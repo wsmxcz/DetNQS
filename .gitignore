@@ -1,0 +1,100 @@
+# 1. Build & Compilation Artifacts
+# ---------------------------------
+# General build output directories
+build/
+dist/
+documents/
+*.egg-info/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled libraries and executables
+*.o
+*.so
+*.a
+*.lib
+*.dll
+*.exe
+*.dylib
+*.out
+*.app
+
+# 2. Python Specific
+# --------------------
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Caches for linters, formatters, and test runners
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# 3. JAX & Machine Learning
+# ---------------------------
+# Caches
+jax_cache/
+xla_cache/
+
+# Large data, model, and serialization files
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.model
+*.joblib
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# 4. IDE & Editor Files
+# -----------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.suo
+*.user
+
+# 5. OS Generated Files
+# -----------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# 6. Logs & Temporary Files
+# ---------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.backup
+*.pid
+*.seed
+.benchmarks
+*.FCIDUMP
+performance/
+runs/
+scans/

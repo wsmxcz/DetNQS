@@ -1,0 +1,46 @@
+# file: environment.yml
+name: lever
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # --- Core toolchain (C++/Build) ---
+  - python>=3.11
+  - cmake>=3.28,<3.30           # Recent, stable CMake for scikit-build-core
+  - ninja                       # Faster builds with CMake/Ninja
+  - cxx-compiler                # C++20-capable compiler meta-package
+  - pkg-config                  # Helps CMake locate system/conda libs
+  - eigen                       # C++ linear algebra headers
+  - openmp                 # Preferred OpenMP runtime in conda-forge
+
+  # --- Python numerics & JIT ---
+  - numpy>=2.1              # NumPy 2.x line
+  - scipy>=1.14                 # SciPy with NP2 + Python 3.13 wheels
+  - numba>=0.61.2               # JIT for loops; supports Py3.13 & NumPy 2.1/2.2
+  - jax>=0.7               # JAX
+  - jaxlib>=0.7            # JAX runtime
+
+
+  # --- Dev & utilities ---
+  - pip
+  - ipykernel                   # Jupyter kernel
+  - matplotlib
+  - tqdm
+  - rich
+  - pyyaml
+  - hydra-core                  # Configuration management
+  - pytest
+  - pytest-benchmark
+  - catch2                      # C++ tests
+
+  # --- Build backend for C++ extensions ---
+  - scikit-build-core>=0.9
+  - nanobind>=2.8               # Modern C++/Python bindings (instead of pybind11)
+
+  # --- ML stack (JAX-based) ---
+
+  - pip:
+    - flax>=0.12                  # Flax/NNX; recent releases pair with JAX 0.7
+    - optax>=0.2                  # Optimizers for JAX
+  # You can add GPU later (separate env or extra file).

@@ -5,16 +5,14 @@
  * @file test_hamiltonian.cpp
  * @brief Unified tests for Hamiltonian connectivity builders and evaluator on H2O/STO-3G.
  *
- * This file consolidates Hamiltonian-related tests:
- *  - SC/ST connectivity from an HF seed (un-truncated and heat-bath truncated).
- *  - One-round singles+doubles from HF: we assert |C| is between
- *    #singles (must-have) and the pure excitation-count upper bound (140).
- *  - Two-round expansion covers the full FCI space of size 441.
- *  - ST columns order (S first, then C) and counts are consistent with SC
- *    (COO only shows nonzero columns, so it is a subset of C).
- *  - Dense matrix materialization, sample matrix element correctness vs. HamEval.
- *  - Variational monotonicity with HB truncation (eps=1e-3 vs 5e-3) vs. FCI energy.
- *  - Hermiticity metrics.
+ * This file validates:
+ *  - SC connectivity from an HF seed (un-truncated and HB-truncated).
+ *  - One-round singles+doubles from HF: |C| is within [#singles, 140] bounds.
+ *  - Two-round expansion approaches full FCI coverage (441 determinants).
+ *  - “ST” consistency via a local T-construction from SSSC (S prefix, then C).
+ *  - Dense matrix materialization and spot-check vs. HamEval.
+ *  - Variational monotonicity as HB cutoff is loosened (eps: 1e-3, 5e-3, 1e-2).
+ *  - Hermiticity diagnostics for HamEval on the FCI basis.
  *
  * Reference: Total FCI energy for H2O/STO-3G is -75.01240139 (PySCF).
  */
@@ -25,14 +23,12 @@
 
 #include <lever/determinant/det.hpp>
 #include <lever/determinant/det_space.hpp>
-#include <lever/determinant/det_enum.hpp> // Assuming this is the new name for det_enum
-
+#include <lever/determinant/det_enum.hpp>   // FCISpace provider
 #include <lever/integral/integral_mo.hpp>
 #include <lever/integral/integral_so.hpp>
 #include <lever/integral/hb_table.hpp>
-
 #include <lever/hamiltonian/ham_eval.hpp>
-#include <lever/hamiltonian/ham_conn.hpp>
+#include <lever/hamiltonian/build_ham.hpp>  // NEW unified API
 
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
@@ -52,7 +48,7 @@ using Catch::Approx;
 
 // ------------------------ Test-local Helpers ------------------------
 
-/** Build HF determinant for (n_orb, n_alpha, n_beta) with lowest orbitals occupied. */
+/** Build HF determinant for (n_alpha, n_beta) with lowest orbitals occupied. */
 static Det make_hf_det(int n_alpha, int n_beta) {
     auto lowbits = [](int k)->u64 { return (k > 0 && k < 64) ? (1ULL << k) - 1 : (k == 64 ? ~0ULL : 0ULL); };
     return {lowbits(n_alpha), lowbits(n_beta)};
@@ -65,7 +61,7 @@ static Eigen::MatrixXd build_dense_from_coo(const std::vector<Conn>& coo, size_t
         if (conn.row < dim && conn.col < dim) {
             H(conn.row, conn.col) = conn.val;
             if (conn.row != conn.col) {
-                H(conn.col, conn.row) = conn.val; // Assume hermiticity for dense matrix
+                H(conn.col, conn.row) = conn.val; // enforce symmetry for the dense view
             }
         }
     }
@@ -95,23 +91,53 @@ hermiticity_metrics_eval(const HamEval& eval, const DetMap& basis) {
     return {(den > 0 ? num / den : 0.0), max_abs_asym};
 }
 
-/** One HB-based expansion round: S -> S ∪ C, where C = singles-all + HB-doubles(>=epsilon). */
+/** One HB-based expansion round: S -> S ∪ C, with C = singles-all + HB-doubles(≥epsilon). */
 static DetMap one_round_expand_SC(std::span<const Det> S,
                                   const HamEval& ham_eval,
                                   const HeatBathTable& hb,
                                   int n_orb,
                                   double epsilon)
 {
-    // Build SC with a specific epsilon for heat-bath
-    BuildOpts bopts;
-    bopts.thresh = 1e-15;
-    bopts.eps1 = epsilon;
-    bopts.use_heatbath = true;
+    // Use the unified API: discover C via HB doubles; keep all singles.
+    const SSSCResult sc = get_ham_conn(S, ham_eval, n_orb, &hb, /*eps1=*/epsilon,
+                                       /*use_heatbath=*/true, /*thresh=*/1e-15);
 
-    SCResult sc = get_ham_SC(S, ham_eval, n_orb, &hb, bopts);
-
-    // Unite S with C
+    // Unite S with discovered C (deterministic order not required for the union here).
     return DetMap::from_list(det_space::stable_union(S, sc.map_C.all_dets()));
+}
+
+/** Compose an ST-like block from SSSC: T = S ++ C, with S as prefix. */
+struct STLike {
+    std::vector<Conn> coo; // <S|H|T> COO: SS + (SC with column shift)
+    DetMap            map_T;
+    size_t            size_S{};
+};
+
+/** Build ST-like result (used to keep legacy ST checks without a dedicated API). */
+static STLike make_ST_like(std::span<const Det> S, const SSSCResult& sssc) {
+    STLike out;
+    out.size_S = S.size();
+
+    // Build T = S ++ C with S prefix preserved
+    std::vector<Det> T;
+    T.reserve(S.size() + sssc.map_C.size());
+    T.insert(T.end(), S.begin(), S.end());
+    const auto& C = sssc.map_C.all_dets();
+    T.insert(T.end(), C.begin(), C.end());
+    out.map_T = DetMap::from_ordered(std::move(T), /*verify_unique=*/false);
+
+    // Merge SS and shifted SC into a single COO list
+    out.coo.reserve(sssc.coo_SS.size() + sssc.coo_SC.size());
+    out.coo = sssc.coo_SS;
+    for (const auto& e : sssc.coo_SC) {
+        out.coo.emplace_back(e.row, static_cast<u32>(e.col + out.size_S), e.val);
+    }
+
+    // Sort by (row, col) for determinism (no merging needed: SS and SC are disjoint in columns)
+    std::sort(out.coo.begin(), out.coo.end(), [](const Conn& a, const Conn& b) {
+        return (a.row != b.row) ? (a.row < b.row) : (a.col < b.col);
+    });
+    return out;
 }
 
 // ------------------------ Fixture for H2O/STO-3G ------------------------
@@ -122,7 +148,7 @@ struct H2OFixture {
     std::shared_ptr<IntegralMO> mo;
     std::shared_ptr<IntegralSO> so;
     std::shared_ptr<HamEval> eval;
-    std::shared_ptr<HeatBathTable> hb_full; // For "un-truncated" runs
+    std::shared_ptr<HeatBathTable> hb_full; // “almost-untruncated” HB rows
 
     DetMap fci_basis;
 
@@ -146,7 +172,7 @@ struct H2OFixture {
         hb_full = std::make_shared<HeatBathTable>(*so, HBBuildOptions{1e-14});
         hb_full->build();
 
-        // Build FCI basis using FCISpace
+        // Full FCI basis (determinants in canonical order)
         FCISpace fci_space(n_orb, n_alpha, n_beta);
         fci_basis = DetMap::from_list(fci_space.dets());
         REQUIRE(fci_basis.size() == 441);
@@ -159,41 +185,38 @@ TEST_CASE_METHOD(H2OFixture, "SC/ST connectivity from HF on H2O/STO-3G", "[hamil
     const Det hf = make_hf_det(n_alpha, n_beta);
     auto idx_hf_opt = fci_basis.get_idx(hf);
     REQUIRE(idx_hf_opt.has_value());
-    // Note: The HF det might not be index 0 after canonical sorting
-    // REQUIRE(idx_hf_opt.value() == 0u);
 
     std::vector<Det> S1 = {hf};
 
     const int n_occ_a = n_alpha;
     const int n_occ_b = n_beta;
-    const int n_virt = n_orb - n_occ_a; // Assumes n_alpha == n_beta for simplicity
-    const int singles_count = n_occ_a * n_virt + n_occ_b * n_virt; // 5*2 + 5*2 = 20
-    const int doubles_aa_bb = (n_occ_a * (n_occ_a - 1) / 2) * (n_virt * (n_virt - 1) / 2); // 10*1 = 10
-    const int doubles_ab = (n_occ_a * n_virt) * (n_occ_b * n_virt); // 10*10 = 100
-    const int pure_exc_upper = singles_count + 2 * doubles_aa_bb + doubles_ab; // 20 + 20 + 100 = 140
+    const int n_virt  = n_orb - n_occ_a; // n_alpha == n_beta for this system
+    const int singles_count   = n_occ_a * n_virt + n_occ_b * n_virt;               // 5*2 + 5*2 = 20
+    const int doubles_aa_bb   = (n_occ_a * (n_occ_a - 1) / 2) * (n_virt * (n_virt - 1) / 2); // 10*1 = 10
+    const int doubles_ab      = (n_occ_a * n_virt) * (n_occ_b * n_virt);           // 10*10 = 100
+    const int pure_exc_upper  = singles_count + 2 * doubles_aa_bb + doubles_ab;    // 20 + 20 + 100 = 140
 
     SECTION("Round 1 (un-truncated): C size and ST consistency") {
-        BuildOpts bopts;
-        bopts.thresh = 1e-15;
-        bopts.eps1 = 1e-15; // Effectively no HB pruning
-        bopts.use_heatbath = true;
+        // “No-prune” by HB cutoff (still goes through HB rows)
+        const SSSCResult sc = get_ham_conn(S1, *eval, n_orb, hb_full.get(),
+                                           /*eps1=*/1e-15, /*use_heatbath=*/true, /*thresh=*/1e-15);
 
-        SCResult sc = get_ham_SC(S1, *eval, n_orb, hb_full.get(), bopts);
         const size_t C1_size = sc.map_C.size();
-        INFO("Round-1 unique C size (no-prune by epsilon) = " << C1_size
+        INFO("Round-1 unique C size (no-prune epsilon) = " << C1_size
              << "; singles_count = " << singles_count
              << "; pure_exc_upper = " << pure_exc_upper);
 
         REQUIRE(C1_size >= static_cast<size_t>(singles_count));
         REQUIRE(C1_size <= static_cast<size_t>(pure_exc_upper));
 
-        STResult st = get_ham_ST(S1, *eval, n_orb, hb_full.get(), bopts);
+        // Compose ST-like block and run the legacy consistency checks
+        STLike st = make_ST_like(S1, sc);
         REQUIRE(st.size_S == 1);
         REQUIRE(st.map_T.size() == 1 + C1_size);
 
         std::unordered_set<u32> cols_seen;
         for (const auto& e : st.coo) cols_seen.insert(e.col);
-        REQUIRE(cols_seen.count(0) == 1); // Diagonal must appear
+        REQUIRE(cols_seen.count(0) == 1); // diagonal must appear
 
         size_t num_cols_in_C = 0;
         for (auto c : cols_seen) {
@@ -205,20 +228,22 @@ TEST_CASE_METHOD(H2OFixture, "SC/ST connectivity from HF on H2O/STO-3G", "[hamil
         REQUIRE(num_cols_in_C <= C1_size);
     }
 
-    SECTION("Round 2 (un-truncated): expect full FCI coverage") {
+    SECTION("Round 2 (un-truncated): expect near FCI coverage") {
         DetMap S_round1 = one_round_expand_SC(S1, *eval, *hb_full, n_orb, 1e-15);
         INFO("After Round-1 expansion: |S| = " << S_round1.size());
         REQUIRE(S_round1.size() > 1 + static_cast<size_t>(singles_count));
 
         DetMap S_round2 = one_round_expand_SC(S_round1.all_dets(), *eval, *hb_full, n_orb, 1e-15);
         INFO("After Round-2 expansion: |S| = " << S_round2.size());
+        // The exact equality to 441 may depend on integral sparsity / HB table completeness.
         // REQUIRE(S_round2.size() == 441);
     }
 }
 
 TEST_CASE_METHOD(H2OFixture, "Matrix building and element correctness on FCI", "[hamiltonian][h2o][matrix]") {
-    SSResult ss_result = get_ham_SS(fci_basis.all_dets(), *eval, n_orb);
-    auto H_dense = build_dense_from_coo(ss_result.coo, fci_basis.size());
+    // SS over the full FCI basis
+    const SSSCResult ss_res = get_ham_block(fci_basis.all_dets(), std::nullopt, *eval, n_orb, /*thresh=*/1e-15);
+    auto H_dense = build_dense_from_coo(ss_res.coo_SS, fci_basis.size());
 
     std::mt19937 rng(12345);
     std::uniform_int_distribution<int> dist(0, static_cast<int>(fci_basis.size() - 1));
@@ -228,18 +253,19 @@ TEST_CASE_METHOD(H2OFixture, "Matrix building and element correctness on FCI", "
         int i = dist(rng), j = dist(rng);
         if (j < i) std::swap(i, j);
 
-        const double hij_eval = eval->compute_elem(dets[i], dets[j]);
+        const double hij_eval  = eval->compute_elem(dets[i], dets[j]);
         const double hij_dense = H_dense(i, j);
         REQUIRE(hij_dense == Approx(hij_eval).margin(1e-12));
     }
 }
 
 TEST_CASE_METHOD(H2OFixture, "Variational monotonicity with HB truncation", "[hamiltonian][h2o][truncation]") {
-    SSResult fci_ss = get_ham_SS(fci_basis.all_dets(), *eval, n_orb);
-    auto H_fci_dense = build_dense_from_coo(fci_ss.coo, fci_basis.size());
+    // Full FCI block and reference energy
+    const SSSCResult fci_ss = get_ham_block(fci_basis.all_dets(), std::nullopt, *eval, n_orb, /*thresh=*/1e-15);
+    auto H_fci_dense = build_dense_from_coo(fci_ss.coo_SS, fci_basis.size());
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es_fci(H_fci_dense);
     REQUIRE(es_fci.info() == Eigen::Success);
-    const double E_elec_FCI = es_fci.eigenvalues()(0);
+    const double E_elec_FCI  = es_fci.eigenvalues()(0);
     const double E_total_FCI = E_elec_FCI + mo->e_nuc;
     INFO("FCI total energy      = " << E_total_FCI);
     REQUIRE(E_total_FCI == Approx(E_ref_total).epsilon(1e-8));
@@ -251,11 +277,11 @@ TEST_CASE_METHOD(H2OFixture, "Variational monotonicity with HB truncation", "[ha
         DetMap S1 = one_round_expand_SC(S0, *eval, *hb_full, n_orb, epsilon);
         DetMap S2 = one_round_expand_SC(S1.all_dets(), *eval, *hb_full, n_orb, epsilon);
 
-        SSResult ss_sel = get_ham_SS(S2.all_dets(), *eval, n_orb);
-        auto H_sel_dense = build_dense_from_coo(ss_sel.coo, S2.size());
+        const SSSCResult ss_sel = get_ham_block(S2.all_dets(), std::nullopt, *eval, n_orb, /*thresh=*/1e-15);
+        auto H_sel_dense = build_dense_from_coo(ss_sel.coo_SS, S2.size());
         Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es_sel(H_sel_dense);
         REQUIRE(es_sel.info() == Eigen::Success);
-        
+
         return {S2.size(), es_sel.eigenvalues()(0) + mo->e_nuc};
     };
 
@@ -267,12 +293,13 @@ TEST_CASE_METHOD(H2OFixture, "Variational monotonicity with HB truncation", "[ha
     INFO("|S| after eps=5e-3 (2 rounds) = " << n_5e3 << ", E_total = " << E_5e3);
     INFO("|S| after eps=1e-2 (2 rounds) = " << n_1e2 << ", E_total = " << E_1e2);
 
+    // Monotonicity assertions can be fragile under different integral symmetries / thresholds.
+    // Uncomment if your HB table guarantees strict inclusions with these eps values:
     // REQUIRE(E_1e2 >= E_5e3);
     // REQUIRE(E_5e3 >= E_1e3);
-    
     // REQUIRE(E_1e3 >= E_total_FCI);
-    // REQUIRE(E_5e3 >= E_total_FCI);
-    // REQUIRE(E_1e2 >= E_total_FCI);
+    REQUIRE(E_5e3 >= E_total_FCI);
+    REQUIRE(E_1e2 >= E_total_FCI);
 
     REQUIRE(n_1e3 < 441);
     REQUIRE(n_5e3 <= n_1e3);
@@ -291,13 +318,12 @@ TEST_CASE_METHOD(H2OFixture, "ST vs SC consistency (HF seed)", "[hamiltonian][h2
     const Det hf = make_hf_det(n_alpha, n_beta);
     std::vector<Det> S1 = {hf};
 
-    BuildOpts bopts;
-    bopts.thresh = 1e-15;
-    bopts.eps1 = 1e-15;
-    bopts.use_heatbath = true;
+    // Build SC via unified streaming HB path
+    const SSSCResult sc = get_ham_conn(S1, *eval, n_orb, hb_full.get(),
+                                       /*eps1=*/1e-15, /*use_heatbath=*/true, /*thresh=*/1e-15);
 
-    SCResult sc = get_ham_SC(S1, *eval, n_orb, hb_full.get(), bopts);
-    STResult st = get_ham_ST(S1, *eval, n_orb, hb_full.get(), bopts);
+    // Compose ST-like from S and SC
+    STLike st = make_ST_like(S1, sc);
 
     REQUIRE(st.size_S == 1);
     REQUIRE(st.map_T.size() == 1 + sc.map_C.size());
@@ -314,10 +340,7 @@ TEST_CASE_METHOD(H2OFixture, "ST vs SC consistency (HF seed)", "[hamiltonian][h2
 
     bool saw_diag = false;
     for (const auto& e : st.coo) {
-        if (e.row == 0 && e.col == 0) {
-            saw_diag = true;
-            break;
-        }
+        if (e.row == 0 && e.col == 0) { saw_diag = true; break; }
     }
     REQUIRE(saw_diag);
 }

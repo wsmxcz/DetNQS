@@ -13,10 +13,9 @@ from .core import (
     gen_fci_dets,
     gen_excited_dets,
     get_ham_diag,
-    get_ham_conns_SS,
-    get_ham_conns_SC,
-    get_ham_conns_ST,
-    get_ham_conns_SSSC,
+    get_ham_conn,
+    get_ham_block,
+    get_ham_conn_amp
 )
 
 from .engine.hamiltonian import (
@@ -37,10 +36,9 @@ __all__ = [
     "gen_fci_dets",
     "gen_excited_dets",
     "get_ham_diag",
-    "get_ham_conns_SS",
-    "get_ham_conns_SC",
-    "get_ham_conns_ST",
-    "get_ham_conns_SSSC",
+    "get_ham_conn",
+    "get_ham_block",
+    "get_ham_conn_amp",
     "HamOp",
     "SpaceRep",
     "get_ham_proxy",

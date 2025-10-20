@@ -4,8 +4,9 @@
 """
 Wavefunction model components and factory functions.
 
-Entry points: Slater(), RBM(), RBMModPhase(), Jastrow(), Product()
-Each factory returns an initialized WavefunctionModel ready for computation.
+Provides neural quantum state ansätze: Slater determinants, Pfaffians,
+RBMs, Jastrow factors, and their compositions. All models map occupation
+basis vectors to complex log-amplitudes log ψ(s).
 
 File: lever/models/__init__.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -39,33 +40,29 @@ def Slater(
     kernel_init: Callable | None = None,
 ) -> WavefunctionModel:
     """
-    Create neural Slater determinant wavefunction model.
-    
+    Neural Slater determinant ansatz with multi-determinant expansion.
+  
     Computes log ψ(s) = log(Σᵢ cᵢ det(Mᵢ[s,:])) where Mᵢ are learnable
-    orbital matrices and cᵢ are optional expansion coefficients.
-    
-    Three orbital formulations:
-      - Generalized: Single matrix for all electrons (spin-orbital basis)
-      - Restricted: Shared spatial orbitals for α/β spins (RHF-like)
-      - Unrestricted: Separate α/β orbital matrices (UHF-like)
-    
+    orbital matrices. Supports three formulations:
+      - Generalized: Spin-orbital basis M ∈ ℂ^(N×N_orb)
+      - Restricted: Shared spatial orbitals M_α = M_β
+      - Unrestricted: Separate M_α, M_β matrices
+  
     Args:
-        n_orbitals: Number of spatial orbitals
-        n_alpha: Alpha-spin electron count
-        n_beta: Beta-spin electron count
-        seed: RNG seed for parameter initialization
-        n_dets: Number of determinants in CI expansion (default: 1)
+        n_orbitals: Spatial orbital count
+        n_alpha, n_beta: Electron counts per spin
+        seed: Parameter initialization seed
+        n_dets: CI expansion terms (1 = single determinant)
         generalized: Use spin-orbital formulation
-        restricted: Share spatial orbitals for α/β (ignored if generalized)
-        use_log_coeffs: Learn expansion coefficients cᵢ (only when n_dets > 1)
+        restricted: Share α/β spatial orbitals (ignored if generalized)
+        use_log_coeffs: Learn expansion coefficients (only for n_dets > 1)
         param_dtype: Orbital matrix dtype (complex recommended)
-        kernel_init: Weight initializer (default: orthogonal())
-        
+        kernel_init: Weight initializer (default: orthogonal)
+      
     Returns:
-        Initialized WavefunctionModel with learnable orbital parameters
+        Initialized WavefunctionModel
     """
     from flax.linen import initializers
-
     from .slater import Slater
 
     kernel_init = kernel_init or initializers.orthogonal()
@@ -84,6 +81,7 @@ def Slater(
 
     return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
 
+
 def Pfaffian(
     n_orbitals: int,
     n_alpha: int,
@@ -97,37 +95,33 @@ def Pfaffian(
     kernel_init: Callable | None = None,
 ) -> WavefunctionModel:
     """
-    Creates a neural Pfaffian or AGP wavefunction model.
+    Pfaffian/AGP ansatz for systems with pairing correlations.
 
-    This ansatz generalizes the Slater determinant and is particularly
-    suited for systems with strong pairing correlations.
-
-    Modes:
-      - singlet_only=True: Antisymmetric Geminal Power (AGP). The amplitude
-        is given by the determinant of an N_alpha x N_beta pairing matrix.
-      - singlet_only=False: General Pfaffian, including both singlet
-        (opposite-spin) and triplet (same-spin) pairing terms.
+    Two operational modes:
+      - singlet_only=True: AGP form, ψ ∝ det(P) where P_{ij} pairs
+        α-spin i with β-spin j
+      - singlet_only=False: Full Pfaffian including triplet pairing
+  
+    Generalizes Slater determinants to capture stronger correlations.
 
     Args:
-        n_orbitals: Number of spatial orbitals.
-        n_alpha, n_beta: Electron counts per spin.
-        seed: RNG seed for parameter initialization.
-        n_terms: Number of terms in the expansion (default: 1).
-        singlet_only: If True, use the AGP (determinant) form.
-        use_log_coeffs: Learn expansion coefficients for multi-term models.
-        param_dtype: Parameter dtype (complex recommended).
-        kernel_init: Weight initializer (default: lecun_normal()).
+        n_orbitals: Spatial orbital count
+        n_alpha, n_beta: Electron counts per spin
+        seed: Parameter initialization seed
+        n_terms: Expansion terms for multi-Pfaffian ansatz
+        singlet_only: Use AGP (determinant) form
+        use_log_coeffs: Learn expansion coefficients (n_terms > 1)
+        param_dtype: Parameter dtype (complex recommended)
+        kernel_init: Weight initializer (default: lecun_normal)
 
     Returns:
-        An initialized WavefunctionModel.
+        Initialized WavefunctionModel
     """
     from flax.linen import initializers
-    # Import the new Pfaffian module
     from .pfaffian import Pfaffian as PfaffianModule
 
     kernel_init = kernel_init or initializers.lecun_normal()
 
-    # Create the Flax Linen module instance
     ansatz = PfaffianModule(
         n_orbitals=n_orbitals,
         n_alpha=n_alpha,
@@ -139,8 +133,8 @@ def Pfaffian(
         kernel_init=kernel_init,
     )
 
-    # Wrap it in the WavefunctionModel, which handles JIT, batching, etc.
     return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
+
 
 def RBM(
     n_orbitals: int,
@@ -150,17 +144,18 @@ def RBM(
     use_visible_bias: bool = True,
 ) -> WavefunctionModel:
     """
-    Create complex-valued restricted Boltzmann machine wavefunction.
-    
-    Maps occupation basis to RBM visible layer (2*n_orbitals units).
-    Hidden layer size = alpha * n_visible.
-    
+    Complex-valued restricted Boltzmann machine.
+  
+    Maps occupation basis to visible layer (2N_orb units), then to
+    hidden layer (α·2N_orb units). Computes ψ via energy function
+    partition sum.
+  
     Args:
-        n_orbitals: Spatial orbitals (visible units = 2*n_orbitals)
-        seed: RNG seed
-        alpha: Hidden-to-visible unit ratio
-        use_visible_bias: Enable visible layer bias
-        
+        n_orbitals: Spatial orbital count (visible = 2N_orb)
+        seed: Parameter initialization seed
+        alpha: Hidden/visible unit ratio
+        use_visible_bias: Enable visible bias terms
+      
     Returns:
         Initialized WavefunctionModel
     """
@@ -182,16 +177,16 @@ def RBMModPhase(
     alpha: float = 1.0,
 ) -> WavefunctionModel:
     """
-    Create twin-RBM model with separate modulus and phase networks.
-    
-    Uses two real-valued RBMs for improved training stability:
-    log|ψ| from first RBM, arg(ψ) from second RBM.
-    
+    Dual-RBM model with separate modulus and phase networks.
+  
+    Decomposes ψ = |ψ|e^{iφ} using two real RBMs for improved
+    optimization stability.
+  
     Args:
-        n_orbitals: Spatial orbitals
-        seed: RNG seed
-        alpha: Hidden-to-visible unit ratio per RBM
-        
+        n_orbitals: Spatial orbital count
+        seed: Parameter initialization seed
+        alpha: Hidden/visible ratio per RBM
+      
     Returns:
         Initialized WavefunctionModel
     """
@@ -207,31 +202,30 @@ def Backflow(
     n_beta: int,
     *,
     seed: int,
+    n_dets: int,
     generalized: bool = False,
     restricted: bool = True,
     hidden_dims: Tuple[int, ...] = (256,),
-    bf_scale: float = 1.0,
     param_dtype: Any = jnp.complex64,
 ) -> WavefunctionModel:
     """
-    Create Hilbert-space backflow model with MLP-modulated orbitals.
+    Hilbert-space backflow with configuration-dependent orbitals.
 
-    Enhances a Slater determinant by making the orbital matrix M configuration-
-    dependent: M_eff(s) = M_base + MLP(s). This allows the wavefunction's
-    nodal surface to dynamically adapt, capturing strong correlation.
+    Enhances Slater determinants via M_eff(s) = M_base + MLP(s),
+    allowing adaptive nodal surfaces for strong correlation.
 
     Args:
-        n_orbitals: Number of spatial orbitals.
-        n_alpha, n_beta: Electron counts per spin.
-        seed: RNG seed for parameter initialization.
-        generalized: Use a single spin-orbital matrix.
-        restricted: Share spatial orbitals for alpha/beta spins.
-        hidden_dims: Tuple of hidden layer sizes for the MLP.
-        bf_scale: Multiplicative factor for the MLP output, controls backflow strength.
-        param_dtype: Dtype for model parameters (complex recommended).
+        n_orbitals: Spatial orbital count
+        n_alpha, n_beta: Electron counts per spin
+        seed: Parameter initialization seed
+        n_dets: Multi-determinant expansion terms
+        generalized: Use spin-orbital formulation
+        restricted: Share α/β spatial orbitals
+        hidden_dims: MLP architecture (layer sizes)
+        param_dtype: Parameter dtype (complex recommended)
 
     Returns:
-        An initialized WavefunctionModel with backflow correlations.
+        Initialized WavefunctionModel
     """
     from .backflow import BackflowMLP
 
@@ -239,14 +233,15 @@ def Backflow(
         n_orbitals=n_orbitals,
         n_alpha=n_alpha,
         n_beta=n_beta,
+        n_dets=n_dets,
         generalized=generalized,
         restricted=restricted,
         hidden_dims=hidden_dims,
-        bf_scale=bf_scale,
         param_dtype=param_dtype,
     )
-    
+  
     return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
+
 
 def Jastrow(
     n_orbitals: int,
@@ -255,16 +250,16 @@ def Jastrow(
     param_dtype: Any = jnp.float64,
 ) -> WavefunctionModel:
     """
-    Create Hilbert-space Jastrow correlation factor.
-    
-    Symmetric pairwise correlation operator in occupation number basis.
-    Typically combined with Slater determinants via Product().
-    
+    Symmetric Jastrow correlation factor in occupation basis.
+  
+    Pairwise correlation operator: ψ_J = exp(Σ_{i<j} v_{ij} n_i n_j).
+    Commonly combined with Slater via Product().
+  
     Args:
-        n_orbitals: Spatial orbitals
-        seed: RNG seed
-        param_dtype: Parameter dtype (usually real)
-        
+        n_orbitals: Spatial orbital count
+        seed: Parameter initialization seed
+        param_dtype: Parameter dtype (typically real)
+      
     Returns:
         Initialized WavefunctionModel
     """
@@ -276,22 +271,21 @@ def Jastrow(
 
 def Product(*models: WavefunctionModel) -> ProductModel:
     """
-    Compose multiple wavefunctions via logarithmic product.
-    
-    Combines models by summing their log-amplitudes:
-    log ψ_total = log ψ₁ + log ψ₂ + ... + log ψₙ
-    
+    Compose wavefunctions via logarithmic product.
+  
+    Combines models by log ψ_total = Σᵢ log ψᵢ, preserving normalization
+    and enabling hybrid ansätze.
+  
     Args:
-        *models: WavefunctionModel instances to compose
-        
+        *models: WavefunctionModel instances
+      
     Returns:
-        ProductModel (duck-types as WavefunctionModel)
-        
+        ProductModel (duck-typed WavefunctionModel)
+      
     Example:
         >>> slater = Slater(n_orbitals=4, n_alpha=2, n_beta=2, seed=42)
         >>> jastrow = Jastrow(n_orbitals=4, seed=43)
         >>> wf = Product(slater, jastrow)
-        >>> log_psi = wf(batch_configs)
     """
     return ProductModel(models)
 

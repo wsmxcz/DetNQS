@@ -13,8 +13,7 @@ add_library(lever_core STATIC
     src/integral/integral_mo.cpp
     src/integral/hb_table.cpp
     src/hamiltonian/ham_eval.cpp
-    src/hamiltonian/ham_conn.cpp
-    src/hamiltonian/ham_block.cpp
+    src/hamiltonian/build_ham.cpp
 )
 add_library(lever::core ALIAS lever_core)
 

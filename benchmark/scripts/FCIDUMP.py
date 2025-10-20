@@ -1,476 +1,593 @@
-#!/usr/bin/env python
+# Copyright 2025 The LEVER Authors - All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
-FCIDUMP.py - Generate FCIDUMP files for calculations and tests
+Generate FCIDUMP files with orbital localization and natural orbital transforms.
 
-This script generates FCIDUMP files for various molecular geometries and
-supports different orbital localization schemes. It uses PySCF for the
-quantum chemistry calculations.
+Supports multiple molecular geometries, orbital localization (Boys, Pipek-Mezey,
+Edmiston-Ruedenberg, IBO), natural orbitals (MP2, CISD, CCSD), optional LIVVO
+for virtual orbitals, and benchmark calculations (MP2, CISD, CCSD, CCSD(T), FCI).
 
-Usage:
-    python FCIDUMP.py molecule [options]
+File: tools/FCIDUMP.py
+Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+Date: January, 2025
 
-Example:
-    python FCIDUMP.py h2 --basis sto-3g --output H2.FCIDUMP
-    python FCIDUMP.py h2o --basis cc-pvdz --output H2O.FCIDUMP --symmetry
-    python FCIDUMP.py hchain --n_atoms 10 --distance 2.0 --basis sto-3g --localize boys --output H10.FCIDUMP
+Examples:
+  python FCIDUMP.py h2 --basis sto-3g --output H2.FCIDUMP
+  python FCIDUMP.py h2o --basis cc-pvdz --output H2O.FCIDUMP
+  python FCIDUMP.py hchain --n_atoms 10 --distance 2.0 --basis sto-3g \\
+      --localize boys --output H10_2.00_boys.FCIDUMP
+  python FCIDUMP.py n2 --basis cc-pvtz --localize no-mp2 \\
+      --output N2.FCIDUMP --benchmark
+  python FCIDUMP.py c2h6 --basis sto-3g --cc_angle 30 \\
+      --output C2H6_30.FCIDUMP --benchmark
 """
 
-import os
-import sys
-import math
 import argparse
+import math
+import sys
+from datetime import datetime
+from typing import Callable
+
 import numpy as np
-from functools import reduce
-from pyscf import gto, scf, lo, symm, ao2mo
+from pyscf import ao2mo, cc, ci, fci, gto, lo, mp, scf
+from pyscf.cc import ccsd_rdm
+from pyscf.lo import edmiston, iao, ibo, orth, vvo
 from pyscf.tools import fcidump
 
 
-def round_geometry(geometry, decimals=4):
-    """
-    Round coordinates in a molecular geometry to a specified number of decimal places.
-    
-    Args:
-        geometry: List of (atom, (x, y, z)) tuples
-        decimals: Number of decimal places to round to
-        
-    Returns:
-        Geometry with rounded coordinates
-    """
-    new_geometry = []
-    for atom, (x, y, z) in geometry:
-        x_rounded = round(x, decimals)
-        y_rounded = round(y, decimals)
-        z_rounded = round(z, decimals)
-        new_geometry.append((atom, (x_rounded, y_rounded, z_rounded)))
-    return new_geometry
+# ============================================================================
+# Geometry Utilities
+# ============================================================================
+
+def _round(geom: list, decimals: int = 4) -> list:
+    """Round coordinates to specified decimals."""
+    return [(atom, tuple(round(x, decimals) for x in xyz)) for atom, xyz in geom]
 
 
-def generate_hydrogen_chain(n, distance=1.4, decimals=4):
-    """
-    Generate a linear chain of hydrogen atoms.
-    
-    Args:
-        n: Number of hydrogen atoms
-        distance: Distance between neighboring atoms
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of a hydrogen chain
-    """
-    geometry = []
-    for i in range(n):
-        z = i * distance
-        geometry.append(('H', (0.0, 0.0, z)))
-    return round_geometry(geometry, decimals)
+def _diatomic(a1: str, a2: str, d: float) -> list:
+    """Diatomic molecule along z-axis."""
+    return _round([(a1, (0, 0, 0)), (a2, (0, 0, d))])
 
 
-def generate_water_geometry(oh_distance=0.9572, decimals=4):
-    """
-    Generate the geometry of a water molecule.
-    
-    Args:
-        oh_distance: O-H bond distance
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of a water molecule
-    """
-    hoh_angle_deg = 104.5
-    hoh_angle_rad = math.radians(hoh_angle_deg)
-    O = ("O", (0.0, 0.0, 0.0))
-    x1 = oh_distance * math.sin(hoh_angle_rad/2)
-    y1 = oh_distance * math.cos(hoh_angle_rad/2)
-    H1 = ("H", (x1, y1, 0.0))
-    x2 = -x1
-    y2 = y1
-    H2 = ("H", (x2, y2, 0.0))
-    geometry = [O, H1, H2]
-    return round_geometry(geometry, decimals)
+def _rotate_z(x: float, y: float, z: float, deg: float) -> tuple:
+    """Rotate (x,y,z) around z-axis by deg degrees."""
+    rad = math.radians(deg)
+    c, s = math.cos(rad), math.sin(rad)
+    return (x * c - y * s, x * s + y * c, z)
 
 
-def generate_diatomic_molecule(atom1, atom2, distance, decimals=4):
-    """
-    Generate a diatomic molecule.
-    
-    Args:
-        atom1: Symbol of the first atom
-        atom2: Symbol of the second atom
-        distance: Bond distance
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of a diatomic molecule
-    """
-    atom1_position = (0.0, 0.0, 0.0)
-    atom2_position = (0.0, 0.0, distance)
-    
-    geometry = [(atom1, atom1_position), (atom2, atom2_position)]
-    return round_geometry(geometry, decimals)
+# ============================================================================
+# Molecular Geometries
+# ============================================================================
+
+def geom_h_chain(n: int, d: float = 1.4) -> list:
+    """Linear H chain along z-axis."""
+    return _round([("H", (0, 0, i * d)) for i in range(n)])
 
 
-def generate_hydrogen_ring(n, radius, decimals=4):
-    """
-    Generate a ring of hydrogen atoms uniformly distributed on a circle.
-
-    Args:
-        n: Number of hydrogen atoms in the ring.
-        radius: Radius of the ring.
-        decimals: Number of decimal places for coordinates.
-
-    Returns:
-        Geometry of the hydrogen ring as a list of ("H", (x, y, z)) tuples.
-    """
-    geometry = []
-    for i in range(n):
-        angle = 2 * math.pi * i / n
-        x = radius * math.cos(angle)
-        y = radius * math.sin(angle)
-        geometry.append(("H", (x, y, 0.0)))
-    return round_geometry(geometry, decimals)
+def geom_h_ring(n: int, r: float) -> list:
+    """Planar H ring in xy-plane."""
+    theta = 2 * math.pi / n
+    return _round([("H", (r * math.cos(i * theta), r * math.sin(i * theta), 0))
+                   for i in range(n)])
 
 
-def generate_NH3_geometry(nh_distance=1.012, decimals=4):
-    """
-    Generate the geometry of an ammonia (NH3) molecule.
-    
-    Args:
-        nh_distance: N–H bond distance (default ≈ 1.012 Å)
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of an NH3 molecule
-    """
-    r_xy = nh_distance / 1.08265
+def geom_h2o(oh: float = 0.9572) -> list:
+    """H₂O with ∠HOH ≈ 104.5°."""
+    ang = math.radians(104.5)
+    x = oh * math.sin(ang / 2)
+    y = oh * math.cos(ang / 2)
+    return _round([("O", (0, 0, 0)), ("H", (x, y, 0)), ("H", (-x, y, 0))])
+
+
+def geom_nh3(nh: float = 1.012) -> list:
+    """NH₃ pyramid."""
+    r_xy = nh / 1.08265
     h = 0.4147 * r_xy
-    
-    N = ("N", (0.0, 0.0, 0.0))
-    H1 = ("H", (r_xy, 0.0, -h))
-    H2 = ("H", (r_xy * math.cos(math.radians(120)), 
-                r_xy * math.sin(math.radians(120)), -h))
-    H3 = ("H", (r_xy * math.cos(math.radians(240)), 
-                r_xy * math.sin(math.radians(240)), -h))
-    
-    geometry = [N, H1, H2, H3]
-    return round_geometry(geometry, decimals)
+    geom = [("N", (0, 0, 0))]
+    for ang in [0, 120, 240]:
+        rad = math.radians(ang)
+        geom.append(("H", (r_xy * math.cos(rad), r_xy * math.sin(rad), -h)))
+    return _round(geom)
 
 
-def generate_CH4_geometry(ch_distance=1.09, decimals=4):
+def geom_ch4(ch: float = 1.09) -> list:
+    """Tetrahedral CH₄."""
+    dirs = [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)]
+    geom = [("C", (0, 0, 0))]
+    for v in dirs:
+        norm = math.sqrt(sum(x**2 for x in v))
+        geom.append(("H", tuple(ch * x / norm for x in v)))
+    return _round(geom)
+
+
+def geom_co2(co: float = 1.16) -> list:
+    """Linear CO₂."""
+    return _round([("C", (0, 0, 0)), ("O", (0, 0, co)), ("O", (0, 0, -co))])
+
+
+def geom_o3() -> list:
+    """Ozone."""
+    return _round([("O", (0, 0, 0)), ("O", (0, 1.0885, 0.6697)),
+                   ("O", (0, -1.0885, 0.6697))])
+
+
+def geom_li2o() -> list:
+    """Li₂O."""
+    return _round([("Li", (3.732, 0.25, 0)), ("Li", (2.0, 0.25, 0)),
+                   ("O", (2.866, -0.25, 0))])
+
+
+def geom_c2h4(cc: float = 1.339, ang: float = 0) -> list:
     """
-    Generate the geometry of a methane (CH4) molecule.
-    
+    C₂H₄ with CC distance and rotation angle around CC bond.
+  
     Args:
-        ch_distance: C–H bond distance (default ≈ 1.09 Å)
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of a CH4 molecule
+        cc: C-C distance (Å), equilibrium ≈ 1.339
+        ang: Rotation angle (deg) of second CH₂ group
     """
-    C = ("C", (0.0, 0.0, 0.0))
-    directions = [
-        (1,  1,  1),
-        (1, -1, -1),
-        (-1,  1, -1),
-        (-1, -1,  1)
-    ]
-    
-    H_atoms = []
-    for vec in directions:
-        norm = math.sqrt(vec[0]**2 + vec[1]**2 + vec[2]**2)
-        scaled = (ch_distance * vec[0] / norm,
-                  ch_distance * vec[1] / norm,
-                  ch_distance * vec[2] / norm)
-        H_atoms.append(("H", scaled))
-        
-    geometry = [C] + H_atoms
-    return round_geometry(geometry, decimals)
+    scale = cc / 1.339
+    c1 = (0, 0, 0.6695 * scale)
+    c2 = (0, 0, -0.6695 * scale)
+    h3 = (0, 0.9289 * scale, 1.2321 * scale)
+    h4 = (0, -0.9289 * scale, 1.2321 * scale)
+    h5 = (0, 0.9289 * scale, -1.2321 * scale)
+    h6 = (0, -0.9289 * scale, -1.2321 * scale)
+
+    c2_rot = _rotate_z(*c2, ang)
+    h5_rot = _rotate_z(*h5, ang)
+    h6_rot = _rotate_z(*h6, ang)
+
+    return _round([("C", c1), ("C", c2_rot), ("H", h3), ("H", h4),
+                   ("H", h5_rot), ("H", h6_rot)])
 
 
-def generate_O2_geometry(distance=1.208, decimals=4):
+def geom_c2h6(cc: float = 1.536, ang: float = 0) -> list:
     """
-    Generate the geometry of an O2 molecule.
-    
+    C₂H₆ with CC distance and rotation angle around CC bond.
+  
     Args:
-        distance: O-O bond distance (default ≈ 1.208 Å)
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of an O2 molecule
+        cc: C-C distance (Å), equilibrium ≈ 1.536
+        ang: Rotation angle (deg) of second CH₃ group (staggered at 0°)
     """
-    return generate_diatomic_molecule("O", "O", distance, decimals)
+    scale = cc / 1.536
+    c1 = (0, 0, 0.7680 * scale)
+    c2 = (0, 0, -0.7680 * scale)
+    h3 = (-1.0192 * scale, 0, 1.1573 * scale)
+    h4 = (0.5096 * scale, 0.8826 * scale, 1.1573 * scale)
+    h5 = (0.5096 * scale, -0.8826 * scale, 1.1573 * scale)
+    h6 = (1.0192 * scale, 0, -1.1573 * scale)
+    h7 = (-0.5096 * scale, -0.8826 * scale, -1.1573 * scale)
+    h8 = (-0.5096 * scale, 0.8826 * scale, -1.1573 * scale)
+
+    c2_rot = _rotate_z(*c2, ang)
+    h6_rot = _rotate_z(*h6, ang)
+    h7_rot = _rotate_z(*h7, ang)
+    h8_rot = _rotate_z(*h8, ang)
+
+    return _round([("C", c1), ("C", c2_rot), ("H", h3), ("H", h4), ("H", h5),
+                   ("H", h6_rot), ("H", h7_rot), ("H", h8_rot)])
 
 
-def generate_N2_geometry(distance=1.098, decimals=4):
-    """
-    Generate the geometry of an N2 molecule.
-    
-    Args:
-        distance: N-N bond distance (default ≈ 1.098 Å)
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of an N2 molecule
-    """
-    return generate_diatomic_molecule("N", "N", distance, decimals)
+# ============================================================================
+# Natural Orbital Transforms
+# ============================================================================
+
+def _sorted_eigh(dm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Diagonalize 1-RDM, return sorted eigenvalues and eigenvectors."""
+    dm_sym = (dm + dm.T.conj()) * 0.5
+    occ, U = np.linalg.eigh(dm_sym)
+    idx = np.argsort(-occ)
+    return occ[idx], U[:, idx]
 
 
-def generate_CO2_geometry(co_distance=1.16, decimals=4):
-    """
-    Generate the geometry of a CO2 molecule.
-    
-    Args:
-        co_distance: C-O bond distance (default ≈ 1.16 Å)
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of a CO2 molecule
-    """
-    C = ("C", (0.0, 0.0, 0.0))
-    O1 = ("O", (0.0, 0.0, co_distance))
-    O2 = ("O", (0.0, 0.0, -co_distance))
-    
-    geometry = [C, O1, O2]
-    return round_geometry(geometry, decimals)
+def get_mp2_no(mf: scf.hf.RHF) -> tuple[np.ndarray, np.ndarray]:
+    """MP2 natural orbitals via 1-RDM diagonalization."""
+    m2 = mp.MP2(mf).run()
+    if hasattr(m2, "make_natorbs"):
+        occ, U = m2.make_natorbs()
+        return mf.mo_coeff @ U, occ
+    dm_mo = m2.make_rdm1(ao_repr=False)
+    occ, U = _sorted_eigh(dm_mo)
+    return mf.mo_coeff @ U, occ
 
-def generate_Li2O_geometry(decimals=4):
-    """
-    Generate the geometry of a CO2 molecule.
-    
-    Args:
-        co_distance: C-O bond distance (default ≈ 1.16 Å)
-        decimals: Number of decimal places for coordinates
-        
-    Returns:
-        Geometry of a CO2 molecule
-    """
-    Li1 = ("Li", (3.732, 0.25, 0.0))
-    Li2 = ("Li", (2.0, 0.25, 0.0))
-    O = ("O", (2.866, -0.25, 0.0))
-    
-    geometry = [Li1, Li2, O]
-    return round_geometry(geometry, decimals)
 
-def localize_orbitals(mol, mf, method):
+def get_cisd_no(mf: scf.hf.RHF) -> tuple[np.ndarray, np.ndarray]:
+    """CISD natural orbitals via 1-RDM diagonalization."""
+    myci = ci.CISD(mf).run()
+    dm_mo = myci.make_rdm1()
+    occ, U = _sorted_eigh(dm_mo)
+    return mf.mo_coeff @ U, occ
+
+
+def get_ccsd_no(mf: scf.hf.RHF) -> tuple[np.ndarray, np.ndarray]:
+    """CCSD natural orbitals via lambda-relaxed 1-RDM."""
+    mycc = cc.CCSD(mf).run()
+    mycc.solve_lambda()
+    dm_mo = ccsd_rdm.make_rdm1(mycc, mycc.t1, mycc.t2,
+                               mycc.l1, mycc.l2, ao_repr=False)
+    occ, U = _sorted_eigh(dm_mo)
+    return mf.mo_coeff @ U, occ
+
+
+# ============================================================================
+# Benchmark Calculations
+# ============================================================================
+
+def run_benchmarks(mol: gto.Mole, mf: scf.hf.SCF, log) -> dict:
+    """Run MP2, CISD, CCSD, CCSD(T), FCI benchmarks."""
+    results = {}
+    log.write("\n" + "=" * 60 + "\n")
+    log.write("BENCHMARK CALCULATIONS\n")
+    log.write("=" * 60 + "\n\n")
+
+    # MP2
+    try:
+        log.write("Running MP2...\n")
+        log.flush()
+        m2 = mp.MP2(mf).run(verbose=0)
+        results["mp2"] = m2.e_tot
+        log.write(f"  E(MP2)  = {m2.e_tot:.12f} Ha\n")
+        log.write(f"  Ecorr   = {m2.e_corr:.12f} Ha\n\n")
+    except Exception as e:
+        log.write(f"  MP2 failed: {e}\n\n")
+        results["mp2"] = None
+
+    # CISD
+    try:
+        log.write("Running CISD...\n")
+        log.flush()
+        myci = ci.CISD(mf).run(verbose=0)
+        results["cisd"] = myci.e_tot
+        log.write(f"  E(CISD) = {myci.e_tot:.12f} Ha\n")
+        log.write(f"  Ecorr   = {myci.e_corr:.12f} Ha\n\n")
+    except Exception as e:
+        log.write(f"  CISD failed: {e}\n\n")
+        results["cisd"] = None
+
+    # CCSD and CCSD(T)
+    mycc = None
+    try:
+        log.write("Running CCSD...\n")
+        log.flush()
+        mycc = cc.CCSD(mf).run(verbose=0)
+        results["ccsd"] = mycc.e_tot
+        log.write(f"  E(CCSD) = {mycc.e_tot:.12f} Ha\n")
+        log.write(f"  Ecorr   = {mycc.e_corr:.12f} Ha\n\n")
+    except Exception as e:
+        log.write(f"  CCSD failed: {e}\n\n")
+        results["ccsd"] = None
+
+    if mycc is not None:
+        try:
+            log.write("Running CCSD(T)...\n")
+            log.flush()
+            e_t = mycc.ccsd_t()
+            results["ccsd_t"] = mycc.e_tot + e_t
+            log.write(f"  E(T)    = {e_t:.12f} Ha\n")
+            log.write(f"  E(CCSD(T)) = {results['ccsd_t']:.12f} Ha\n")
+            log.write(f"  Ecorr   = {results['ccsd_t'] - mf.e_tot:.12f} Ha\n\n")
+        except Exception as e:
+            log.write(f"  CCSD(T) failed: {e}\n\n")
+            results["ccsd_t"] = None
+    else:
+        log.write("CCSD(T) skipped (CCSD failed)\n\n")
+        results["ccsd_t"] = None
+
+    # FCI (only for small systems)
+    n_orb = mol.nao_nr()
+    if n_orb <= 12:
+        try:
+            log.write("Running FCI (singlet)...\n")
+            cisolver = fci.FCI(mf, singlet=True)
+            cisolver = fci.addons.fix_spin(cisolver, ss=0, shift=2.0)
+            e_fci, _ = cisolver.kernel()
+            results["fci"] = e_fci
+            log.write(f"  E(FCI)  = {e_fci:.12f} Ha\n\n")
+        except Exception as e:
+            log.write(f"  FCI failed: {e}\n\n")
+            results["fci"] = None
+    else:
+        log.write(f"FCI skipped (n_orb={n_orb} > 12)\n\n")
+        results["fci"] = None
+
+    log.write("=" * 60 + "\n\n")
+    log.flush()
+    return results
+
+
+# ============================================================================
+# Orbital Localization
+# ============================================================================
+
+def transform_orbitals(mol: gto.Mole, mf: scf.hf.SCF,
+                      method: str, loc_vir: bool = False) -> np.ndarray:
     """
-    Localize molecular orbitals using different methods.
-    
+    Transform MO coefficients via localization or natural orbitals.
+  
     Args:
         mol: PySCF Mole object
-        mf: PySCF SCF object
-        method: Localization method ('boys', 'pipek', 'edmiston', etc.)
-        
-    Returns:
-        Localized molecular orbital coefficients
+        mf: Mean-field object
+        method: Transform method (boys/pipek/edmiston/ibo/no-mp2/no-cisd/no-ccsd)
+        loc_vir: Apply LIVVO to virtual orbitals
     """
-    mo_coeff = mf.mo_coeff
-    
-    if method.lower() == 'boys':
-        loc_obj = lo.Boys(mol, mo_coeff)
-        mo_loc = loc_obj.kernel()
-    elif method.lower() == 'edmiston':
-        loc_obj = lo.EdmistonRuedenberg(mol, mo_coeff)
-        mo_loc = loc_obj.kernel()
-    elif method.lower() == 'pipek':
-        loc_obj = lo.PipekMezey(mol, mo_coeff)
-        mo_loc = loc_obj.kernel()
-    elif method.lower() == 'nao':
-        mo_loc = lo.orth_ao(mf, 'nao')
-    elif method.lower() == 'lowdin':
-        mo_loc = lo.orth_ao(mf, 'lowdin')
-    elif method.lower() == 'meta-lowdin':
-        mo_loc = lo.orth_ao(mf, 'meta-lowdin')
-    elif method.lower() == 'canonical':
-        # Just return the original coefficients
-        mo_loc = mo_coeff.copy()
-    else:
-        raise ValueError(f"Unsupported localization method: {method}")
-    
-    return mo_loc
+    C = mf.mo_coeff
+    method = (method or "").lower()
+
+    # Natural orbitals (full space)
+    if method in ("no-mp2", "mp2_no"):
+        C_no, _ = get_mp2_no(mf)
+        return C_no
+    if method in ("no-cisd", "cisd_no"):
+        C_no, _ = get_cisd_no(mf)
+        return C_no
+    if method in ("no-ccsd", "ccsd_no"):
+        C_no, _ = get_ccsd_no(mf)
+        return C_no
+
+    # Localization (occupied only)
+    occ_mask = mf.mo_occ > 1e-8
+    C_occ, C_vir = C[:, occ_mask], C[:, ~occ_mask]
+
+    def _localize(C_sub: np.ndarray, how: str) -> np.ndarray:
+        if how == "boys":
+            return lo.boys.Boys(mol, C_sub).kernel()
+        elif how == "pipek":
+            return lo.pipek.PipekMezey(mol, C_sub).kernel()
+        elif how == "edmiston":
+            return edmiston.ER(mol, C_sub).kernel()
+        elif how == "ibo":
+            S = mol.intor_symmetric("int1e_ovlp")
+            iaos = iao.iao(mol, C_sub)
+            iaos = orth.vec_lowdin(iaos, S)
+            return ibo.ibo(mol, C_sub, iaos=iaos, s=S)
+        else:
+            raise ValueError(f"Unknown localization: {how}")
+
+    if method in ("boys", "pipek", "edmiston", "ibo"):
+        C_occ_loc = _localize(C_occ, method)
+        C_vir_loc = vvo.livvo(mol, C_occ_loc, C_vir) if loc_vir else C_vir
+        return np.hstack([C_occ_loc, C_vir_loc])
+
+    if method in ("canonical", None, ""):
+        return C
+
+    raise ValueError(f"Unknown method: {method}")
 
 
-def generate_fcidump(geometry, basis='sto-3g', output_file='FCIDUMP', 
-                     charge=0, spin=0, symmetry=False, localize=None,
-                     active_space=None, verbose=False, use_uhf=False):
+# ============================================================================
+# FCIDUMP Generation
+# ============================================================================
+
+def gen_fcidump(geom: list, basis: str = "sto-3g", out: str = "FCIDUMP",
+                charge: int = 0, spin: int = 0, loc: str = None,
+                verbose: bool = False, loc_vir: bool = False,
+                benchmark: bool = False) -> None:
     """
-    Generate a FCIDUMP file for a molecule.
-    
+    Generate FCIDUMP file from molecular geometry.
+  
     Args:
-        geometry: Molecular geometry
-        basis: Basis set
-        output_file: Output file name
+        geom: Molecular geometry [(atom, (x,y,z)), ...]
+        basis: Basis set name
+        out: Output filename
         charge: Molecular charge
         spin: Number of unpaired electrons (2S)
-        symmetry: Whether to use symmetry
-        localize: Orbital localization method (None, 'boys', 'pipek', etc.)
-        active_space: Tuple of (n_active_electrons, n_active_orbitals)
-        verbose: Whether to print verbose output
-        use_uhf: Whether to use UHF instead of RHF
+        loc: Orbital transform method
+        verbose: Verbose output
+        loc_vir: Localize virtual orbitals with LIVVO
+        benchmark: Run benchmark calculations
     """
-    # Build the molecule
-    mol = gto.Mole()
-    mol.atom = geometry
-    mol.basis = basis
-    mol.charge = charge
-    mol.spin = spin
-    mol.symmetry = symmetry
-    mol.verbose = 4 if verbose else 2
-    mol.build()
-    
-    # Run SCF
-    if use_uhf or spin > 0:
-        mf = scf.UHF(mol)
-    else:
-        mf = scf.RHF(mol)
-    
-    mf.verbose = 4 if verbose else 0
-    mf.conv_tol = 1e-10
-    mf.conv_tol_grad = 1e-8
-    mf.run()
-    
-    # Localize orbitals if requested
-    if localize:
-        print(f"Localizing orbitals using {localize} method...")
-        mo_coeff = localize_orbitals(mol, mf, localize)
-        mf.mo_coeff = mo_coeff
-    
-    # Handle active space
-    if active_space:
-        n_active_electrons, n_active_orbitals = active_space
-        if n_active_orbitals is None:
-            n_active_orbitals = mol.nao_nr()
-        
-        # Assuming closed-shell for simplicity here
-        n_inactive_orbs = (mol.nelectron - n_active_electrons) // 2
-        n_active_orbs = n_active_orbitals
-        
-        active_space = (n_inactive_orbs, n_active_orbs)
-        print(f"Using active space: {n_active_electrons} electrons in {n_active_orbitals} orbitals")
-        print(f"Active space params: {active_space}")
-    else:
-        active_space = None
-    
-    # Write FCIDUMP file
-    fcidump.from_scf(mf, output_file, tol=1e-10, molpro_orbsym=None)
-    
-    print(f"Generated FCIDUMP file: {output_file}")
-    print(f"  Molecule: {mol.atom}")
+    log_filename = out.replace(".FCIDUMP", "") + ".log"
+    if not log_filename.endswith(".log"):
+        log_filename = out + ".log"
+
+    with open(log_filename, "w") as log:
+        # Header
+        log.write("=" * 60 + "\n")
+        log.write("FCIDUMP GENERATION LOG\n")
+        log.write("=" * 60 + "\n")
+        log.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.write(f"Output: {out}\n\n")
+
+        # Build molecule
+        log.write("=" * 60 + "\n")
+        log.write("MOLECULAR GEOMETRY\n")
+        log.write("=" * 60 + "\n")
+        mol = gto.Mole()
+        mol.atom = geom
+        mol.basis = basis
+        mol.charge = charge
+        mol.spin = spin
+        mol.verbose = 4 if verbose else 2
+        mol.build()
+
+        log.write(f"Charge: {charge}\n")
+        log.write(f"Spin (2S): {spin}\n")
+        log.write(f"Basis: {basis}\n")
+        log.write(f"N_electrons: {mol.nelectron}\n")
+        log.write(f"N_orbitals: {mol.nao_nr()}\n\n")
+        log.write("Atomic coordinates (Angstrom):\n")
+        for atom, coord in geom:
+            log.write(f"  {atom:4s}  {coord[0]:12.6f}  {coord[1]:12.6f}  "
+                     f"{coord[2]:12.6f}\n")
+        log.write("\n")
+
+        # SCF calculation
+        log.write("=" * 60 + "\n")
+        log.write("SCF CALCULATION\n")
+        log.write("=" * 60 + "\n")
+        mf = scf.ROHF(mol) if spin > 0 else scf.RHF(mol)
+        mf.verbose = 4 if verbose else 0
+        mf.conv_tol = 1e-10
+        mf.conv_tol_grad = 1e-8
+        log.write(f"Method: {'ROHF' if spin > 0 else 'RHF'}\n")
+        log.write(f"Conv_tol: {mf.conv_tol}\n")
+        log.write(f"Conv_tol_grad: {mf.conv_tol_grad}\n\n")
+        log.flush()
+
+        mf.run()
+
+        log.write(f"E(SCF) = {mf.e_tot:.12f} Ha\n")
+        log.write(f"Converged: {mf.converged}\n\n")
+
+        # Orbital transformation
+        if loc:
+            log.write("=" * 60 + "\n")
+            log.write("ORBITAL TRANSFORMATION\n")
+            log.write("=" * 60 + "\n")
+            log.write(f"Method: {loc}\n")
+            log.write(f"Localize virtuals (LIVVO): {loc_vir}\n\n")
+            log.flush()
+
+            mf.mo_coeff = transform_orbitals(mol, mf, loc, loc_vir)
+            log.write("Transformation completed\n\n")
+
+        # Benchmark calculations
+        if benchmark:
+            bench_results = run_benchmarks(mol, mf, log)
+
+            log.write("=" * 60 + "\n")
+            log.write("ENERGY SUMMARY\n")
+            log.write("=" * 60 + "\n")
+            log.write(f"{'Method':<12s} {'Energy (Ha)':<20s} "
+                     f"{'Corr Energy (Ha)':<20s}\n")
+            log.write("-" * 60 + "\n")
+            log.write(f"{'HF':<12s} {mf.e_tot:< 20.12f} {'---':<20s}\n")
+
+            for method in ["mp2", "cisd", "ccsd", "ccsd_t", "fci"]:
+                method_name = "CCSD(T)" if method == "ccsd_t" else method.upper()
+                if bench_results.get(method) is not None:
+                    e_tot = bench_results[method]
+                    e_corr = e_tot - mf.e_tot
+                    log.write(f"{method_name:<12s} {e_tot:< 20.12f} "
+                             f"{e_corr:< 20.12f}\n")
+                else:
+                    log.write(f"{method_name:<12s} {'N/A':<20s} {'N/A':<20s}\n")
+            log.write("=" * 60 + "\n\n")
+
+        # Write FCIDUMP
+        log.write("=" * 60 + "\n")
+        log.write("FCIDUMP GENERATION\n")
+        log.write("=" * 60 + "\n")
+        log.write(f"Writing to: {out}\n")
+        log.write(f"Tolerance: 1e-12\n\n")
+        log.flush()
+
+        fcidump.from_scf(mf, out, tol=1e-12)
+
+        log.write("FCIDUMP file generated successfully\n\n")
+        log.write("=" * 60 + "\n")
+        log.write("END OF LOG\n")
+        log.write("=" * 60 + "\n")
+
+    # Console output
+    print(f"\nGenerated: {out}")
+    print(f"Log file: {log_filename}")
     print(f"  Basis: {basis}")
     print(f"  E(SCF) = {mf.e_tot:.12f}")
-    
-    # Print orbital symmetries if using symmetry
-    if symmetry:
-        orbsym = symm.label_orb_symm(mol, mol.irrep_id, mol.symm_orb, mf.mo_coeff)
-        print("  Orbital symmetries:", orbsym)
+
+    if benchmark:
+        print("\n  Benchmark energies:")
+        if "mp2" in bench_results and bench_results["mp2"]:
+            print(f"    E(MP2)  = {bench_results['mp2']:.12f}")
+        if "cisd" in bench_results and bench_results["cisd"]:
+            print(f"    E(CISD) = {bench_results['cisd']:.12f}")
+        if "ccsd" in bench_results and bench_results["ccsd"]:
+            print(f"    E(CCSD) = {bench_results['ccsd']:.12f}")
+        if "ccsd_t" in bench_results and bench_results["ccsd_t"]:
+            print(f"    E(CCSD(T)) = {bench_results['ccsd_t']:.12f}")
+        if "fci" in bench_results and bench_results["fci"]:
+            print(f"    E(FCI)  = {bench_results['fci']:.12f}")
 
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description='Generate FCIDUMP files for Dice/SHCI calculations')
-    
-    # Molecule selection
-    parser.add_argument('molecule', type=str, help='Molecule type (h2, h2o, nh3, ch4, etc.)')
-    
-    # Basic options
-    parser.add_argument('--basis', type=str, default='sto-3g', help='Basis set')
-    parser.add_argument('--output', type=str, default='FCIDUMP', help='Output file name')
-    parser.add_argument('--charge', type=int, default=0, help='Molecular charge')
-    parser.add_argument('--spin', type=int, default=0, help='Number of unpaired electrons (2S)')
-    parser.add_argument('--symmetry', action='store_true', help='Use symmetry')
-    parser.add_argument('--uhf', action='store_true', help='Use unrestricted Hartree-Fock')
-    parser.add_argument('--verbose', action='store_true', help='Verbose output')
-    
-    # Molecular geometry parameters
-    parser.add_argument('--distance', type=float, help='Bond distance (in Angstroms)')
-    parser.add_argument('--n_atoms', type=int, help='Number of atoms (for chains, rings, etc.)')
-    parser.add_argument('--radius', type=float, help='Radius (for rings)')
-    
-    # Orbital localization
-    parser.add_argument('--localize', type=str, choices=[
-        'boys', 'pipek', 'edmiston', 'nao', 'lowdin', 'meta-lowdin', 'canonical'],
-        help='Orbital localization method')
-    
-    # Active space
-    parser.add_argument('--active_e', type=int, help='Number of active electrons')
-    parser.add_argument('--active_orb', type=int, help='Number of active orbitals')
-    
-    return parser.parse_args()
+# ============================================================================
+# Command Line Interface
+# ============================================================================
+
+def parse_args():
+    """Parse command line arguments."""
+    p = argparse.ArgumentParser(
+        description="Generate FCIDUMP files with orbital transforms")
+
+    p.add_argument("molecule", help="Molecule type (h2, h2o, c2h4, c2h6, ...)")
+    p.add_argument("--basis", default="sto-3g", help="Basis set")
+    p.add_argument("--output", default="FCIDUMP", help="Output filename")
+    p.add_argument("--charge", type=int, default=0, help="Charge")
+    p.add_argument("--spin", type=int, default=0, help="Unpaired electrons (2S)")
+    p.add_argument("--verbose", action="store_true", help="Verbose output")
+    p.add_argument("--benchmark", action="store_true",
+                   help="Run benchmark calculations")
+
+    # Geometry parameters
+    p.add_argument("--distance", type=float, help="Bond distance (Angstrom)")
+    p.add_argument("--n_atoms", type=int, help="Number of atoms")
+    p.add_argument("--radius", type=float, help="Ring radius")
+    p.add_argument("--cc_dist", type=float, help="C-C bond distance")
+    p.add_argument("--cc_angle", type=float, default=0,
+                   help="C-C rotation angle (degrees)")
+
+    # Orbital transforms
+    p.add_argument("--localize",
+                   choices=["canonical", "boys", "pipek", "edmiston", "ibo",
+                           "no-mp2", "no-cisd", "no-ccsd",
+                           "mp2_no", "cisd_no", "ccsd_no"],
+                   help="Orbital transform method")
+    p.add_argument("--localize_virtual", action="store_true",
+                   help="Localize virtuals with LIVVO")
+
+    return p.parse_args()
 
 
 def main():
-    """Main function"""
-    args = parse_arguments()
-    
-    # Set up geometry based on molecule type
-    molecule = args.molecule.lower()
-    
-    if molecule == 'h2':
-        distance = args.distance or 0.74
-        geometry = generate_diatomic_molecule('H', 'H', distance)
-    elif molecule == 'b2':
-        distance = args.distance or 2.00
-        geometry = generate_diatomic_molecule('B', 'B', distance)
-    elif molecule == 'licl':
-        distance = args.distance or 2.02
-        geometry = generate_diatomic_molecule('Li', 'Cl', distance)
-    elif molecule == 'li2o':
-        geometry = generate_Li2O_geometry()
-    elif molecule == 'c2':
-        distance = args.distance or 2.00
-        geometry = generate_diatomic_molecule('C', 'C', distance)
-    elif molecule == 'hchain':
-        n_atoms = args.n_atoms or 4
-        distance = args.distance or 1.0
-        geometry = generate_hydrogen_chain(n_atoms, distance)
-    elif molecule == 'hring':
-        n_atoms = args.n_atoms or 4
-        radius = args.radius or 1.0
-        geometry = generate_hydrogen_ring(n_atoms, radius)
-    elif molecule == 'h6_chain':
-        n_atoms = args.n_atoms or 6
-        distance = args.distance or 1.0
-        geometry = generate_hydrogen_chain(n_atoms, distance)
-    elif molecule == 'h2o' or molecule == 'water':
-        distance = args.distance or 0.9572
-        geometry = generate_water_geometry(distance)
-    elif molecule == 'nh3' or molecule == 'ammonia':
-        distance = args.distance or 1.012
-        geometry = generate_NH3_geometry(distance)
-    elif molecule == 'ch4' or molecule == 'methane':
-        distance = args.distance or 1.09
-        geometry = generate_CH4_geometry(distance)
-    elif molecule == 'o2':
-        distance = args.distance or 1.208
-        geometry = generate_O2_geometry(distance)
-    elif molecule == 'n2':
-        distance = args.distance or 1.098
-        geometry = generate_N2_geometry(distance)
-    elif molecule == 'co2':
-        distance = args.distance or 1.16
-        geometry = generate_CO2_geometry(distance)
-    else:
-        print(f"Error: Molecule '{molecule}' not supported.")
-        print("Supported molecules: h2, h4_chain, h4_ring, h6_chain, h2o, nh3, ch4, o2, n2, co2")
+    args = parse_args()
+    mol = args.molecule.lower()
+
+    # Geometry dispatch
+    geom_map = {
+        "h2": lambda: _diatomic("H", "H", args.distance or 0.74),
+        "b2": lambda: _diatomic("B", "B", args.distance or 2.0),
+        "c2": lambda: _diatomic("C", "C", args.distance or 1.2425),
+        "n2": lambda: _diatomic("N", "N", args.distance or 1.098),
+        "o2": lambda: _diatomic("O", "O", args.distance or 1.208),
+        "o3": lambda: geom_o3(),
+        "licl": lambda: _diatomic("Li", "Cl", args.distance or 2.02),
+        "li2o": lambda: geom_li2o(),
+        "hchain": lambda: geom_h_chain(args.n_atoms or 4, args.distance or 1.0),
+        "hring": lambda: geom_h_ring(args.n_atoms or 4, args.radius or 1.0),
+        "h6_chain": lambda: geom_h_chain(6, args.distance or 1.0),
+        "h2o": lambda: geom_h2o(args.distance or 0.9572),
+        "water": lambda: geom_h2o(args.distance or 0.9572),
+        "nh3": lambda: geom_nh3(args.distance or 1.012),
+        "ammonia": lambda: geom_nh3(args.distance or 1.012),
+        "ch4": lambda: geom_ch4(args.distance or 1.09),
+        "methane": lambda: geom_ch4(args.distance or 1.09),
+        "co2": lambda: geom_co2(args.distance or 1.16),
+        "c2h4": lambda: geom_c2h4(args.cc_dist or 1.339, args.cc_angle),
+        "ethylene": lambda: geom_c2h4(args.cc_dist or 1.339, args.cc_angle),
+        "c2h6": lambda: geom_c2h6(args.cc_dist or 1.536, args.cc_angle),
+        "ethane": lambda: geom_c2h6(args.cc_dist or 1.536, args.cc_angle),
+    }
+
+    if mol not in geom_map:
+        print(f"Error: Unsupported molecule '{mol}'")
+        print(f"Supported: {', '.join(sorted(geom_map.keys()))}")
         sys.exit(1)
-    
-    # Set up active space
-    active_space = None
-    if args.active_e and args.active_orb:
-        active_space = (args.active_e, args.active_orb)
-    
-    # Generate FCIDUMP file
-    generate_fcidump(
-        geometry=geometry,
+
+    geom = geom_map[mol]()
+
+    gen_fcidump(
+        geom=geom,
         basis=args.basis,
-        output_file=args.output,
+        out=args.output,
         charge=args.charge,
         spin=args.spin,
-        symmetry=args.symmetry,
-        localize=args.localize,
-        active_space=active_space,
+        loc=args.localize,
         verbose=args.verbose,
-        use_uhf=args.uhf
+        loc_vir=args.localize_virtual,
+        benchmark=args.benchmark,
     )
 
 
-if __name__ == '__main__':
-    main() 
+if __name__ == "__main__":
+    main()

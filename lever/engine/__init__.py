@@ -48,7 +48,7 @@ from .utils import (
 from .evaluator import Evaluator
 
 # --- Hamiltonian Construction Bridge ---
-from .hamiltonian import get_ham_proxy, get_ham_full, get_ham_ss
+from .hamiltonian import get_ham_proxy, get_ham_full
 
 # --- Physics Computations ---
 from .physics import (
@@ -87,7 +87,6 @@ __all__ = [
     "Evaluator",
     "get_ham_proxy",
     "get_ham_full",
-    "get_ham_ss",
     "compute_energy_and_gradient",
     "compute_energy",
     "compute_local_energy",

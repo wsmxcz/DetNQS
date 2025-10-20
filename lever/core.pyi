@@ -2,83 +2,72 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Type stubs for C++ bridge module (nanobind extension).
+Type stubs for LEVER C++ extension module.
 
-Provides type hints for low-level computational routines including:
-- Determinant space generation (Slater determinant enumeration)
-- Hamiltonian matrix construction (COO sparse format)
-- Heat-bath screening (importance-based determinant selection)
-
-File: lever/core.pyi
-Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Provides type hints for determinant generation, Hamiltonian construction,
+and heat-bath screening routines.
 """
 
-from typing import Any, TypedDict
+from typing import Optional, TypedDict
 
 import numpy as np
 import numpy.typing as npt
 
 # --- Type Aliases ---
 
-DetArray = npt.NDArray[np.uint64]  # Determinants: shape (N, 2), bitstring pairs
-F64Array = npt.NDArray[np.float64]  # Real values: shape (N,)
-U32Array = npt.NDArray[np.uint32]   # Indices: shape (N,)
+DetArray = npt.NDArray[np.uint64]  # Shape (N, 2): determinant bitstrings
+F64Array = npt.NDArray[np.float64]  # Shape (N,): floating point values
+U32Array = npt.NDArray[np.uint32]   # Shape (N,): integer indices
 
 
 class CooData(TypedDict):
-    """COO sparse matrix components."""
+    """Sparse matrix in COO format."""
     row: U32Array
     col: U32Array
     val: F64Array
 
 
-class HamSCResult(TypedDict):
-    """<S|H|C> block with generated C-space."""
-    conns: CooData
-    det_C: DetArray
-    size_C: int
+class HamBlockResult(TypedDict):
+    """Hamiltonian blocks for predefined spaces."""
+    SS: CooData  # <S|H|S> block
+    SC: CooData  # <S|H|C> block
 
 
-class HamSTResult(TypedDict):
-    """<S|H|T> unified block where T = S ∪ C."""
-    conns: CooData
-    det_T: DetArray
-    size_S: int
-    size_T: int
+class HamConnResult(TypedDict):
+    """Hamiltonian with dynamically discovered C-space."""
+    SS: CooData      # <S|H|S> block
+    SC: CooData      # <S|H|C> block
+    det_C: DetArray  # Discovered C-space determinants
+    size_C: int      # Number of C-space determinants
 
 
-class HamSSSCResult(TypedDict):
-    """Combined <S|H|S> and <S|H|C> blocks."""
-    SS: CooData
-    SC: CooData
-    det_C: DetArray
-    size_C: int
-
-
-# --- C++ Extension Classes ---
+# --- Integral Context ---
 
 class IntCtx:
     """
-    Integral context with molecular integrals and optional heat-bath cache.
+    Integral context with optional heat-bath cache.
     
-    Manages FCIDUMP-loaded integrals and provides Hamiltonian evaluation.
+    Loads molecular integrals from FCIDUMP and provides Hamiltonian evaluation.
     Heat-bath table enables efficient importance-based screening.
     """
     
     def __init__(self, fcidump_path: str, num_orb: int) -> None:
-        """Load integrals from FCIDUMP file."""
+        """
+        Load integrals from FCIDUMP file.
+        
+        Args:
+            fcidump_path: Path to FCIDUMP file
+            num_orb: Number of spatial orbitals
+        """
         ...
     
     def get_e_nuc(self) -> float:
-        """Return nuclear repulsion energy."""
+        """Get nuclear repulsion energy."""
         ...
     
     def hb_prepare(self, threshold: float = 1e-8) -> None:
         """
         Build heat-bath table cache.
-        
-        Precomputes sorted excitation importance values for screening.
         
         Args:
             threshold: Minimum |integral| value to store
@@ -90,164 +79,143 @@ class IntCtx:
         ...
 
 
-# --- C++ Extension Functions ---
+# --- Determinant Generation ---
 
 def gen_fci_dets(n_orb: int, n_alpha: int, n_beta: int) -> DetArray:
     """
-    Generate full FCI space via combinatorial enumeration.
+    Generate full CI space via combinatorial enumeration.
     
+    Args:
+        n_orb: Number of spatial orbitals
+        n_alpha: Number of alpha electrons
+        n_beta: Number of beta electrons
+        
     Returns:
         Determinants as (α, β) bitstring pairs, shape (N_FCI, 2)
     """
     ...
 
-# MODIFIED: Updated signature for gen_excited_dets
-def gen_excited_dets(
-    ref_dets: DetArray,
-    n_orb: int,
-    int_ctx: IntCtx,
-    use_heatbath: bool = False,
-    eps1: float = 1e-3,
-) -> DetArray:
+
+def gen_excited_dets(ref_dets: DetArray, n_orb: int) -> DetArray:
     """
-    Generate all unique single/double excitations from reference determinants.
+    Generate all unique single and double excitations.
     
     Args:
-        ref_dets: The reference determinants to generate excitations from.
-        n_orb: The number of spatial orbitals.
-        int_ctx: The integral context, required for heat-bath screening.
-        use_heatbath: If True, enables importance-based screening for doubles.
-        eps1: The heat-bath selection threshold for doubles.
+        ref_dets: Reference determinants, shape (N, 2)
+        n_orb: Number of spatial orbitals
         
     Returns:
-        A canonicalized (sorted, unique) array of excited determinants.
+        Canonicalized (sorted, unique) excited determinants
     """
     ...
 
 
-def get_ham_diag(dets: DetArray, int_ctx: IntCtx, n_orbitals: int) -> F64Array:
+# --- Hamiltonian Construction ---
+
+def get_ham_diag(dets: DetArray, int_ctx: IntCtx) -> F64Array:
     """
     Compute diagonal Hamiltonian elements ⟨D|Ĥ|D⟩.
     
-    Evaluates one-body and two-body terms via bitstring manipulation.
-    """
-    ...
-
-# NEW: Added signature for get_ham_block
-def get_ham_block(
-    bra_dets: DetArray,
-    ket_dets: DetArray,
-    int_ctx: IntCtx,
-    n_orbitals: int,
-    thresh: float = 1e-12,
-) -> CooData:
-    """
-    Compute the Hamiltonian block <bra|H|ket> between two arbitrary sets.
-    
     Args:
-        bra_dets: Determinants for the rows of the matrix.
-        ket_dets: Determinants for the columns of the matrix.
-        int_ctx: The integral context.
-        n_orbitals: The number of spatial orbitals.
-        thresh: A cutoff to prune small matrix elements.
+        dets: Determinants, shape (N, 2)
+        int_ctx: Integral context
         
     Returns:
-        A dictionary representing the COO sparse matrix.
+        Diagonal elements, shape (N,)
     """
     ...
 
 
-def get_ham_conns_SS(
-    dets_S: DetArray,
+def get_ham_block(
+    bra_dets: DetArray,
+    ket_dets: Optional[DetArray],
     int_ctx: IntCtx,
     n_orbitals: int,
-    thresh: float = 1e-12,
-) -> CooData:
+    thresh: float = 1e-15,
+) -> HamBlockResult:
     """
-    Build ⟨S|Ĥ|S⟩ block in COO format via direct excitation enumeration.
+    Compute Hamiltonian blocks for predefined spaces.
     
     Args:
-        thresh: Drop matrix elements with |H_ij| < thresh
+        bra_dets: S-space determinants (rows)
+        ket_dets: C-space determinants (columns). If None, only <S|H|S> computed
+        int_ctx: Integral context
+        n_orbitals: Number of spatial orbitals
+        thresh: Cutoff for small matrix elements
+        
+    Returns:
+        Dictionary with 'SS' and 'SC' COO matrices
     """
     ...
 
 
-def get_ham_conns_SC(
+def get_ham_conn(
     dets_S: DetArray,
     int_ctx: IntCtx,
     n_orbitals: int,
     use_heatbath: bool = False,
-    eps1: float = 1e-3,
-    thresh: float = 1e-12,
-) -> HamSCResult:
+    eps1: float = 1e-6,
+    thresh: float = 1e-15,
+) -> HamConnResult:
     """
-    Build ⟨S|Ĥ|C⟩ block with optional heat-bath screening.
+    Build Hamiltonian with static heat-bath screening.
+    
+    Discovers C-space determinants using importance-based selection on integrals.
     
     Args:
-        use_heatbath: Enable importance-based determinant selection
-        eps1: Heat-bath selection threshold for |H_SC|
-        thresh: Drop matrix elements with |H_ij| < thresh
+        dets_S: S-space determinants
+        int_ctx: Integral context
+        n_orbitals: Number of spatial orbitals
+        use_heatbath: Enable heat-bath screening for doubles
+        eps1: Heat-bath threshold |<ij||ab>|
+        thresh: Drop matrix elements |H_ij| < thresh
     
     Returns:
-        Dictionary with COO matrix, generated C-space, and C-space size
+        Dictionary with SS/SC matrices and discovered C-space
     """
     ...
 
 
-def get_ham_conns_ST(
+def get_ham_conn_amp(
     dets_S: DetArray,
+    psi_S: F64Array,
     int_ctx: IntCtx,
     n_orbitals: int,
-    use_heatbath: bool = False,
-    eps1: float = 1e-3,
-    thresh: float = 1e-12,
-) -> HamSTResult:
+    eps1: float = 1e-6,
+    thresh: float = 1e-15,
+) -> HamConnResult:
     """
-    Build unified ⟨S|Ĥ|T⟩ block where T = S ∪ C.
+    Build Hamiltonian with dynamic amplitude screening.
     
-    Concatenates S and C spaces for single-matrix representation.
+    Discovers C-space determinants using amplitude-weighted importance.
+    Requires heat-bath table.
+    
+    Args:
+        dets_S: S-space determinants
+        psi_S: Amplitudes for dets_S
+        int_ctx: Integral context (heat-bath table required)
+        n_orbitals: Number of spatial orbitals
+        eps1: Screening threshold |H_ij * psi_i|
+        thresh: Drop matrix elements |H_ij| < thresh
     
     Returns:
-        Dictionary with COO matrix, T-space determinants, and sizes
+        Dictionary with SS/SC matrices and discovered C-space
     """
     ...
 
 
-def get_ham_conns_SSSC(
-    dets_S: DetArray,
-    int_ctx: IntCtx,
-    n_orbitals: int,
-    use_heatbath: bool = False,
-    eps1: float = 1e-3,
-    thresh: float = 1e-12,
-) -> HamSSSCResult:
-    """
-    Build ⟨S|Ĥ|S⟩ and ⟨S|Ĥ|C⟩ in single pass for efficiency.
-    
-    Avoids redundant excitation generation by processing both blocks together.
-    
-    Returns:
-        Dictionary with both COO matrices, C-space determinants, and C-space size
-    """
-    ...
-
-
-# Update the __all__ list to include the new function
 __all__ = [
     "DetArray",
-    "F64Array", 
+    "F64Array",
     "U32Array",
     "CooData",
-    "HamSCResult",
-    "HamSTResult",
-    "HamSSSCResult",
+    "HamBlockResult",
+    "HamConnResult",
     "IntCtx",
     "gen_fci_dets",
     "gen_excited_dets",
     "get_ham_diag",
-    "get_ham_block",      # Added the new function
-    "get_ham_conns_SS",
-    "get_ham_conns_SC",
-    "get_ham_conns_ST",
-    "get_ham_conns_SSSC",
+    "get_ham_block",
+    "get_ham_conn",
+    "get_ham_conn_amp",
 ]

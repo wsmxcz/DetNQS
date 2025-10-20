@@ -95,6 +95,8 @@ ehthumbs.db
 *.seed
 .benchmarks
 *.FCIDUMP
+*.pdf
+*.csv
 performance/
 runs/
 scans/

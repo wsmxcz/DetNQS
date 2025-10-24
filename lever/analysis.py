@@ -246,8 +246,8 @@ class AnalysisSuite:
         
         fci_dets = core.gen_fci_dets(sys.n_orbitals, sys.n_alpha, sys.n_beta)
         
-        ham_fci, _, _, _ = engine.hamiltonian.get_ham_full(
-            S_dets=fci_dets, C_dets=fci_dets,
+        ham_fci, _ = engine.hamiltonian.get_ham_ss(
+            S_dets=fci_dets,
             int_ctx=self.int_ctx, n_orbitals=sys.n_orbitals,
         )
         

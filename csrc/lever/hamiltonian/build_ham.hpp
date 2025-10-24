@@ -42,6 +42,25 @@ namespace lever {
 );
 
 /**
+ * Build H_SS only (for CI evaluations without SC block).
+ *
+ * Behavior:
+ *  - Diagonal + full singles/doubles within S
+ *  - No C-space discovery or SC interactions
+ *
+ * @param dets_S  S determinants
+ * @param ham     Hamiltonian evaluator
+ * @param n_orb   Number of spatial orbitals
+ * @return COO matrix for H_SS
+ */
+[[nodiscard]] COOMatrix get_ham_ss(
+    std::span<const Det> dets_S,
+    const HamEval& ham,
+    int n_orb
+);
+
+
+/**
  * Build H_SS and H_SC with pre-defined S and C spaces.
  *
  * Behavior:

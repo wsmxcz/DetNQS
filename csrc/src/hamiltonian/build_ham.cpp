@@ -418,6 +418,28 @@ std::vector<double> get_ham_diag(
     return diag;
 }
 
+COOMatrix get_ham_ss(
+    std::span<const Det> dets_S,
+    const HamEval& ham,
+    int n_orb
+) {
+    COOMatrix out;
+    if (dets_S.empty()) return out;
+    const auto map_S = DetMap::from_ordered(
+        {dets_S.begin(), dets_S.end()}, 
+        /*verify_unique=*/true
+    );
+    // Use KnownSets policy with empty C space (only SS connections)
+    PolicyKnownSets policy{map_S, /*map_C=*/DetMap{}};
+    std::vector<COOMatrix> tl_ss, tl_sc_idx;
+    std::vector<std::vector<KeyedEntry>> tl_sc_key;
+    stream_build(dets_S, ham, n_orb, /*hb=*/nullptr, policy,
+                 tl_ss, tl_sc_idx, tl_sc_key);
+    merge_thread_local(tl_ss, out);
+    out.n_rows = out.n_cols = static_cast<u32>(dets_S.size());
+    return out;
+}
+
 HamBlocks get_ham_block(
     std::span<const Det> dets_S,
     std::optional<std::span<const Det>> dets_C,
@@ -490,7 +512,8 @@ HamBlocks get_ham_conn(
     std::vector<COOMatrix> tl_ss, tl_sc_idx;
     std::vector<std::vector<KeyedEntry>> tl_sc_key;
 
-    stream_build(dets_S, ham, n_orb, nullptr, policy,
+    // FIX: Pass hb_table instead of nullptr
+    stream_build(dets_S, ham, n_orb, hb_table, policy,
                  tl_ss, tl_sc_idx, tl_sc_key);
 
     merge_thread_local(tl_ss, out.H_SS);
@@ -502,6 +525,7 @@ HamBlocks get_ham_conn(
 
     return out;
 }
+
 
 HamBlocks get_ham_conn_amp(
     std::span<const Det> dets_S,

@@ -49,7 +49,7 @@ class Driver:
     Coordinates active space evolution (outer) and VMC optimization (inner)
     using JIT-compiled lax.scan for efficient gradient descent.
     """
-  
+
     def __init__(
         self,
         config: LeverConfig,
@@ -63,7 +63,7 @@ class Driver:
       
         # Initialize integral context with heat-bath precomputation
         self.int_ctx = core.IntCtx(config.system.fcidump_path, config.system.n_orbitals)
-        self.int_ctx.hb_prepare()
+        self.int_ctx.hb_prepare(threshold=1e-15)
         self.e_nuc = self.int_ctx.get_e_nuc()
 
     def run(self) -> DriverResults:
@@ -128,26 +128,37 @@ class Driver:
         )
 
     def _build_hamiltonian(self, s_dets: np.ndarray) -> tuple[Any, Any, Any]:
-        """Construct Hamiltonian blocks H_SS, H_SC with optional screening."""
+        """Construct Hamiltonian blocks H_SS, H_SC with mode-specific screening."""
         cfg = self.config
-      
-        if cfg.screening.mode == ScreenMode.DYNAMIC:
-            # Dynamic screening: importance sampling via ψ_S amplitudes
-            psi_s = self._compute_s_amplitudes(s_dets)
+        
+        # Map ScreenMode enum to string for backend dispatch
+        if cfg.screening.mode == ScreenMode.NONE:
             return engine.hamiltonian.get_ham_proxy(
-                S_dets=s_dets, int_ctx=self.int_ctx, 
+                S_dets=s_dets,
+                int_ctx=self.int_ctx,
                 n_orbitals=cfg.system.n_orbitals,
-                psi_S=psi_s, use_heatbath=True, eps1=cfg.screening.eps1
+                mode="none",
             )
         elif cfg.screening.mode == ScreenMode.STATIC:
-            # Static screening: determinant structure only
             return engine.hamiltonian.get_ham_proxy(
-                S_dets=s_dets, int_ctx=self.int_ctx,
+                S_dets=s_dets,
+                int_ctx=self.int_ctx,
                 n_orbitals=cfg.system.n_orbitals,
-                use_heatbath=True, eps1=cfg.screening.eps1
+                mode="static",
+                eps1=cfg.screening.eps1,
+            )
+        elif cfg.screening.mode == ScreenMode.DYNAMIC:
+            psi_s = self._compute_s_amplitudes(s_dets)
+            return engine.hamiltonian.get_ham_proxy(
+                S_dets=s_dets,
+                int_ctx=self.int_ctx,
+                n_orbitals=cfg.system.n_orbitals,
+                mode="dynamic",
+                psi_S=psi_s,
+                eps1=cfg.screening.eps1,
             )
         else:
-            raise NotImplementedError(f"Unsupported mode: {cfg.screening.mode}")
+            raise NotImplementedError(f"Unsupported screening mode: {cfg.screening.mode}")
 
     def _optimize_parameters(
         self, ham_ss, ham_sc, space_rep
@@ -258,8 +269,8 @@ class Driver:
         if eval_var or eval_t_ci:
             # Construct full T-space Hamiltonian
             t_dets = np.concatenate([space_rep.s_dets, space_rep.c_dets])
-            ham_tt, _, _, _ = engine.hamiltonian.get_ham_full(
-                S_dets=t_dets, C_dets=t_dets,
+            ham_tt, _ = engine.hamiltonian.get_ham_ss(
+                S_dets=t_dets,
                 int_ctx=self.int_ctx,
                 n_orbitals=cfg.system.n_orbitals,
             )

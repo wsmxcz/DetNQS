@@ -210,6 +210,17 @@ NB_MODULE(_lever_cpp, m) {
           },
           "dets"_a, "int_ctx"_a);
 
+    // Hamiltonian SS block only
+    m.def("get_ham_ss",
+        [](DetArrayRO dets, const IntCtx* ctx, int n_orb) {
+            auto coo = lever::get_ham_ss(
+                to_det_vector(dets), ctx->ham, n_orb
+            );
+            return from_coo_matrix(coo);
+        },
+        "dets_S"_a, "int_ctx"_a, "n_orbitals"_a,
+        "Build H_SS only for CI evaluations");
+
     // Hamiltonian blocks (known sets)
     m.def("get_ham_block",
           [](DetArrayRO bra_dets, 

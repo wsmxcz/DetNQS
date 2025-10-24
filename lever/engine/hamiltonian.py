@@ -5,7 +5,7 @@
 Hamiltonian operator construction bridging Python frontend and C++ backend.
 
 Implements PROXY (streaming screening) and FULL (exact subspace) workflows
-for variational quantum chemistry. Uses sparse COO format for efficiency.
+for variational quantum chemistry using sparse COO format.
 
 File: lever/engine/hamiltonian.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -14,7 +14,7 @@ Date: October, 2025
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
@@ -33,30 +33,24 @@ def _extract_diagonal(ham_op: HamOp) -> np.ndarray:
     """
     Extract diagonal H_ii from sparse COO matrix.
     
-    Algorithm: Filter rows where i=j, index by row, fill dense array.
-    
-    Args:
-        ham_op: Square sparse Hamiltonian in COO format
+    Algorithm: Filter row==col pairs, index by row number.
     
     Returns:
         H_diag[i] = ⟨i|Ĥ|i⟩
-    
-    Raises:
-        ValueError: If operator is not square
     """
     if ham_op.shape[0] != ham_op.shape[1]:
         raise ValueError("Diagonal extraction requires square operator")
         
     size = ham_op.shape[0]
     H_diag = np.zeros(size, dtype=np.float64)
-    diag_mask = (ham_op.rows == ham_op.cols)
+    diag_mask = ham_op.rows == ham_op.cols
     H_diag[ham_op.rows[diag_mask]] = ham_op.vals[diag_mask]
     
     return H_diag
 
 
 def _to_coo_dict(ham_op: HamOp) -> dict[str, np.ndarray | tuple[int, int]]:
-    """Convert HamOp to CooData dictionary for C++ interface."""
+    """Convert HamOp to CooData dict for C++ backend."""
     return {
         "row": ham_op.rows,
         "col": ham_op.cols,
@@ -66,12 +60,37 @@ def _to_coo_dict(ham_op: HamOp) -> dict[str, np.ndarray | tuple[int, int]]:
 
 
 def _from_coo_dict(coo_dict: dict) -> HamOp:
-    """Convert CooData dictionary from C++ to HamOp."""
+    """Convert C++ CooData dict to HamOp."""
     return HamOp(
         rows=coo_dict["row"],
         cols=coo_dict["col"],
         vals=coo_dict["val"],
         shape=tuple(coo_dict["shape"]),
+    )
+
+
+def _remove_s_from_c(
+    S_dets: NDArray[np.uint64], 
+    C_dets: NDArray[np.uint64]
+) -> NDArray[np.uint64]:
+    """
+    Remove S-space overlaps from C-space determinants.
+    
+    Algorithm: Set-based lookup with O(|S| + |C|) complexity.
+    
+    Returns:
+        Filtered C-space determinants preserving original order
+    """
+    if len(C_dets) == 0:
+        return np.empty((0, 2), dtype=np.uint64)
+    
+    S_set = {(int(d[0]), int(d[1])) for d in S_dets}
+    C_filtered = [d for d in C_dets if (int(d[0]), int(d[1])) not in S_set]
+    
+    return (
+        np.array(C_filtered, dtype=np.uint64) 
+        if C_filtered 
+        else np.empty((0, 2), dtype=np.uint64)
     )
 
 
@@ -83,46 +102,62 @@ def get_ham_proxy(
     S_dets: NDArray[np.uint64],
     int_ctx: core.IntCtx,
     n_orbitals: int,
-    psi_S: Optional[NDArray[np.float64]] = None,
-    use_heatbath: bool = True,
-    eps1: float = 1e-3,
-    diag_shift: float = 0.5,
+    mode: str = "none",
+    psi_S: NDArray[np.float64] | None = None,
+    eps1: float = 1e-6,
+    diag_shift: float = 0.0,
 ) -> tuple[HamOp, HamOp, SpaceRep]:
     """
-    Construct Ĥ_SS and Ĥ_SC with streaming C-space discovery.
+    Build H_SS and H_SC with unified screening modes.
     
-    Screening Modes:
-      • Static Heat-Bath (psi_S=None): Select by integral |⟨ij||ab⟩| > eps1
-      • Dynamic Amplitude (psi_S given): Select by |H_ij·ψ_i| > eps1 (HCI-style)
+    Screening modes:
+      • "none": Full singles/doubles enumeration
+      • "static": Heat-bath screening with fixed ε₁ cutoff
+      • "dynamic": Amplitude-weighted screening (requires ψ_S)
     
     Algorithm:
-      1. Generate singles/doubles from S-space
-      2. Apply screening criterion (heat-bath or amplitude-weighted)
-      3. Build Ĥ_SS and Ĥ_SC simultaneously in single pass
-      4. Compute H_diag_C for discovered C-space
+      1. Generate C-space via C++ backend with selected screening
+      2. Build ⟨S|Ĥ|S⟩ and ⟨S|Ĥ|C⟩ in COO format
+      3. Extract/compute H_diag for S and C spaces
     
     Args:
-        S_dets: Reference space determinants, shape (n_S, 2)
+        S_dets: Reference determinants, shape (n_S, 2)
         int_ctx: C++ integral context
         n_orbitals: Number of spatial orbitals
-        psi_S: Optional wavefunction for dynamic screening
-        use_heatbath: Enable heat-bath screening for doubles
-        eps1: Screening threshold (mode-dependent interpretation)
-        diag_shift: Level shift for H_diag_C (stabilization)
+        mode: Screening strategy
+        psi_S: S-space wavefunction for dynamic mode
+        eps1: Screening threshold
+        diag_shift: Level shift for H_diag_C stabilization
     
     Returns:
-        (ham_ss, ham_sc, space):
-          • ham_ss: ⟨S|Ĥ|S⟩ operator
-          • ham_sc: ⟨S|Ĥ|C⟩ coupling operator
-          • space: S ∪ C Hilbert space representation with diagonals
+        (H_SS, H_SC, space): Hamiltonian blocks and Hilbert space representation
     """
     S = np.ascontiguousarray(S_dets, dtype=np.uint64)
     size_S = len(S)
 
-    # Select C++ backend based on screening mode
-    if psi_S is not None:
+    # Dispatch to C++ backend based on screening mode
+    if mode == "none":
+        C_raw = core.gen_excited_dets(S, n_orbitals)
+        C = _remove_s_from_c(S, C_raw)
+        result = core.get_ham_block(
+            bra_dets=S, 
+            ket_dets=C, 
+            int_ctx=int_ctx, 
+            n_orbitals=n_orbitals
+        )
+    elif mode == "static":
+        result = core.get_ham_conn(
+            dets_S=S,
+            int_ctx=int_ctx,
+            n_orbitals=n_orbitals,
+            use_heatbath=True,
+            eps1=eps1,
+        )
+    elif mode == "dynamic":
+        if psi_S is None:
+            raise ValueError("Dynamic mode requires psi_S amplitudes")
         if len(psi_S) != size_S:
-            raise ValueError(f"psi_S length {len(psi_S)} ≠ S_dets length {size_S}")
+            raise ValueError(f"psi_S size mismatch: {len(psi_S)} ≠ {size_S}")
         
         psi = np.ascontiguousarray(psi_S, dtype=np.float64)
         result = core.get_ham_conn_amp(
@@ -133,13 +168,7 @@ def get_ham_proxy(
             eps1=eps1,
         )
     else:
-        result = core.get_ham_conn(
-            dets_S=S,
-            int_ctx=int_ctx,
-            n_orbitals=n_orbitals,
-            use_heatbath=use_heatbath,
-            eps1=eps1,
-        )
+        raise ValueError(f"Unknown screening mode: {mode}")
 
     # Unpack sparse COO data
     coo_ss, coo_sc = result["H_SS"], result["H_SC"]
@@ -160,10 +189,8 @@ def get_ham_proxy(
         shape=(size_S, size_C),
     )
 
-    # Extract H_diag_S from Ĥ_SS diagonal
+    # Extract/compute diagonal elements
     H_diag_S = _extract_diagonal(ham_ss)
-
-    # Compute H_diag_C via direct evaluation
     H_diag_C = (
         core.get_ham_diag(dets=C_dets, int_ctx=int_ctx) + diag_shift
         if size_C > 0
@@ -179,6 +206,64 @@ def get_ham_proxy(
 
     return ham_ss, ham_sc, space
 
+# ============================================================================
+# Main API: Basic Hamiltonian Construction
+# ============================================================================
+
+def get_ham_ss(
+    S_dets: NDArray[np.uint64],
+    int_ctx: core.IntCtx,
+    n_orbitals: int,
+) -> tuple[HamOp, SpaceRep]:
+    """
+    Build H_SS block without C-space discovery.
+    
+    Efficient for CI evaluations without SC coupling requirements.
+    Uses full singles/doubles enumeration within S-space only.
+    
+    Algorithm:
+      1. Call C++ backend for ⟨S|Ĥ|S⟩ block construction
+      2. Extract H_diag_S from diagonal elements
+      3. Return space with empty C-space
+    
+    Args:
+        S_dets: Reference determinants, shape (n_S, 2)
+        int_ctx: C++ integral context
+        n_orbitals: Number of spatial orbitals
+    
+    Returns:
+        (H_SS, space): Hamiltonian block and S-only space representation
+    """
+    S = np.ascontiguousarray(S_dets, dtype=np.uint64)
+    size_S = len(S)
+    
+    # Build H_SS block via C++ backend
+    coo_ss = core.get_ham_ss(
+        dets_S=S,
+        int_ctx=int_ctx,
+        n_orbitals=n_orbitals,
+    )
+    
+    # Construct sparse operator
+    ham_ss = HamOp(
+        rows=coo_ss["row"],
+        cols=coo_ss["col"],
+        vals=coo_ss["val"],
+        shape=(size_S, size_S),
+    )
+    
+    # Extract diagonal elements
+    H_diag_S = _extract_diagonal(ham_ss)
+    
+    # Create space representation with empty C-space
+    space = SpaceRep(
+        s_dets=S,
+        c_dets=np.empty((0, 2), dtype=np.uint64),
+        H_diag_S=H_diag_S,
+        H_diag_C=np.array([], dtype=np.float64),
+    )
+    
+    return ham_ss, space
 
 # ============================================================================
 # Main API: Full Hamiltonian Construction
@@ -191,31 +276,21 @@ def get_ham_full(
     n_orbitals: int,
 ) -> tuple[HamOp, HamOp, HamOp, SpaceRep]:
     """
-    Construct complete Hamiltonian blocks for exact S ∪ C subspace.
+    Build complete Hamiltonian blocks for exact S ∪ C subspace.
     
     Algorithm:
       1. Build ⟨S|Ĥ|S⟩ and ⟨S|Ĥ|C⟩ in single S-space iteration
       2. Build ⟨C|Ĥ|C⟩ in separate C-space iteration
       3. Extract diagonals from square blocks
     
-    Args:
-        S_dets: Reference space determinants, shape (n_S, 2)
-        C_dets: External space determinants, shape (n_C, 2)
-        int_ctx: C++ integral context
-        n_orbitals: Number of spatial orbitals
-    
     Returns:
-        (ham_ss, ham_sc, ham_cc, space):
-          • ham_ss: ⟨S|Ĥ|S⟩ operator
-          • ham_sc: ⟨S|Ĥ|C⟩ operator
-          • ham_cc: ⟨C|Ĥ|C⟩ operator
-          • space: S ∪ C Hilbert space representation with diagonals
+        (H_SS, H_SC, H_CC, space): Complete Hamiltonian blocks and space
     """
     S = np.ascontiguousarray(S_dets, dtype=np.uint64)
     C = np.ascontiguousarray(C_dets, dtype=np.uint64)
     size_S, size_C = len(S), len(C)
 
-    # Phase 1-2: Build ⟨S|Ĥ|S⟩ and ⟨S|Ĥ|C⟩ jointly
+    # Phase 1: Build ⟨S|Ĥ|S⟩ and ⟨S|Ĥ|C⟩
     result_S = core.get_ham_block(
         bra_dets=S,
         ket_dets=C,
@@ -224,7 +299,6 @@ def get_ham_full(
     )
     
     coo_ss, coo_sc = result_S["H_SS"], result_S["H_SC"]
-
     ham_ss = HamOp(
         rows=coo_ss["row"],
         cols=coo_ss["col"],
@@ -238,7 +312,7 @@ def get_ham_full(
         shape=(size_S, size_C),
     )
 
-    # Phase 3: Build ⟨C|Ĥ|C⟩ independently
+    # Phase 2: Build ⟨C|Ĥ|C⟩
     result_C = core.get_ham_block(
         bra_dets=C,
         ket_dets=None,
@@ -246,8 +320,7 @@ def get_ham_full(
         n_orbitals=n_orbitals,
     )
     
-    coo_cc = result_C["H_SS"]  # ⟨C|Ĥ|C⟩ returned as 'H_SS'
-
+    coo_cc = result_C["H_SS"]
     ham_cc = HamOp(
         rows=coo_cc["row"],
         cols=coo_cc["col"],
@@ -255,7 +328,7 @@ def get_ham_full(
         shape=(size_C, size_C),
     )
 
-    # Extract diagonals from constructed blocks
+    # Extract diagonals
     H_diag_S = _extract_diagonal(ham_ss)
     H_diag_C = _extract_diagonal(ham_cc)
 
@@ -288,41 +361,37 @@ def get_ham_eff(
     Computes: H_eff = H_SS + H_SC · D⁻¹ · H_CS
     where D_jj = E_ref - H_CC[j,j]
     
-    Regularization Strategies:
-      • "linear_shift": 1/(d + ε·sign(d)) - Sharp transition at zero
-      • "sigma": d/(d² + ε²) - Smooth Tikhonov-style (recommended)
+    Regularization:
+      • "linear_shift": 1/(d + ε·sign(d)) - Sharp zero crossing
+      • "sigma": d/(d² + ε²) - Smooth Tikhonov-style
     
     Algorithm:
-      1. Compute regularized denominators D_jj⁻¹
-      2. Column-wise outer products: ΔH = Σ_j (D_jj⁻¹)·b_j⊗b_j
+      1. Compute regularized D_jj⁻¹
+      2. Column-wise outer products: ΔH = Σⱼ (D_jj⁻¹)·bⱼ⊗bⱼ
       3. Assemble H_eff = H_SS + ΔH with duplicate merging
     
     Args:
-        ham_ss: ⟨S|Ĥ|S⟩ block in COO format
-        ham_sc: ⟨S|Ĥ|C⟩ block in COO format
-        h_cc_diag: Diagonal elements H_CC[j,j], shape (|C|,)
+        ham_ss: ⟨S|Ĥ|S⟩ block
+        ham_sc: ⟨S|Ĥ|C⟩ block
+        h_cc_diag: Diagonal elements H_CC[j,j]
         e_ref: Reference energy for denominator
-        reg_type: Regularization strategy ("linear_shift" or "sigma")
+        reg_type: Regularization strategy
         epsilon: Regularization parameter
         upper_only: Compute upper triangle only, then mirror
     
     Returns:
         Assembled H_eff in COO format
-        
-    Raises:
-        ValueError: If dimensions are inconsistent
     """
     if ham_ss.shape[0] != ham_ss.shape[1]:
         raise ValueError("H_SS must be square")
     if ham_sc.shape[0] != ham_ss.shape[0]:
-        raise ValueError("H_SC row dimension must match H_SS")
+        raise ValueError("H_SC row dimension mismatch")
     if ham_sc.shape[1] != len(h_cc_diag):
-        raise ValueError("H_SC column dimension must match h_cc_diag length")
+        raise ValueError("H_SC column dimension mismatch with h_cc_diag")
     
-    # Convert to CooData format for C++ interface
+    # Convert to C++ interface format
     H_SS_dict = _to_coo_dict(ham_ss)
     H_SC_dict = _to_coo_dict(ham_sc)
-    
     h_cc = np.ascontiguousarray(h_cc_diag, dtype=np.float64)
     
     # Call C++ backend
@@ -336,8 +405,7 @@ def get_ham_eff(
         upper_only=upper_only,
     )
     
-    # Convert back to HamOp
     return _from_coo_dict(result)
 
 
-__all__ = ["get_ham_proxy", "get_ham_full", "get_ham_eff"]
+__all__ = ["get_ham_ss", "get_ham_proxy", "get_ham_full", "get_ham_eff"]

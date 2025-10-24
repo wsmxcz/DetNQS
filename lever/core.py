@@ -29,6 +29,9 @@ gen_excited_dets = _lever_cpp.gen_excited_dets
 get_ham_diag = _lever_cpp.get_ham_diag
 """Compute diagonal Hamiltonian elements <D|H|D>."""
 
+get_ham_ss = _lever_cpp.get_ham_ss
+"""Compute H_SS block only (no C-space discovery)."""
+
 get_ham_block = _lever_cpp.get_ham_block
 """Compute Hamiltonian blocks for predefined spaces."""
 
@@ -46,6 +49,7 @@ __all__ = [
     "gen_fci_dets",
     "gen_excited_dets",
     "get_ham_diag",
+    "get_ham_ss",
     "get_ham_block",
     "get_ham_conn",
     "get_ham_conn_amp",

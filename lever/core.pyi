@@ -128,6 +128,26 @@ def get_ham_diag(dets: DetArray, int_ctx: IntCtx) -> F64Array:
     """
     ...
 
+def get_ham_ss(
+    dets_S: DetArray,
+    int_ctx: IntCtx,
+    n_orbitals: int,
+) -> CooData:
+    """
+    Compute H_SS block only without C-space discovery.
+    
+    Performs full singles/doubles enumeration within S-space.
+    Efficient for CI evaluations that don't need SC coupling.
+    
+    Args:
+        dets_S: S-space determinants, shape (N, 2)
+        int_ctx: Integral context
+        n_orbitals: Number of spatial orbitals
+        
+    Returns:
+        Sparse COO matrix for <S|H|S>
+    """
+    ...
 
 def get_ham_block(
     bra_dets: DetArray,

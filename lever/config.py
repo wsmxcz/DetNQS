@@ -29,9 +29,9 @@ class EvalMode(str, Enum):
 
 class ScreenMode(str, Enum):
     """Screening strategy for C-space generation."""
-    OFF = "off"
-    STATIC = "static"
-    DYNAMIC = "dynamic"
+    NONE = "none"        # Full enumeration without heat-bath
+    STATIC = "static"    # Heat-bath screening on integrals
+    DYNAMIC = "dynamic"  # Amplitude-weighted screening
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,7 @@ Provides type hints for determinant generation, Hamiltonian construction,
 and heat-bath screening routines.
 """
 
-from typing import Optional, TypedDict
+from typing import Literal, Optional, TypedDict
 
 import numpy as np
 import numpy.typing as npt
@@ -25,20 +25,23 @@ class CooData(TypedDict):
     row: U32Array
     col: U32Array
     val: F64Array
+    shape: tuple[int, int]
 
 
-class HamBlockResult(TypedDict):
+class HamBlockResult(TypedDict, total=False):
     """Hamiltonian blocks for predefined spaces."""
-    SS: CooData  # <S|H|S> block
-    SC: CooData  # <S|H|C> block
+    H_SS: CooData       # <S|H|S> block (always present)
+    H_SC: CooData       # <S|H|C> block (always present)
+    det_C: DetArray     # C-space determinants (if ket_dets provided)
+    size_C: int         # Number of C-space determinants (if ket_dets provided)
 
 
 class HamConnResult(TypedDict):
     """Hamiltonian with dynamically discovered C-space."""
-    SS: CooData      # <S|H|S> block
-    SC: CooData      # <S|H|C> block
-    det_C: DetArray  # Discovered C-space determinants
-    size_C: int      # Number of C-space determinants
+    H_SS: CooData       # <S|H|S> block
+    H_SC: CooData       # <S|H|C> block
+    det_C: DetArray     # Discovered C-space determinants
+    size_C: int         # Number of C-space determinants
 
 
 # --- Integral Context ---
@@ -70,7 +73,7 @@ class IntCtx:
         Build heat-bath table cache.
         
         Args:
-            threshold: Minimum |integral| value to store
+            threshold: Minimum |integral| value to store (default: MAT_ELEMENT_THRESH)
         """
         ...
     
@@ -131,20 +134,21 @@ def get_ham_block(
     ket_dets: Optional[DetArray],
     int_ctx: IntCtx,
     n_orbitals: int,
-    thresh: float = 1e-15,
 ) -> HamBlockResult:
     """
     Compute Hamiltonian blocks for predefined spaces.
+    
+    Full singles/doubles enumeration within S-space.
+    If ket_dets provided, computes cross-space SC block.
     
     Args:
         bra_dets: S-space determinants (rows)
         ket_dets: C-space determinants (columns). If None, only <S|H|S> computed
         int_ctx: Integral context
         n_orbitals: Number of spatial orbitals
-        thresh: Cutoff for small matrix elements
         
     Returns:
-        Dictionary with 'SS' and 'SC' COO matrices
+        Dictionary with 'H_SS', 'H_SC', and optional 'det_C', 'size_C'
     """
     ...
 
@@ -155,23 +159,22 @@ def get_ham_conn(
     n_orbitals: int,
     use_heatbath: bool = False,
     eps1: float = 1e-6,
-    thresh: float = 1e-15,
 ) -> HamConnResult:
     """
     Build Hamiltonian with static heat-bath screening.
     
     Discovers C-space determinants using importance-based selection on integrals.
+    Singles always enumerated; doubles screened by |⟨ij||ab⟩| ≥ eps1.
     
     Args:
         dets_S: S-space determinants
-        int_ctx: Integral context
+        int_ctx: Integral context (heat-bath table required if use_heatbath=True)
         n_orbitals: Number of spatial orbitals
         use_heatbath: Enable heat-bath screening for doubles
-        eps1: Heat-bath threshold |<ij||ab>|
-        thresh: Drop matrix elements |H_ij| < thresh
+        eps1: Heat-bath threshold |⟨ij||ab⟩|
     
     Returns:
-        Dictionary with SS/SC matrices and discovered C-space
+        Dictionary with 'H_SS', 'H_SC', 'det_C', 'size_C'
     """
     ...
 
@@ -182,24 +185,57 @@ def get_ham_conn_amp(
     int_ctx: IntCtx,
     n_orbitals: int,
     eps1: float = 1e-6,
-    thresh: float = 1e-15,
 ) -> HamConnResult:
     """
     Build Hamiltonian with dynamic amplitude screening.
     
-    Discovers C-space determinants using amplitude-weighted importance.
-    Requires heat-bath table.
+    Discovers C-space using amplitude-weighted importance.
+    Per-row heat-bath cutoff: τᵢ = eps1 / max(|ψₛ[i]|, δ)
+    Singles post-filtered by |Hᵢₖ · ψₛ[i]| ≥ eps1
     
     Args:
         dets_S: S-space determinants
-        psi_S: Amplitudes for dets_S
+        psi_S: Amplitudes for dets_S, shape (N,)
         int_ctx: Integral context (heat-bath table required)
         n_orbitals: Number of spatial orbitals
-        eps1: Screening threshold |H_ij * psi_i|
-        thresh: Drop matrix elements |H_ij| < thresh
+        eps1: Screening threshold |H_ij · ψ_i|
     
     Returns:
-        Dictionary with SS/SC matrices and discovered C-space
+        Dictionary with 'H_SS', 'H_SC', 'det_C', 'size_C'
+    """
+    ...
+
+
+def get_ham_eff(
+    H_SS: CooData,
+    H_SC: CooData,
+    h_cc_diag: F64Array,
+    e_ref: float,
+    reg_type: Literal["linear_shift", "sigma"] = "sigma",
+    epsilon: float = 1e-12,
+    upper_only: bool = True,
+) -> CooData:
+    """
+    Assemble effective Hamiltonian via perturbative correction.
+    
+    Computes: H_eff = H_SS + H_SC · D⁻¹ · H_CS
+    where D_jj = E_ref - H_CC[j,j]
+    
+    Regularization strategies:
+      - "linear_shift": 1/(d + ε·sign(d)) - Sharp transition at zero
+      - "sigma": d/(d² + ε²) - Smooth Tikhonov-style (recommended)
+    
+    Args:
+        H_SS: <S|H|S> block in COO format
+        H_SC: <S|H|C> block in COO format
+        h_cc_diag: Diagonal elements H_CC[j,j], shape (|C|,)
+        e_ref: Reference energy for denominator
+        reg_type: Regularization strategy
+        epsilon: Regularization parameter
+        upper_only: Compute upper triangle only, then mirror
+        
+    Returns:
+        Assembled H_eff in COO format
     """
     ...
 
@@ -218,4 +254,5 @@ __all__ = [
     "get_ham_block",
     "get_ham_conn",
     "get_ham_conn_amp",
+    "get_ham_eff",
 ]

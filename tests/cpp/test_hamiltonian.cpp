@@ -7,7 +7,7 @@
  * Validates:
  *  - Block construction (H_SS, H_SC) with known S/C spaces
  *  - Connection discovery via Heat-bath screening
- *  - Effective Hamiltonian assembly: H_eff = H_SS + H_SC·D⁻¹·H_CS
+ *  - Effective Hamiltonian: H_eff = H_SS + H_SC·D⁻¹·H_CS
  *  - Element-wise correctness against direct evaluation
  *
  * Test system: H2O/STO-3G (7 orbitals, 5α5β, 441 FCI determinants)
@@ -47,7 +47,7 @@ using Catch::Approx;
 // Test Utilities
 // ============================================================================
 
-/** Construct HF determinant with n_α, n_β electrons in lowest orbitals. */
+/** Build HF determinant: n_α, n_β electrons in lowest orbitals */
 static Det make_hf_det(int n_alpha, int n_beta) {
     auto lowbits = [](int k) -> u64 {
         if (k <= 0) return 0ULL;
@@ -57,25 +57,29 @@ static Det make_hf_det(int n_alpha, int n_beta) {
     return {lowbits(n_alpha), lowbits(n_beta)};
 }
 
-/** Convert COO format to dense Eigen matrix. */
+/** Convert COOMatrix to dense Eigen matrix with optional symmetrization */
 static Eigen::MatrixXd coo_to_dense(
-    const std::vector<Conn>& coo,
+    const COOMatrix& coo,
     size_t dim,
     bool symmetrize = true
 ) {
     Eigen::MatrixXd H = Eigen::MatrixXd::Zero(dim, dim);
-    for (const auto& e : coo) {
-        if (e.row < dim && e.col < dim) {
-            H(e.row, e.col) = e.val;
-            if (symmetrize && e.row != e.col) {
-                H(e.col, e.row) = e.val;
+    for (size_t k = 0; k < coo.nnz(); ++k) {
+        u32 i = coo.rows[k];
+        u32 j = coo.cols[k];
+        double v = coo.vals[k];
+        
+        if (i < dim && j < dim) {
+            H(i, j) = v;
+            if (symmetrize && i != j) {
+                H(j, i) = v;
             }
         }
     }
     return H;
 }
 
-/** Compute ground state energy via dense diagonalization. */
+/** Ground state energy via dense diagonalization */
 static double compute_ground_energy(
     const Eigen::MatrixXd& H,
     double e_nuc
@@ -88,7 +92,7 @@ static double compute_ground_energy(
 }
 
 // ============================================================================
-// H2O/STO-3G Fixture
+// H2O/STO-3G Test Fixture
 // ============================================================================
 
 struct H2OFixture {
@@ -119,8 +123,8 @@ struct H2OFixture {
         so = std::make_shared<IntegralSO>(*mo);
         ham = std::make_shared<HamEval>(*so);
         
-        // Build Heat-bath table
-        hb_table = std::make_shared<HeatBathTable>(*so, HBBuildOptions{1e-14});
+        // Build Heat-bath table with default threshold
+        hb_table = std::make_shared<HeatBathTable>(*so, HBBuildOptions{HEATBATH_THRESH});
         hb_table->build();
         
         // Generate full FCI basis
@@ -133,13 +137,13 @@ struct H2OFixture {
 };
 
 // ============================================================================
-// Tests
+// Test Cases
 // ============================================================================
 
 TEST_CASE_METHOD(H2OFixture, "Diagonal elements", "[hamiltonian][diagonal]") {
     const auto& dets = fci_basis.all_dets();
     
-    // Compute via batch function
+    // Batch computation
     auto diag = get_ham_diag(dets, *ham);
     REQUIRE(diag.size() == dets.size());
     
@@ -155,7 +159,7 @@ TEST_CASE_METHOD(H2OFixture, "Diagonal elements", "[hamiltonian][diagonal]") {
 }
 
 TEST_CASE_METHOD(H2OFixture, "Block construction with known spaces", "[hamiltonian][block]") {
-    // Use first 50 determinants as S, next 30 as C
+    // First 50 dets as S, next 30 as C
     const auto& all_dets = fci_basis.all_dets();
     std::vector<Det> dets_S(all_dets.begin(), all_dets.begin() + 50);
     std::vector<Det> dets_C(all_dets.begin() + 50, all_dets.begin() + 80);
@@ -169,13 +173,13 @@ TEST_CASE_METHOD(H2OFixture, "Block construction with known spaces", "[hamiltoni
     
     SECTION("Dimensions") {
         REQUIRE(result.map_C.size() == 30);
-        REQUIRE(!result.coo_SS.empty());
-        REQUIRE(!result.coo_SC.empty());
+        REQUIRE(!result.H_SS.empty());
+        REQUIRE(!result.H_SC.empty());
     }
     
     SECTION("Element correctness") {
         // Verify SS block
-        auto H_SS = coo_to_dense(result.coo_SS, 50);
+        auto H_SS = coo_to_dense(result.H_SS, 50);
         
         std::mt19937 rng(123);
         std::uniform_int_distribution<int> dist(0, 49);
@@ -206,20 +210,20 @@ TEST_CASE_METHOD(H2OFixture, "Connection discovery from HF", "[hamiltonian][conn
         size_t n_C = result.map_C.size();
         INFO("Discovered |C| = " << n_C);
         
-        // Expected: singles (5*2 + 5*2 = 20) + relevant doubles
+        // Expected: singles (2×10) + relevant doubles
         REQUIRE(n_C >= 20);
-        REQUIRE(n_C <= 140);  // Upper bound: all singles + all doubles
+        REQUIRE(n_C <= 140);
     }
     
     SECTION("No self-connections in C") {
-        // HF should remain in S, not appear in discovered C
+        // HF stays in S, not in discovered C
         auto idx = result.map_C.get_idx(hf_det);
         REQUIRE(!idx.has_value());
     }
 }
 
 TEST_CASE_METHOD(H2OFixture, "Effective Hamiltonian assembly", "[hamiltonian][heff]") {
-    // Build small CI space: HF + single excitations
+    // Build small CI space: HF + connections
     std::vector<Det> S_small = {hf_det};
     
     auto conn_result = get_ham_conn(
@@ -234,7 +238,7 @@ TEST_CASE_METHOD(H2OFixture, "Effective Hamiltonian assembly", "[hamiltonian][he
     const auto& C_dets = conn_result.map_C.all_dets();
     auto h_cc_diag = get_ham_diag(C_dets, *ham);
     
-    // Reference energy (use HF diagonal as crude estimate)
+    // Reference energy: HF diagonal
     double e_ref = ham->compute_diagonal(hf_det);
     
     SECTION("Assembly succeeds") {
@@ -242,38 +246,35 @@ TEST_CASE_METHOD(H2OFixture, "Effective Hamiltonian assembly", "[hamiltonian][he
         config.reg_type = Regularization::Sigma;
         config.epsilon = 1e-10;
         
-        auto heff_result = get_ham_eff(
-            conn_result,
+        auto H_eff = get_ham_eff(
+            conn_result.H_SS,
+            conn_result.H_SC,
             h_cc_diag,
             e_ref,
             config
         );
         
-        REQUIRE(heff_result.n_rows_S == S_small.size());
-        REQUIRE(!heff_result.coo_heff.empty());
-        
-        INFO("Regularized columns: " << heff_result.n_regularized);
-        INFO("Max |D_jj|: " << heff_result.max_abs_d);
-        INFO("Max correction: " << heff_result.max_correction);
+        REQUIRE(H_eff.n_rows == S_small.size());
+        REQUIRE(!H_eff.empty());
     }
     
     SECTION("Perturbative correction lowers energy") {
-        // Build H_eff and H_SS for comparison
         HeffConfig config;
         config.epsilon = 1e-10;
         
-        auto heff_result = get_ham_eff(
-            conn_result,
+        auto H_eff = get_ham_eff(
+            conn_result.H_SS,
+            conn_result.H_SC,
             h_cc_diag,
             e_ref,
             config
         );
         
-        auto H_eff = coo_to_dense(heff_result.coo_heff, 1);
-        auto H_SS = coo_to_dense(conn_result.coo_SS, 1);
+        auto H_eff_dense = coo_to_dense(H_eff, 1);
+        auto H_SS_dense = coo_to_dense(conn_result.H_SS, 1);
         
-        double E_hf = H_SS(0, 0) + mo->e_nuc;
-        double E_eff = H_eff(0, 0) + mo->e_nuc;
+        double E_hf = H_SS_dense(0, 0) + mo->e_nuc;
+        double E_eff = H_eff_dense(0, 0) + mo->e_nuc;
         
         INFO("E(HF) = " << E_hf);
         INFO("E(H_eff) = " << E_eff);
@@ -289,22 +290,22 @@ TEST_CASE_METHOD(H2OFixture, "FCI energy recovery", "[hamiltonian][fci]") {
     // Build full H_SS over FCI space
     auto result = get_ham_block(
         dets,
-        std::nullopt,  // No C space
+        std::nullopt,
         *ham,
         n_orb
     );
     
-    auto H_dense = coo_to_dense(result.coo_SS, dets.size());
+    auto H_dense = coo_to_dense(result.H_SS, dets.size());
     double E_fci = compute_ground_energy(H_dense, mo->e_nuc);
     
-    INFO("Computed FCI energy: " << E_fci);
-    INFO("Reference FCI energy: " << E_ref_fci);
+    INFO("Computed FCI: " << E_fci);
+    INFO("Reference FCI: " << E_ref_fci);
     
     REQUIRE(E_fci == Approx(E_ref_fci).epsilon(1e-7));
 }
 
 TEST_CASE_METHOD(H2OFixture, "Hermiticity verification", "[hamiltonian][symmetry]") {
-    // Use small subspace for efficiency
+    // Small subspace for efficiency
     const auto& all_dets = fci_basis.all_dets();
     std::vector<Det> subset(all_dets.begin(), all_dets.begin() + 50);
     
@@ -315,7 +316,7 @@ TEST_CASE_METHOD(H2OFixture, "Hermiticity verification", "[hamiltonian][symmetry
         n_orb
     );
     
-    auto H = coo_to_dense(result.coo_SS, subset.size(), /*symmetrize=*/false);
+    auto H = coo_to_dense(result.H_SS, subset.size(), /*symmetrize=*/false);
     
     // Check hermiticity
     double max_asym = 0.0;
@@ -329,19 +330,17 @@ TEST_CASE_METHOD(H2OFixture, "Hermiticity verification", "[hamiltonian][symmetry
     REQUIRE(max_asym < 1e-12);
 }
 
-TEST_CASE_METHOD(H2OFixture, "Mirror upper triangle", "[hamiltonian][utility]") {
-    std::vector<Conn> upper = {
-        {0, 0, 1.0},
-        {0, 1, 2.0},
-        {1, 1, 3.0},
-        {1, 2, 4.0},
-        {2, 2, 5.0}
-    };
+TEST_CASE_METHOD(H2OFixture, "Mirror upper triangle utility", "[hamiltonian][utility]") {
+    COOMatrix upper;
+    upper.rows = {0, 0, 1, 1, 2};
+    upper.cols = {0, 1, 1, 2, 2};
+    upper.vals = {1.0, 2.0, 3.0, 4.0, 5.0};
+    upper.n_rows = upper.n_cols = 3;
     
     auto full = mirror_upper_to_full(upper);
     
-    // Should have: 5 original + 2 mirrored off-diagonal entries
-    REQUIRE(full.size() == 7);
+    // 5 original + 2 mirrored off-diagonal = 7 entries
+    REQUIRE(full.nnz() == 7);
     
     // Verify mirroring
     auto H = coo_to_dense(full, 3, /*symmetrize=*/false);

@@ -38,6 +38,9 @@ get_ham_conn = _lever_cpp.get_ham_conn
 get_ham_conn_amp = _lever_cpp.get_ham_conn_amp
 """Build Hamiltonian with dynamic amplitude screening."""
 
+get_ham_eff = _lever_cpp.get_ham_eff
+"""Assemble effective Hamiltonian via perturbative correction."""
+
 __all__ = [
     "IntCtx",
     "gen_fci_dets",
@@ -46,4 +49,5 @@ __all__ = [
     "get_ham_block",
     "get_ham_conn",
     "get_ham_conn_amp",
+    "get_ham_eff",
 ]

@@ -15,6 +15,7 @@ add_library(lever_core STATIC
     src/hamiltonian/ham_eval.cpp
     src/hamiltonian/build_ham.cpp
     src/hamiltonian/ham_eff.cpp
+    src/hamiltonian/ham_utils.cpp
 )
 add_library(lever::core ALIAS lever_core)
 

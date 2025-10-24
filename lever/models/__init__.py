@@ -227,7 +227,7 @@ def Backflow(
     Returns:
         Initialized WavefunctionModel
     """
-    from .backflow import BackflowMLP
+    from .backflow import BackflowMLP, cBackflowMLP
 
     ansatz = BackflowMLP(
         n_orbitals=n_orbitals,

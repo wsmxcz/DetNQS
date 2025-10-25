@@ -2,19 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Core tests for Hamiltonian builders and effective Hamiltonian assembly.
+ * @file test_hamiltonian.cpp
+ * @brief Core Hamiltonian builder and effective Hamiltonian tests.
  *
  * Validates:
- *  - Block construction (H_SS, H_SC) with known S/C spaces
- *  - Connection discovery via Heat-bath screening
+ *  - Block construction: H_SS, H_SC with known S/C spaces
+ *  - Heat-bath connection discovery
  *  - Effective Hamiltonian: H_eff = H_SS + H_SC·D⁻¹·H_CS
- *  - Element-wise correctness against direct evaluation
+ *  - Element-wise correctness vs direct evaluation
  *
- * Test system: H2O/STO-3G (7 orbitals, 5α5β, 441 FCI determinants)
- * Reference FCI energy: -75.01240139 Ha
+ * Test system: H₂O/STO-3G (7 orb, 5α5β, 441 FCI dets)
+ * Reference FCI: -75.01240139 Ha (PySCF)
  *
- * File: tests/test_hamiltonian.cpp
- * Author: Zheng (Alex) Che
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: November, 2025
  */
 
 #define CATCH_CONFIG_MAIN
@@ -47,8 +48,11 @@ using Catch::Approx;
 // Test Utilities
 // ============================================================================
 
-/** Build HF determinant: n_α, n_β electrons in lowest orbitals */
-static Det make_hf_det(int n_alpha, int n_beta) {
+/**
+ * Construct HF determinant with n_α/n_β electrons in lowest orbitals.
+ * Returns |00...011...1⟩ with n bits set.
+ */
+[[nodiscard]] static Det make_hf_det(int n_alpha, int n_beta) {
     auto lowbits = [](int k) -> u64 {
         if (k <= 0) return 0ULL;
         if (k >= 64) return ~0ULL;
@@ -57,8 +61,11 @@ static Det make_hf_det(int n_alpha, int n_beta) {
     return {lowbits(n_alpha), lowbits(n_beta)};
 }
 
-/** Convert COOMatrix to dense Eigen matrix with optional symmetrization */
-static Eigen::MatrixXd coo_to_dense(
+/**
+ * Convert COO sparse matrix to dense Eigen format.
+ * Optionally symmetrize by mirroring upper triangle.
+ */
+[[nodiscard]] static Eigen::MatrixXd coo_to_dense(
     const COOMatrix& coo,
     size_t dim,
     bool symmetrize = true
@@ -71,16 +78,17 @@ static Eigen::MatrixXd coo_to_dense(
         
         if (i < dim && j < dim) {
             H(i, j) = v;
-            if (symmetrize && i != j) {
-                H(j, i) = v;
-            }
+            if (symmetrize && i != j) H(j, i) = v;
         }
     }
     return H;
 }
 
-/** Ground state energy via dense diagonalization */
-static double compute_ground_energy(
+/**
+ * Compute ground state energy via dense diagonalization.
+ * Returns E₀ = λ_min(H) + E_nuc.
+ */
+[[nodiscard]] static double compute_ground_energy(
     const Eigen::MatrixXd& H,
     double e_nuc
 ) {
@@ -92,11 +100,15 @@ static double compute_ground_energy(
 }
 
 // ============================================================================
-// H2O/STO-3G Test Fixture
+// H₂O/STO-3G Test Fixture
 // ============================================================================
 
 struct H2OFixture {
-    const std::string fcidump = "H2O_sto3g.FCIDUMP";
+    static constexpr const char* fcidump = "H2O_sto3g.FCIDUMP";
+    static constexpr int n_orb = 7;
+    static constexpr int n_alpha = 5;
+    static constexpr int n_beta = 5;
+    static constexpr double E_ref_fci = -75.01240139;  ///< PySCF reference
     
     std::shared_ptr<IntegralMO> mo;
     std::shared_ptr<IntegralSO> so;
@@ -106,28 +118,24 @@ struct H2OFixture {
     DetMap fci_basis;
     Det hf_det;
     
-    const int n_orb = 7;
-    const int n_alpha = 5;
-    const int n_beta = 5;
-    
-    const double E_ref_fci = -75.01240139;  // PySCF reference
-    
     H2OFixture() {
         if (!std::filesystem::exists(fcidump)) {
             FAIL("FCIDUMP not found: " << fcidump);
         }
         
-        // Load integrals
+        // Load integrals and build SO representation
         mo = std::make_shared<IntegralMO>(n_orb);
         mo->load_from_fcidump(fcidump);
         so = std::make_shared<IntegralSO>(*mo);
         ham = std::make_shared<HamEval>(*so);
         
-        // Build Heat-bath table with default threshold
-        hb_table = std::make_shared<HeatBathTable>(*so, HBBuildOptions{HEATBATH_THRESH});
+        // Build Heat-bath screening table
+        hb_table = std::make_shared<HeatBathTable>(
+            *so, HBBuildOptions{HEATBATH_THRESH}
+        );
         hb_table->build();
         
-        // Generate full FCI basis
+        // Generate full FCI space: (7 choose 5)² = 441 determinants
         FCISpace fci_space(n_orb, n_alpha, n_beta);
         fci_basis = DetMap::from_list(fci_space.dets());
         REQUIRE(fci_basis.size() == 441);
@@ -140,14 +148,14 @@ struct H2OFixture {
 // Test Cases
 // ============================================================================
 
-TEST_CASE_METHOD(H2OFixture, "Diagonal elements", "[hamiltonian][diagonal]") {
+TEST_CASE_METHOD(H2OFixture, "Diagonal element evaluation", "[hamiltonian][diagonal]") {
     const auto& dets = fci_basis.all_dets();
     
-    // Batch computation
+    // Batch computation of all diagonal elements
     auto diag = get_ham_diag(dets, *ham);
     REQUIRE(diag.size() == dets.size());
     
-    // Spot check against direct evaluation
+    // Verify against direct evaluation (spot check)
     std::mt19937 rng(42);
     std::uniform_int_distribution<size_t> dist(0, dets.size() - 1);
     
@@ -159,17 +167,12 @@ TEST_CASE_METHOD(H2OFixture, "Diagonal elements", "[hamiltonian][diagonal]") {
 }
 
 TEST_CASE_METHOD(H2OFixture, "Block construction with known spaces", "[hamiltonian][block]") {
-    // First 50 dets as S, next 30 as C
+    // Partition FCI space: S = first 50 dets, C = next 30 dets
     const auto& all_dets = fci_basis.all_dets();
     std::vector<Det> dets_S(all_dets.begin(), all_dets.begin() + 50);
     std::vector<Det> dets_C(all_dets.begin() + 50, all_dets.begin() + 80);
     
-    auto result = get_ham_block(
-        dets_S,
-        std::span(dets_C),
-        *ham,
-        n_orb
-    );
+    auto result = get_ham_block(dets_S, std::span(dets_C), *ham, n_orb);
     
     SECTION("Dimensions") {
         REQUIRE(result.map_C.size() == 30);
@@ -177,13 +180,13 @@ TEST_CASE_METHOD(H2OFixture, "Block construction with known spaces", "[hamiltoni
         REQUIRE(!result.H_SC.empty());
     }
     
-    SECTION("Element correctness") {
-        // Verify SS block
+    SECTION("Element-wise correctness") {
         auto H_SS = coo_to_dense(result.H_SS, 50);
         
         std::mt19937 rng(123);
         std::uniform_int_distribution<int> dist(0, 49);
         
+        // Spot check random matrix elements
         for (int trial = 0; trial < 10; ++trial) {
             int i = dist(rng);
             int j = dist(rng);
@@ -197,11 +200,9 @@ TEST_CASE_METHOD(H2OFixture, "Block construction with known spaces", "[hamiltoni
 TEST_CASE_METHOD(H2OFixture, "Connection discovery from HF", "[hamiltonian][connectivity]") {
     std::vector<Det> S = {hf_det};
     
+    // Discover connected C-space via Heat-bath screening
     auto result = get_ham_conn(
-        S,
-        *ham,
-        n_orb,
-        hb_table.get(),
+        S, *ham, n_orb, hb_table.get(),
         /*eps1=*/1e-6,
         /*use_heatbath=*/true
     );
@@ -210,48 +211,42 @@ TEST_CASE_METHOD(H2OFixture, "Connection discovery from HF", "[hamiltonian][conn
         size_t n_C = result.map_C.size();
         INFO("Discovered |C| = " << n_C);
         
-        // Expected: singles (2×10) + relevant doubles
+        // Expected: singles (≈20) + relevant doubles
         REQUIRE(n_C >= 20);
         REQUIRE(n_C <= 140);
     }
     
-    SECTION("No self-connections in C") {
-        // HF stays in S, not in discovered C
+    SECTION("No self-connections") {
+        // HF determinant remains in S, not in C
         auto idx = result.map_C.get_idx(hf_det);
         REQUIRE(!idx.has_value());
     }
 }
 
 TEST_CASE_METHOD(H2OFixture, "Effective Hamiltonian assembly", "[hamiltonian][heff]") {
-    // Build small CI space: HF + connections
+    // Build CI space: HF + Heat-bath connections
     std::vector<Det> S_small = {hf_det};
     
     auto conn_result = get_ham_conn(
-        S_small,
-        *ham,
-        n_orb,
-        hb_table.get(),
-        /*eps1=*/1e-5
+        S_small, *ham, n_orb, hb_table.get(), /*eps1=*/1e-5
     );
     
-    // Get C-space diagonal
+    // Compute C-space diagonal: D_jj = E_ref - H_CC[j,j]
     const auto& C_dets = conn_result.map_C.all_dets();
     auto h_cc_diag = get_ham_diag(C_dets, *ham);
     
-    // Reference energy: HF diagonal
+    // Use HF energy as reference
     double e_ref = ham->compute_diagonal(hf_det);
     
     SECTION("Assembly succeeds") {
-        HeffConfig config;
-        config.reg_type = Regularization::Sigma;
-        config.epsilon = 1e-10;
+        HeffConfig config{
+            .reg_type = Regularization::Sigma,
+            .epsilon = 1e-10
+        };
         
         auto H_eff = get_ham_eff(
-            conn_result.H_SS,
-            conn_result.H_SC,
-            h_cc_diag,
-            e_ref,
-            config
+            conn_result.H_SS, conn_result.H_SC,
+            h_cc_diag, e_ref, config
         );
         
         REQUIRE(H_eff.n_rows == S_small.size());
@@ -259,17 +254,14 @@ TEST_CASE_METHOD(H2OFixture, "Effective Hamiltonian assembly", "[hamiltonian][he
     }
     
     SECTION("Perturbative correction lowers energy") {
-        HeffConfig config;
-        config.epsilon = 1e-10;
+        HeffConfig config{.epsilon = 1e-10};
         
         auto H_eff = get_ham_eff(
-            conn_result.H_SS,
-            conn_result.H_SC,
-            h_cc_diag,
-            e_ref,
-            config
+            conn_result.H_SS, conn_result.H_SC,
+            h_cc_diag, e_ref, config
         );
         
+        // Extract energies: ΔE = H_SC·D⁻¹·H_CS should be negative
         auto H_eff_dense = coo_to_dense(H_eff, 1);
         auto H_SS_dense = coo_to_dense(conn_result.H_SS, 1);
         
@@ -279,7 +271,6 @@ TEST_CASE_METHOD(H2OFixture, "Effective Hamiltonian assembly", "[hamiltonian][he
         INFO("E(HF) = " << E_hf);
         INFO("E(H_eff) = " << E_eff);
         
-        // Perturbation should lower energy
         REQUIRE(E_eff < E_hf);
     }
 }
@@ -287,13 +278,8 @@ TEST_CASE_METHOD(H2OFixture, "Effective Hamiltonian assembly", "[hamiltonian][he
 TEST_CASE_METHOD(H2OFixture, "FCI energy recovery", "[hamiltonian][fci]") {
     const auto& dets = fci_basis.all_dets();
     
-    // Build full H_SS over FCI space
-    auto result = get_ham_block(
-        dets,
-        std::nullopt,
-        *ham,
-        n_orb
-    );
+    // Build full Hamiltonian matrix over FCI space
+    auto result = get_ham_block(dets, std::nullopt, *ham, n_orb);
     
     auto H_dense = coo_to_dense(result.H_SS, dets.size());
     double E_fci = compute_ground_energy(H_dense, mo->e_nuc);
@@ -305,20 +291,15 @@ TEST_CASE_METHOD(H2OFixture, "FCI energy recovery", "[hamiltonian][fci]") {
 }
 
 TEST_CASE_METHOD(H2OFixture, "Hermiticity verification", "[hamiltonian][symmetry]") {
-    // Small subspace for efficiency
+    // Use small subspace for efficiency
     const auto& all_dets = fci_basis.all_dets();
     std::vector<Det> subset(all_dets.begin(), all_dets.begin() + 50);
     
-    auto result = get_ham_block(
-        subset,
-        std::nullopt,
-        *ham,
-        n_orb
-    );
+    auto result = get_ham_block(subset, std::nullopt, *ham, n_orb);
     
+    // Check H = H† without symmetrization
     auto H = coo_to_dense(result.H_SS, subset.size(), /*symmetrize=*/false);
     
-    // Check hermiticity
     double max_asym = 0.0;
     for (size_t i = 0; i < subset.size(); ++i) {
         for (size_t j = i + 1; j < subset.size(); ++j) {
@@ -330,19 +311,22 @@ TEST_CASE_METHOD(H2OFixture, "Hermiticity verification", "[hamiltonian][symmetry
     REQUIRE(max_asym < 1e-12);
 }
 
-TEST_CASE_METHOD(H2OFixture, "Mirror upper triangle utility", "[hamiltonian][utility]") {
-    COOMatrix upper;
-    upper.rows = {0, 0, 1, 1, 2};
-    upper.cols = {0, 1, 1, 2, 2};
-    upper.vals = {1.0, 2.0, 3.0, 4.0, 5.0};
-    upper.n_rows = upper.n_cols = 3;
+TEST_CASE_METHOD(H2OFixture, "Upper triangle mirroring utility", "[hamiltonian][utility]") {
+    // Construct upper-triangle COO matrix
+    COOMatrix upper{
+        .rows = {0, 0, 1, 1, 2},
+        .cols = {0, 1, 1, 2, 2},
+        .vals = {1.0, 2.0, 3.0, 4.0, 5.0},
+        .n_rows = 3,
+        .n_cols = 3
+    };
     
     auto full = mirror_upper_to_full(upper);
     
-    // 5 original + 2 mirrored off-diagonal = 7 entries
+    // 5 original + 2 mirrored off-diagonal = 7 total
     REQUIRE(full.nnz() == 7);
     
-    // Verify mirroring
+    // Verify symmetry
     auto H = coo_to_dense(full, 3, /*symmetrize=*/false);
     REQUIRE(H(0, 1) == Approx(2.0));
     REQUIRE(H(1, 0) == Approx(2.0));

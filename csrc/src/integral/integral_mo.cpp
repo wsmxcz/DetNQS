@@ -1,44 +1,49 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file integral_mo.cpp
- * @brief Implementation of molecular orbital integrals management.
- * @author Zheng (Alex) Che, email: wsmxcz@gmail.com
- * @date July, 2025
+ * @brief Molecular orbital integral storage with FCIDUMP parser.
+ *
+ * Stores 1e (h_pq) and 2e (⟨pq|rs⟩) integrals in triangular packed format.
+ * Parses FCIDUMP files with chemists' notation: ⟨pq|rs⟩ = ∫∫ φ_p(1)φ_q(1) r₁₂⁻¹ φ_r(2)φ_s(2).
+ *
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: November, 2025
  */
+
 #include <lever/integral/integral_mo.hpp>
-#include <stdexcept>
-#include <fstream>
-#include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 
 namespace lever {
 
 IntegralMO::IntegralMO(int num_orbitals) : n_orbs(num_orbitals) {
     if (num_orbitals <= 0 || num_orbitals > 64) {
-        throw std::invalid_argument("IntegralMO: Number of orbitals must be between 1 and 64.");
+        throw std::invalid_argument("Number of orbitals must be in [1, 64]");
     }
     
-    // Calculate storage sizes for triangular packing
-    const size_t n1e_elements = static_cast<size_t>(n_orbs) * (n_orbs + 1) / 2;
-    const size_t n2e_elements = n1e_elements * (n1e_elements + 1) / 2;
+    // Triangular packing: n(n+1)/2 for symmetric matrices
+    const size_t n1e = static_cast<size_t>(n_orbs) * (n_orbs + 1) / 2;
+    const size_t n2e = n1e * (n1e + 1) / 2;
     
-    h1e_.resize(n1e_elements, 0.0);
-    h2e_.resize(n2e_elements, 0.0);
+    h1e_.resize(n1e, 0.0);
+    h2e_.resize(n2e, 0.0);
 }
 
 void IntegralMO::load_from_fcidump(const std::string& filename) {
     std::ifstream file(filename);
     if (!file) {
-        throw std::runtime_error("IntegralMO: Cannot open FCIDUMP file: " + filename);
+        throw std::runtime_error("Cannot open FCIDUMP: " + filename);
     }
 
     parse_namelist(file);
     
-    // Reset stream to parse integral data
+    // Rewind to parse integral data
     file.clear();
     file.seekg(0, std::ios::beg);
     
@@ -52,81 +57,80 @@ void IntegralMO::load_from_fcidump(const std::string& filename) {
 }
 
 std::pair<size_t, size_t> IntegralMO::get_nonzero_count(double threshold) const noexcept {
-    size_t h1e_nonzero = 0;
-    size_t h2e_nonzero = 0;
+    auto count_nonzero = [threshold](const auto& vec) {
+        return std::ranges::count_if(vec, [threshold](double v) {
+            return std::abs(v) > threshold;
+        });
+    };
     
-    for (double val : h1e_) {
-        if (std::abs(val) > threshold) {
-            ++h1e_nonzero;
-        }
-    }
-    for (double val : h2e_) {
-        if (std::abs(val) > threshold) {
-            ++h2e_nonzero;
-        }
-    }
-    
-    return {h1e_nonzero, h2e_nonzero};
+    return {count_nonzero(h1e_), count_nonzero(h2e_)};
 }
 
 void IntegralMO::parse_namelist(std::ifstream& file) {
-    std::string line;
-    std::string namelist_content;
+    std::string line, namelist;
     bool in_namelist = false;
     
     while (std::getline(file, line)) {
-        if (!in_namelist && (line.find("&FCI") != std::string::npos || line.find("&fci") != std::string::npos)) {
+        if (!in_namelist && (line.find("&FCI") != std::string::npos || 
+                             line.find("&fci") != std::string::npos)) {
             in_namelist = true;
         }
         
         if (in_namelist) {
-            namelist_content += line + " ";
-            if (line.find("&END") != std::string::npos || line.find("&end") != std::string::npos) {
+            namelist += line + " ";
+            if (line.find("&END") != std::string::npos || 
+                line.find("&end") != std::string::npos) {
                 break;
             }
         }
     }
     
     if (!in_namelist) {
-        throw std::runtime_error("IntegralMO: No &FCI namelist found in FCIDUMP file.");
+        throw std::runtime_error("No &FCI namelist found in FCIDUMP");
     }
     
+    // Verify NORB matches constructor argument
     int file_norb = 0;
-    if (extract_parameter(namelist_content, "NORB", file_norb)) {
-        if (file_norb != this->n_orbs) {
-            throw std::runtime_error("IntegralMO: NORB mismatch: expected " + std::to_string(this->n_orbs) + 
-                                     ", but FCIDUMP file has " + std::to_string(file_norb) + " orbitals.");
-        }
+    if (extract_parameter(namelist, "NORB", file_norb) && file_norb != n_orbs) {
+        throw std::runtime_error("NORB mismatch: expected " + std::to_string(n_orbs) + 
+                                 ", got " + std::to_string(file_norb));
     }
     
-    if (!extract_parameter(namelist_content, "NELEC", n_elecs) || n_elecs < 0) {
-        throw std::runtime_error("IntegralMO: Failed to parse valid NELEC from namelist.");
+    if (!extract_parameter(namelist, "NELEC", n_elecs) || n_elecs < 0) {
+        throw std::runtime_error("Invalid or missing NELEC in namelist");
     }
     
     int ms2 = 0;
-    if (extract_parameter(namelist_content, "MS2", ms2)) {
+    if (extract_parameter(namelist, "MS2", ms2)) {
         spin_mult = std::abs(ms2) + 1;
     }
 }
 
-bool IntegralMO::extract_parameter(const std::string& content, const std::string& param, int& value) {
-    std::string upper_content = content;
-    std::transform(upper_content.begin(), upper_content.end(), upper_content.begin(), ::toupper);
+bool IntegralMO::extract_parameter(const std::string& content, 
+                                   const std::string& param, 
+                                   int& value) {
+    auto to_upper = [](std::string s) {
+        std::ranges::transform(s, s.begin(), ::toupper);
+        return s;
+    };
     
-    std::string upper_param = param;
-    std::transform(upper_param.begin(), upper_param.end(), upper_param.begin(), ::toupper);
-
-    auto pos = upper_content.find(upper_param + "=");
+    const auto upper_content = to_upper(content);
+    const auto upper_param = to_upper(param);
+    const auto key = upper_param + "=";
+    
+    auto pos = upper_content.find(key);
     if (pos == std::string::npos) {
         return false;
     }
     
-    pos += upper_param.length() + 1;
+    pos += key.length();
     
+    // Skip leading whitespace
     while (pos < content.length() && std::isspace(content[pos])) {
         ++pos;
     }
     
+    // Extract integer value
     size_t end_pos = pos;
     while (end_pos < content.length() && 
            (std::isdigit(content[end_pos]) || content[end_pos] == '-' || content[end_pos] == '+')) {
@@ -145,22 +149,16 @@ bool IntegralMO::is_comment_line(const std::string& line) noexcept {
     if (line.empty()) {
         return true;
     }
-    char first_char = line[0];
-    for (char c : {'!', '*', 'C', 'c', '#'}) {
-        if (first_char == c) {
-            return true;
-        }
-    }
-    return false;
+    
+    constexpr char comment_chars[] = {'!', '*', 'C', 'c', '#'};
+    return std::ranges::any_of(comment_chars, [&](char c) { return line[0] == c; });
 }
 
 void IntegralMO::parse_integral_line(std::string& line) {
     // Convert Fortran 'D' exponent to C++ 'E' format
-    for (char& c : line) {
-        if (c == 'D' || c == 'd') {
-            c = 'E';
-        }
-    }
+    std::ranges::transform(line, line.begin(), [](char c) {
+        return (c == 'D' || c == 'd') ? 'E' : c;
+    });
     
     double value;
     int p, q, r, s;
@@ -170,17 +168,16 @@ void IntegralMO::parse_integral_line(std::string& line) {
         return;
     }
     
-    // - E_core: value 0 0 0 0
-    // - 1e integral: value i j 0 0
-    // - 2e integral: value i j k l (Chemists' notation)
+    // FCIDUMP format (1-based indexing):
+    //   E_nuc:       value  0  0  0  0
+    //   h_pq:        value  p  q  0  0
+    //   ⟨pq|rs⟩:     value  p  q  r  s  (chemists' notation)
     if (p == 0 && q == 0 && r == 0 && s == 0) {
         e_nuc = value;
     } else if (r == 0 && s == 0) {
-        // Indices are 1-based in FCIDUMP, convert to 0-based
-        h1e_[h1e_key(p - 1, q - 1)] = value;
+        h1e_[h1e_key(p - 1, q - 1)] = value;  // Convert to 0-based indexing
     } else {
-        // Indices are 1-based in FCIDUMP, convert to 0-based
-        h2e_[h2e_key(p - 1, q - 1, r - 1, s - 1)] = value;
+        h2e_[h2e_key(p - 1, q - 1, r - 1, s - 1)] = value;  // Convert to 0-based indexing
     }
 }
 

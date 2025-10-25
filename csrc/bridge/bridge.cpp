@@ -1,12 +1,17 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file bridge.cpp
- * @brief LEVER nanobind bridge - exposes C++ core to Python.
+ * @brief Python-C++ bridge via nanobind - exposes LEVER core algorithms.
+ *
+ * Provides bindings for:
+ *   - Integral management (MO/SO) with optional Heat-Bath screening
+ *   - Determinant generation (FCI, excited spaces)
+ *   - Hamiltonian assembly (diagonal, blocks, effective H_eff)
  *
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: January, 2025
+ * Date: November, 2025
  */
 
 #include <nanobind/nanobind.h>
@@ -42,7 +47,16 @@ using lever::u32;
 using lever::u64;
 
 // ============================================================================
-// IntCtx: Integral context with optional heat-bath cache
+// Type Aliases for NumPy Arrays
+// ============================================================================
+using DetArrayRO = nb::ndarray<const u64, nb::shape<-1, 2>, nb::c_contig, nb::device::cpu>;
+using F64VecRO   = nb::ndarray<const double, nb::shape<-1>, nb::c_contig, nb::device::cpu>;
+using DetArrayOut = nb::ndarray<u64, nb::numpy, nb::shape<-1, 2>>;
+using F64VecOut   = nb::ndarray<double, nb::numpy, nb::shape<-1>>;
+using U32VecOut   = nb::ndarray<u32, nb::numpy, nb::shape<-1>>;
+
+// ============================================================================
+// IntCtx: Integral Context with Optional Heat-Bath Cache
 // ============================================================================
 struct IntCtx {
     explicit IntCtx(const std::string& fcidump_path, int num_orb)
@@ -50,16 +64,15 @@ struct IntCtx {
         mo.load_from_fcidump(fcidump_path);
     }
 
-    double e_nuc() const noexcept { return so.get_e_nuc(); }
+    [[nodiscard]] double e_nuc() const noexcept { return so.get_e_nuc(); }
 
     void hb_prepare(double threshold) {
-        lever::HBBuildOptions opt;
-        opt.threshold = threshold;
+        lever::HBBuildOptions opt{.threshold = threshold};
         hb = std::make_unique<HeatBathTable>(so, opt);
         hb->build();
     }
 
-    void hb_clear() { hb.reset(); }
+    void hb_clear() noexcept { hb.reset(); }
 
     lever::IntegralMO mo;
     lever::IntegralSO so;
@@ -68,20 +81,13 @@ struct IntCtx {
 };
 
 // ============================================================================
-// ndarray type aliases
-// ============================================================================
-using DetArrayRO = nb::ndarray<const u64, nb::shape<-1, 2>, nb::c_contig, nb::device::cpu>;
-using F64VecRO   = nb::ndarray<const double, nb::shape<-1>, nb::c_contig, nb::device::cpu>;
-
-using DetArrayOut = nb::ndarray<u64, nb::numpy, nb::shape<-1, 2>>;
-using F64VecOut   = nb::ndarray<double, nb::numpy, nb::shape<-1>>;
-using U32VecOut   = nb::ndarray<u32, nb::numpy, nb::shape<-1>>;
-
-// ============================================================================
-// Conversion helpers
+// Conversion Helpers: Python ↔ C++
 // ============================================================================
 
-inline std::vector<Det> to_det_vector(DetArrayRO arr) {
+/**
+ * Convert NumPy array (N×2) → std::vector<Det>.
+ */
+[[nodiscard]] inline std::vector<Det> to_det_vector(DetArrayRO arr) {
     if (arr.ndim() != 2 || arr.shape(1) != 2) {
         throw std::invalid_argument("Expected shape (N, 2) for determinant array");
     }
@@ -92,22 +98,27 @@ inline std::vector<Det> to_det_vector(DetArrayRO arr) {
     
     const u64* data = arr.data();
     for (size_t i = 0; i < N; ++i) {
-        out.push_back(Det{data[2*i], data[2*i + 1]});
+        out.emplace_back(Det{data[2*i], data[2*i + 1]});
     }
     
     return out;
 }
 
-inline std::vector<double> to_double_vector(F64VecRO arr) {
+/**
+ * Convert NumPy 1D array → std::vector<double>.
+ */
+[[nodiscard]] inline std::vector<double> to_double_vector(F64VecRO arr) {
     if (arr.ndim() != 1) {
         throw std::invalid_argument("Expected 1D array for amplitudes");
     }
-    
-    const size_t N = arr.shape(0);
-    return std::vector<double>(arr.data(), arr.data() + N);
+    return {arr.data(), arr.data() + arr.shape(0)};
 }
 
-inline DetArrayOut from_det_vector(const std::vector<Det>& dets) {
+/**
+ * Convert std::vector<Det> → NumPy array (N×2).
+ * Memory managed by Python via capsule.
+ */
+[[nodiscard]] inline DetArrayOut from_det_vector(const std::vector<Det>& dets) {
     const size_t N = dets.size();
     auto* data = new u64[N * 2];
     
@@ -123,7 +134,10 @@ inline DetArrayOut from_det_vector(const std::vector<Det>& dets) {
     return DetArrayOut(data, {N, 2}, owner);
 }
 
-inline F64VecOut from_double_vector(const std::vector<double>& xs) {
+/**
+ * Convert std::vector<double> → NumPy 1D array.
+ */
+[[nodiscard]] inline F64VecOut from_double_vector(const std::vector<double>& xs) {
     const size_t N = xs.size();
     auto* data = new double[N];
     std::memcpy(data, xs.data(), N * sizeof(double));
@@ -135,7 +149,10 @@ inline F64VecOut from_double_vector(const std::vector<double>& xs) {
     return F64VecOut(data, {N}, owner);
 }
 
-inline nb::dict from_coo_matrix(const COOMatrix& coo) {
+/**
+ * Convert COOMatrix → Python dict with 'row', 'col', 'val', 'shape' keys.
+ */
+[[nodiscard]] inline nb::dict from_coo_matrix(const COOMatrix& coo) {
     const size_t M = coo.nnz();
     
     auto* row_data = new u32[M];
@@ -146,52 +163,90 @@ inline nb::dict from_coo_matrix(const COOMatrix& coo) {
     std::memcpy(col_data, coo.cols.data(), M * sizeof(u32));
     std::memcpy(val_data, coo.vals.data(), M * sizeof(double));
     
-    nb::capsule row_owner(row_data, [](void* p) noexcept { 
-        delete[] static_cast<u32*>(p); 
-    });
-    nb::capsule col_owner(col_data, [](void* p) noexcept { 
-        delete[] static_cast<u32*>(p); 
-    });
-    nb::capsule val_owner(val_data, [](void* p) noexcept { 
-        delete[] static_cast<double*>(p); 
-    });
+    auto make_owner = [](auto* p) {
+        return nb::capsule(p, [](void* ptr) noexcept { 
+            delete[] static_cast<decltype(p)>(ptr);
+        });
+    };
     
     nb::dict d;
-    d["row"] = U32VecOut(row_data, {M}, row_owner);
-    d["col"] = U32VecOut(col_data, {M}, col_owner);
-    d["val"] = F64VecOut(val_data, {M}, val_owner);
+    d["row"]   = U32VecOut(row_data, {M}, make_owner(row_data));
+    d["col"]   = U32VecOut(col_data, {M}, make_owner(col_data));
+    d["val"]   = F64VecOut(val_data, {M}, make_owner(val_data));
     d["shape"] = nb::make_tuple(coo.n_rows, coo.n_cols);
     
     return d;
 }
 
+/**
+ * Convert Python dict → COOMatrix.
+ */
+[[nodiscard]] inline COOMatrix to_coo_matrix(const nb::dict& d) {
+    COOMatrix coo;
+    
+    auto row_arr = nb::cast<U32VecOut>(d["row"]);
+    auto col_arr = nb::cast<U32VecOut>(d["col"]);
+    auto val_arr = nb::cast<F64VecOut>(d["val"]);
+    
+    const size_t nnz = row_arr.shape(0);
+    coo.rows.assign(row_arr.data(), row_arr.data() + nnz);
+    coo.cols.assign(col_arr.data(), col_arr.data() + nnz);
+    coo.vals.assign(val_arr.data(), val_arr.data() + nnz);
+    
+    if (d.contains("shape")) {
+        auto shape = nb::cast<nb::tuple>(d["shape"]);
+        coo.n_rows = nb::cast<u32>(shape[0]);
+        coo.n_cols = nb::cast<u32>(shape[1]);
+    }
+    
+    return coo;
+}
+
+/**
+ * Parse regularization type string → enum.
+ */
+[[nodiscard]] inline lever::Regularization parse_reg_type(const std::string& s) {
+    if (s == "linear_shift") return lever::Regularization::LinearShift;
+    if (s == "sigma")        return lever::Regularization::Sigma;
+    throw std::invalid_argument("Invalid regularization type: " + s);
+}
+
 // ============================================================================
-// Module definition
+// Module Bindings
 // ============================================================================
 
 NB_MODULE(_lever_cpp, m) {
-    m.doc() = "LEVER C++ core bridge";
+    m.doc() = "LEVER C++ core bridge - determinant CI and Hamiltonian assembly";
 
-    // IntCtx class
-    nb::class_<IntCtx>(m, "IntCtx")
+    // ------------------------------------------------------------------------
+    // IntCtx: Integral container with Heat-Bath cache
+    // ------------------------------------------------------------------------
+    nb::class_<IntCtx>(m, "IntCtx", "Integral context (MO/SO integrals + optional Heat-Bath)")
         .def(nb::init<const std::string&, int>(), 
-             "fcidump_path"_a, "num_orb"_a)
-        .def("get_e_nuc", &IntCtx::e_nuc)
+             "fcidump_path"_a, "num_orb"_a,
+             "Load integrals from FCIDUMP file")
+        .def("get_e_nuc", &IntCtx::e_nuc,
+             "Nuclear repulsion energy")
         .def("hb_prepare", &IntCtx::hb_prepare, 
-             "threshold"_a = lever::HEATBATH_THRESH)  // Use constant default
-        .def("hb_clear", &IntCtx::hb_clear);
+             "threshold"_a = lever::HEATBATH_THRESH,
+             "Build Heat-Bath screening table with ⟨pq||rs⟩ threshold")
+        .def("hb_clear", &IntCtx::hb_clear,
+             "Release Heat-Bath cache");
 
-    // Determinant generation
+    // ------------------------------------------------------------------------
+    // Determinant Generation
+    // ------------------------------------------------------------------------
     m.def("gen_fci_dets",
-          [](int n_orb, int n_alpha, int n_beta) {
+          [](int n_orb, int n_alpha, int n_beta) -> DetArrayOut {
               FCISpace fci(n_orb, n_alpha, n_beta);
               const auto& dets_span = fci.dets();
               return from_det_vector({dets_span.begin(), dets_span.end()});
           },
-          "n_orb"_a, "n_alpha"_a, "n_beta"_a);
+          "n_orb"_a, "n_alpha"_a, "n_beta"_a,
+          "Generate full CI determinant basis");
 
     m.def("gen_excited_dets",
-          [](DetArrayRO ref_dets, int n_orb) {
+          [](DetArrayRO ref_dets, int n_orb) -> DetArrayOut {
               auto dets = lever::det_space::generate_connected(
                   to_det_vector(ref_dets), n_orb
               );
@@ -199,34 +254,42 @@ NB_MODULE(_lever_cpp, m) {
                   lever::det_space::canonicalize(std::move(dets))
               );
           },
-          "ref_dets"_a, "n_orb"_a);
+          "ref_dets"_a, "n_orb"_a,
+          "Generate singly/doubly excited determinants from reference set");
 
-    // Hamiltonian diagonal
+    // ------------------------------------------------------------------------
+    // Hamiltonian Diagonal
+    // ------------------------------------------------------------------------
     m.def("get_ham_diag",
-          [](DetArrayRO dets, const IntCtx* ctx) {
+          [](DetArrayRO dets, const IntCtx* ctx) -> F64VecOut {
               return from_double_vector(
                   lever::get_ham_diag(to_det_vector(dets), ctx->ham)
               );
           },
-          "dets"_a, "int_ctx"_a);
+          "dets"_a, "int_ctx"_a,
+          "Compute diagonal Hamiltonian elements ⟨D|H|D⟩");
 
-    // Hamiltonian SS block only
+    // ------------------------------------------------------------------------
+    // Hamiltonian H_SS Block (for CI solver)
+    // ------------------------------------------------------------------------
     m.def("get_ham_ss",
-        [](DetArrayRO dets, const IntCtx* ctx, int n_orb) {
-            auto coo = lever::get_ham_ss(
-                to_det_vector(dets), ctx->ham, n_orb
-            );
-            return from_coo_matrix(coo);
-        },
-        "dets_S"_a, "int_ctx"_a, "n_orbitals"_a,
-        "Build H_SS only for CI evaluations");
+          [](DetArrayRO dets, const IntCtx* ctx, int n_orb) -> nb::dict {
+              auto coo = lever::get_ham_ss(
+                  to_det_vector(dets), ctx->ham, n_orb
+              );
+              return from_coo_matrix(coo);
+          },
+          "dets_S"_a, "int_ctx"_a, "n_orbitals"_a,
+          "Build H_SS block for Davidson/Lanczos diagonalization");
 
-    // Hamiltonian blocks (known sets)
+    // ------------------------------------------------------------------------
+    // Hamiltonian Blocks H_SS, H_SC (known C-space)
+    // ------------------------------------------------------------------------
     m.def("get_ham_block",
           [](DetArrayRO bra_dets, 
              std::optional<DetArrayRO> ket_dets,
              const IntCtx* ctx, 
-             int n_orb) {  // Removed thresh parameter
+             int n_orb) -> nb::dict {
               
               auto dets_S = to_det_vector(bra_dets);
               
@@ -258,19 +321,22 @@ NB_MODULE(_lever_cpp, m) {
           "bra_dets"_a, 
           "ket_dets"_a = nb::none(),
           "int_ctx"_a, 
-          "n_orbitals"_a);
+          "n_orbitals"_a,
+          "Build H_SS and H_SC with explicit C-space determinants");
 
-    // Hamiltonian connections (static Heat-bath)
+    // ------------------------------------------------------------------------
+    // Hamiltonian Connections (static Heat-Bath screening)
+    // ------------------------------------------------------------------------
     m.def("get_ham_conn",
           [](DetArrayRO S, 
              const IntCtx* ctx, 
              int n_orb,
              bool use_heatbath, 
-             double eps1) {  // Removed thresh parameter
+             double eps1) -> nb::dict {
               
               if (use_heatbath && !ctx->hb) {
                   throw std::invalid_argument(
-                      "Heat-bath table not prepared. Call IntCtx.hb_prepare() first."
+                      "Heat-Bath table not prepared. Call IntCtx.hb_prepare() first."
                   );
               }
               
@@ -295,19 +361,22 @@ NB_MODULE(_lever_cpp, m) {
           "int_ctx"_a, 
           "n_orbitals"_a,
           "use_heatbath"_a = false, 
-          "eps1"_a = 1e-6);
+          "eps1"_a = 1e-6,
+          "Build H_SS, H_SC with automatic C-space generation via integral screening");
 
-    // Hamiltonian connections (dynamic amplitude screening)
+    // ------------------------------------------------------------------------
+    // Hamiltonian Connections (dynamic amplitude screening)
+    // ------------------------------------------------------------------------
     m.def("get_ham_conn_amp",
           [](DetArrayRO S, 
              F64VecRO psi_S, 
              const IntCtx* ctx, 
              int n_orb,
-             double eps1) {
+             double eps1) -> nb::dict {
               
               if (!ctx->hb) {
                   throw std::invalid_argument(
-                      "Heat-bath table required. Call IntCtx.hb_prepare() first."
+                      "Heat-Bath table required. Call IntCtx.hb_prepare() first."
                   );
               }
               
@@ -341,59 +410,29 @@ NB_MODULE(_lever_cpp, m) {
           "psi_S"_a, 
           "int_ctx"_a, 
           "n_orbitals"_a,
-          "eps1"_a = 1e-6);
+          "eps1"_a = 1e-6,
+          "Build H_SS, H_SC with amplitude-weighted Heat-Bath screening");
 
-    // Effective Hamiltonian assembly
+    // ------------------------------------------------------------------------
+    // Effective Hamiltonian H_eff = H_SS + H_SC·D⁻¹·H_CS
+    // ------------------------------------------------------------------------
     m.def("get_ham_eff",
-          [](nb::dict H_SS_dict,
-             nb::dict H_SC_dict,
+          [](const nb::dict& H_SS_dict,
+             const nb::dict& H_SC_dict,
              F64VecRO h_cc_diag,
              double e_ref,
              const std::string& reg_type_str,
              double epsilon,
-             bool upper_only) {
+             bool upper_only) -> nb::dict {
               
-              // Convert Python dicts to COOMatrix
-              auto to_coo = [](nb::dict d) -> lever::COOMatrix {
-                  lever::COOMatrix coo;
-                  
-                  auto row_arr = nb::cast<U32VecOut>(d["row"]);
-                  auto col_arr = nb::cast<U32VecOut>(d["col"]);
-                  auto val_arr = nb::cast<F64VecOut>(d["val"]);
-                  
-                  const size_t nnz = row_arr.shape(0);
-                  coo.rows.assign(row_arr.data(), row_arr.data() + nnz);
-                  coo.cols.assign(col_arr.data(), col_arr.data() + nnz);
-                  coo.vals.assign(val_arr.data(), val_arr.data() + nnz);
-                  
-                  if (d.contains("shape")) {
-                      auto shape = nb::cast<nb::tuple>(d["shape"]);
-                      coo.n_rows = nb::cast<u32>(shape[0]);
-                      coo.n_cols = nb::cast<u32>(shape[1]);
-                  }
-                  
-                  return coo;
+              const COOMatrix H_SS = to_coo_matrix(H_SS_dict);
+              const COOMatrix H_SC = to_coo_matrix(H_SC_dict);
+              
+              lever::HeffConfig config{
+                  .reg_type = parse_reg_type(reg_type_str),
+                  .epsilon = epsilon,
+                  .upper_only = upper_only
               };
-              
-              lever::COOMatrix H_SS = to_coo(H_SS_dict);
-              lever::COOMatrix H_SC = to_coo(H_SC_dict);
-              
-              // Parse regularization type
-              lever::Regularization reg_type;
-              if (reg_type_str == "linear_shift") {
-                  reg_type = lever::Regularization::LinearShift;
-              } else if (reg_type_str == "sigma") {
-                  reg_type = lever::Regularization::Sigma;
-              } else {
-                  throw std::invalid_argument(
-                      "Invalid regularization type: " + reg_type_str
-                  );
-              }
-              
-              lever::HeffConfig config;
-              config.reg_type = reg_type;
-              config.epsilon = epsilon;
-              config.upper_only = upper_only;
               
               auto h_eff = lever::get_ham_eff(
                   H_SS, 
@@ -411,6 +450,6 @@ NB_MODULE(_lever_cpp, m) {
           "e_ref"_a,
           "reg_type"_a = "sigma",
           "epsilon"_a = 1e-12,
-          "upper_only"_a = true);
+          "upper_only"_a = true,
+          "Assemble effective Hamiltonian via downfolding: H_eff = H_SS + H_SC·D⁻¹·H_CS");
 }
-

@@ -1,20 +1,15 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file ham_eval.hpp
- * @brief Hamiltonian matrix element evaluator using Slater–Condon rules.
+ * @brief Hamiltonian matrix element evaluator via Slater-Condon rules.
  *
- * Design notes:
- * - Thread-safe, stateless w.r.t. determinants (holds a const ref to integrrals).
- * - Works in spin-orbital basis; even indices = alpha, odd indices = beta.
- * - Excitation analysis and Condon–Shortley phase are delegated to det_ops.
- * - Degree>2 excitations vanish by Slater–Condon orthogonality.
+ * Thread-safe evaluator for ⟨bra|H|ket⟩ in spin-orbital basis
+ * (even indices = α, odd = β). Excitation analysis delegated to det_ops.
  *
- * References (formulas & notation):
- * - Slater–Condon rules overview: diagonal / single / double elements. 
- * - Antisymmetrized two-electron integrals for same-spin doubles.
- * - Physicist↔Chemist notation relation: (pq|rs) = <pr|qs>.
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: November, 2025
  */
 
 #pragma once
@@ -22,56 +17,51 @@
 #include <lever/determinant/det.hpp>
 #include <lever/determinant/det_ops.hpp>
 #include <lever/utils/bit_utils.hpp>
+#include <lever/integral/integral_so.hpp>
 
-#include <lever/integral/integral_so.hpp> // Spin-orbital integrals: h1e_so, h2e_phys, h2e_anti
-
-#include <vector>
 #include <cstdint>
 
 namespace lever {
 
 /**
  * @class HamEval
- * @brief Thread-safe evaluator for Hamiltonian matrix elements <bra|H|ket>.
+ * @brief Evaluates ⟨bra|H|ket⟩ via Slater-Condon rules.
  *
- * Slater–Condon rules:
- *  - degree 0 (diagonal): sum_p h_pp + sum_{p<q} <pq||pq>
- *  - degree 1 (single):   h_ap + sum_{k in occ(ket)} <ak||pk>
- *  - degree 2 (double):   same-spin: <ab||ij>; mixed-spin: <ab|ij> (Physicist)
- *  - degree > 2:          0
+ * Slater-Condon rules (physicist notation):
+ *   degree 0: ∑_p h_pp + ∑_{p<q} ⟨pq||pq⟩
+ *   degree 1: h_ap + ∑_{k∈occ(ket)} ⟨ak||pk⟩
+ *   degree 2: same-spin: ⟨ab||ij⟩; mixed-spin: ⟨ab|ij⟩
+ *   degree > 2: 0
  *
- * Notes:
- *  - The constant core energy term (if any, e.g. FCIDUMP e_core) is typically
- *    added outside the many-electron matrix builder; this class computes purely
- *    electronic contributions from one-/two-electron integrals.
+ * Note: Core energy (e.g., FCIDUMP e_core) added externally.
  */
 class HamEval {
 public:
-    /// Construct from a spin-orbital integral provider (read-only reference).
+    /// Construct from spin-orbital integral provider.
     explicit HamEval(const IntegralSO& so_ints) noexcept;
 
-    /// Analyze excitation pattern and phase between determinants (delegates).
+    /// Analyze excitation pattern and phase.
     [[nodiscard]] ExcInfo analyze_exc(const Det& bra, const Det& ket) const noexcept;
 
-    /// Compute full matrix element <bra|H|ket>.
+    /// Compute matrix element ⟨bra|H|ket⟩.
     [[nodiscard]] double compute_elem(const Det& bra, const Det& ket) const noexcept;
 
-    /// Compute diagonal element <D|H|D> (fast path).
+    /// Compute diagonal element ⟨D|H|D⟩ (optimized path).
     [[nodiscard]] double compute_diagonal(const Det& det) const noexcept;
 
 private:
-    /// Compute single-excitation matrix element, assumes degree==1; uses ket occupancy.
+    /// Single excitation contribution (degree=1).
     [[nodiscard]] double compute_single(const ExcInfo& info, const Det& ket) const noexcept;
 
-    /// Compute double-excitation matrix element, assumes degree==2.
+    /// Double excitation contribution (degree=2).
     [[nodiscard]] double compute_double(const ExcInfo& info) const noexcept;
 
-    /// Spin-orbital index from MO index and spin (0: alpha, 1: beta).
+    /// Convert MO index + spin to spin-orbital index: 2·mo + σ.
     [[nodiscard]] static constexpr int so_from_mo(int mo_idx, int spin) noexcept {
         return (mo_idx << 1) | (spin & 1);
     }
 
-    const IntegralSO& so_ints_; ///< spin-orbital integrals (thread-safe accessors)
+    const IntegralSO& so_ints_; ///< Spin-orbital integrals
 };
 
 } // namespace lever

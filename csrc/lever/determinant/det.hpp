@@ -1,44 +1,50 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file det.hpp
- * @brief Slater determinant representation using bitstring encoding.
+ * @brief Slater determinant representation via bitstring encoding.
+ *
+ * Represents |Ψ⟩ = |α⟩⊗|β⟩ using 64-bit occupation patterns (bit i → orbital i).
+ * Optimized for fast bitwise operations, hashing, and trivial copying.
+ * Supports up to 64 spatial orbitals.
+ *
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: November, 2025
  */
 
 #pragma once
 
 #include <lever/utils/types.hpp>
 #include <compare>
-#include <concepts> // Required for std::convertible_to
+#include <concepts>
 #include <functional>
 
 namespace lever {
 
 /**
- * @brief Slater determinant represented as alpha/beta occupation bitstrings.
- * 
- * Bit i (LSB=0) corresponds to spatial orbital i. This POD (Plain Old Data)
- * type is optimized for fast bitwise operations, efficient hashing, and
- * trivial copying. It supports up to 64 spatial orbitals.
+ * Slater determinant as α/β occupation bitstrings.
+ *
+ * POD type for efficient storage and manipulation. Bit i (LSB=0) corresponds
+ * to spatial orbital i. Trivially copyable and hashable.
  */
 struct Det {
-    u64 alpha;  ///< Alpha spin occupation bitstring
-    u64 beta;   ///< Beta spin occupation bitstring
+    u64 alpha;  ///< α-spin occupation (bit i = 1 if orbital i occupied)
+    u64 beta;   ///< β-spin occupation
 
-    /// C++20 three-way comparison (enables all relational operators)
+    /// Three-way comparison (enables ==, !=, <, <=, >, >=)
     constexpr auto operator<=>(const Det&) const = default;
 };
 
 // ============================================================================
-// Future Extension: Configuration-like Concept
+// Configuration Concept (Future: CSF support)
 // ============================================================================
 
 /**
- * @brief Concept for generalized electron configurations (e.g., Det, CSF).
- * 
- * This is a placeholder for future extensions to support other configuration
- * types like Configuration State Functions (CSF).
+ * Generalized electron configuration concept.
+ *
+ * Placeholder for future extensions to Configuration State Functions (CSF).
+ * Currently satisfied by Det only.
  */
 template<typename T>
 concept ConfigLike = requires(const T& cfg) {
@@ -46,7 +52,6 @@ concept ConfigLike = requires(const T& cfg) {
     { cfg.beta }  -> std::convertible_to<u64>;
 };
 
-// Ensure Det satisfies the concept for compile-time validation
 static_assert(ConfigLike<Det>);
 
 } // namespace lever
@@ -55,24 +60,23 @@ static_assert(ConfigLike<Det>);
 // Standard Library Hash Specialization
 // ============================================================================
 
-// The specialization of std::hash must be within the std namespace.
 namespace std {
 
 /**
- * @brief Hash function for lever::Det.
- * 
- * Enables Det to be used as a key in unordered containers like
- * std::unordered_map. Uses a Boost-style hash_combine algorithm.
+ * Hash functor for lever::Det (enables use in unordered containers).
+ *
+ * Combines α/β hashes via Boost-style hash_combine with golden ratio constant.
  */
 template<>
 struct hash<lever::Det> {
     [[nodiscard]]
     std::size_t operator()(const lever::Det& d) const noexcept {
-        const std::size_t h1 = std::hash<lever::u64>{}(d.alpha);
-        const std::size_t h2 = std::hash<lever::u64>{}(d.beta);
+        const std::size_t h_α = std::hash<lever::u64>{}(d.alpha);
+        const std::size_t h_β = std::hash<lever::u64>{}(d.beta);
         
-        // Boost-style hash_combine with a 64-bit golden ratio constant
-        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+        // h_combined = h_α ⊕ (h_β + φ_64 + (h_α << 6) + (h_α >> 2))
+        // where φ_64 = 2⁶⁴/φ (golden ratio constant)
+        return h_α ^ (h_β + 0x9e3779b97f4a7c15ULL + (h_α << 6) + (h_α >> 2));
     }
 };
 

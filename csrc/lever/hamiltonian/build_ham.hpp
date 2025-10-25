@@ -1,16 +1,17 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file build_ham.hpp
- * @brief Unified streaming Hamiltonian builders (<S|H|S> and <S|H|C>).
+ * @brief Streaming Hamiltonian builders for ⟨S|H|S⟩ and ⟨S|H|C⟩ blocks.
  *
- * Core features:
- * - Single streaming kernel + policy pattern (KnownSets/StaticHB/DynamicAmp)
- * - Deferred indexing for discovered C determinants (lexicographic order)
- * - Deterministic output: sorted COO entries with merged duplicates
- * - Singles always enumerated; doubles with optional Heat-bath pruning
- * - OpenMP parallelism over bra rows with thread-local sinks
+ * Construction policies:
+ *  - KnownSets:  Pre-defined S and C spaces
+ *  - StaticHB:   Heat-bath screening with fixed ε₁ cutoff
+ *  - DynamicAmp: Amplitude-weighted screening τᵢ = ε₁/|ψ_S[i]|
+ *
+ * Output: Deterministic sorted COO with merged duplicates.
+ * Threading: OpenMP parallelism with thread-local sinks.
  *
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
  * Date: January, 2025
@@ -30,11 +31,11 @@
 namespace lever {
 
 /**
- * Compute diagonal matrix elements <D|H|D>.
+ * Compute diagonal elements ⟨D|H|D⟩ for all determinants.
  *
- * @param dets Determinant list (any order)
+ * @param dets Determinant list
  * @param ham  Hamiltonian evaluator
- * @return Vector of <D|H|D> in same order as input
+ * @return Vector of diagonal elements aligned with input
  */
 [[nodiscard]] std::vector<double> get_ham_diag(
     std::span<const Det> dets,
@@ -42,15 +43,13 @@ namespace lever {
 );
 
 /**
- * Build H_SS only (for CI evaluations without SC block).
+ * Build H_SS block via full S-space enumeration.
  *
- * Behavior:
- *  - Diagonal + full singles/doubles within S
- *  - No C-space discovery or SC interactions
+ * Enumerates: H_SS = diag + singles + doubles within S.
  *
- * @param dets_S  S determinants
- * @param ham     Hamiltonian evaluator
- * @param n_orb   Number of spatial orbitals
+ * @param dets_S S determinants
+ * @param ham    Hamiltonian evaluator
+ * @param n_orb  Number of spatial orbitals
  * @return COO matrix for H_SS
  */
 [[nodiscard]] COOMatrix get_ham_ss(
@@ -59,21 +58,16 @@ namespace lever {
     int n_orb
 );
 
-
 /**
- * Build H_SS and H_SC with pre-defined S and C spaces.
+ * Build H_SS and H_SC with pre-defined determinant spaces.
  *
- * Behavior:
- *  - H_SS: Diagonal + all singles/doubles within S (full enumeration)
- *  - H_SC: Only connections from S to provided C (no discovery)
- *  - Preserves input ordering for S and C spaces
+ * Policy: KnownSets - compute ⟨S|H|S⟩ and ⟨S|H|C⟩ for given C.
  *
- * @param dets_S  S determinants (row/column space for SS; row space for SC)
- * @param dets_C  Optional C determinants; if nullopt, H_SC is empty
- * @param ham     Hamiltonian evaluator
- * @param n_orb   Number of spatial orbitals
- * @param thresh  Drop entries with |H_ij| <= thresh
- * @return HamBlocks containing H_SS, H_SC, and C mapping
+ * @param dets_S S determinants
+ * @param dets_C Optional C determinants; nullopt → empty H_SC
+ * @param ham    Hamiltonian evaluator
+ * @param n_orb  Number of spatial orbitals
+ * @return HamBlocks{H_SS, H_SC, C_index_map}
  */
 [[nodiscard]] HamBlocks get_ham_block(
     std::span<const Det> dets_S,
@@ -85,18 +79,18 @@ namespace lever {
 /**
  * Build H_SS and discover C via static Heat-bath screening.
  *
- * Behavior:
- *  - H_SS: Diagonal + full singles/doubles within S
- *  - H_SC: Doubles via Heat-bath with eps1 cutoff; singles post-evaluated
- *  - C discovered on-the-fly with deterministic lexical ordering
+ * Policy: StaticHB
+ *  - Doubles: Keep if |⟨ij||ab⟩| ≥ ε₁ via Heat-bath table
+ *  - Singles: Post-evaluate and filter
+ *  - C determinants indexed lexicographically
  *
- * @param dets_S      S determinants
- * @param ham         Hamiltonian evaluator
- * @param n_orb       Number of spatial orbitals
- * @param hb_table    Heat-bath table (required if use_heatbath=true)
- * @param eps1        Heat-bath cutoff |<ij||ab>| >= eps1
- * @param use_heatbath Enable/disable Heat-bath pruning
- * @param thresh      Drop entries with |H_ij| <= thresh
+ * @param dets_S       S determinants
+ * @param ham          Hamiltonian evaluator
+ * @param n_orb        Number of spatial orbitals
+ * @param hb_table     Heat-bath table (required if use_heatbath=true)
+ * @param eps1         Heat-bath cutoff threshold
+ * @param use_heatbath Enable Heat-bath pruning
+ * @return HamBlocks{H_SS, H_SC, C_index_map}
  */
 [[nodiscard]] HamBlocks get_ham_conn(
     std::span<const Det> dets_S,
@@ -108,21 +102,20 @@ namespace lever {
 );
 
 /**
- * Build H_SS and discover C via dynamic amplitude screening.
+ * Build H_SS and discover C via dynamic amplitude-weighted screening.
  *
- * Behavior:
- *  - H_SS: Diagonal + full singles/doubles within S
- *  - H_SC: Per-row Heat-bath cutoff tau_i = eps1 / max(|psi_S[i]|, delta)
- *          Singles post-filtered by |H_ik * psi_S[i]| >= eps1
- *  - Deterministic deferred indexing for discovered C
+ * Policy: DynamicAmp - per-row adaptive cutoff
+ *  - Doubles: Keep if |⟨ij||ab⟩| ≥ τᵢ where τᵢ = ε₁/max(|ψ_S[i]|, δ)
+ *  - Singles: Keep if |H_ik·ψ_S[i]| ≥ ε₁
+ *  - Favors important configurations with large amplitudes
  *
  * @param dets_S   S determinants
  * @param psi_S    Amplitudes aligned with dets_S
  * @param ham      Hamiltonian evaluator
  * @param n_orb    Number of spatial orbitals
  * @param hb_table Heat-bath table (required)
- * @param eps1     Dynamic criterion: keep if |H * psi| >= eps1
- * @param thresh   Drop entries with |H_ij| <= thresh
+ * @param eps1     Amplitude criterion threshold
+ * @return HamBlocks{H_SS, H_SC, C_index_map}
  */
 [[nodiscard]] HamBlocks get_ham_conn_amp(
     std::span<const Det> dets_S,

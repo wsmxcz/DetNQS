@@ -1,12 +1,17 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file integral_mo.hpp
- * @brief Molecular orbital integrals management and FCIDUMP file parsing.
- * @author Zheng (Alex) Che, email: wsmxcz@gmail.com
- * @date July, 2025
+ * @brief Molecular orbital integrals storage and FCIDUMP parser.
+ *
+ * Manages one- and two-electron integrals with triangular packing
+ * for efficient memory usage in post-HF calculations.
+ *
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: November, 2025
  */
+
 #pragma once
 
 #include <string>
@@ -18,24 +23,19 @@
 namespace lever {
 
 /**
- * @brief Computes canonical key for one-electron integral using triangular packing.
- *        Exploits symmetry: h(p,q) = h(q,p).
- * @param p First MO index (0-indexed).
- * @param q Second MO index (0-indexed).
- * @return Unique key for h(p,q).
+ * Canonical key for one-electron integral h_pq via triangular packing.
+ * Exploits permutational symmetry h_pq = h_qp.
+ * Formula: key = max(p,q)·(max(p,q)+1)/2 + min(p,q)
  */
 [[nodiscard]] constexpr size_t h1e_key(int p, int q) noexcept {
-    if (p < q) {
-        std::swap(p, q);
-    }
+    if (p < q) std::swap(p, q);
     return static_cast<size_t>(p) * (p + 1) / 2 + q;
 }
 
 /**
- * @brief Computes canonical key for two-electron integral using compound triangular packing.
- *        Exploits 8-fold symmetry: (pq|rs) = (qp|rs) = (pq|sr) = (rs|pq) etc.
- * @param p,q,r,s MO indices (0-indexed).
- * @return Unique key for (pq|rs).
+ * Canonical key for two-electron integral (pq|rs) via compound packing.
+ * Exploits 8-fold permutational symmetry.
+ * Formula: key = K_pq·(K_pq+1)/2 + K_rs where K_ij = h1e_key(i,j)
  */
 [[nodiscard]] constexpr size_t h2e_key(int p, int q, int r, int s) noexcept {
     if (p < q) std::swap(p, q);
@@ -49,93 +49,73 @@ namespace lever {
 }
 
 /**
- * @class IntegralMO
- * @brief Manages molecular orbital integrals from FCIDUMP files.
+ * Molecular orbital integral container with FCIDUMP I/O.
  *
- * Provides memory-efficient storage using triangular packing and fast
- * integral lookup for post-Hartree-Fock calculations.
+ * Storage scheme:
+ *   - h1e: Triangular packed (n²/2 elements)
+ *   - h2e: Compound triangular packed (~n⁴/8 elements)
  */
 class IntegralMO {
 public:
-    int n_orbs{0};      ///< Number of spatial orbitals.
-    int n_elecs{0};     ///< Total number of electrons.
-    int spin_mult{1};   ///< Spin multiplicity (2S+1).
-    double e_nuc{0.0};  ///< Nuclear repulsion energy.
+    int n_orbs{0};      ///< Number of spatial MOs
+    int n_elecs{0};     ///< Total electron count
+    int spin_mult{1};   ///< Spin multiplicity 2S+1
+    double e_nuc{0.0};  ///< Nuclear repulsion energy
 
     /**
-     * @brief Constructs IntegralMO with pre-allocated storage.
-     * @param num_orbitals Number of spatial orbitals [1, 64].
-     * @throws std::invalid_argument if num_orbitals is out of range.
+     * Construct with pre-allocated storage for num_orbitals MOs.
+     * @throws std::invalid_argument if num_orbitals ∉ [1,64]
      */
     explicit IntegralMO(int num_orbitals);
 
     /**
-     * @brief Loads integrals from FCIDUMP file.
-     * @param filename Path to FCIDUMP file.
-     * @throws std::runtime_error if file cannot be opened or parsed.
+     * Load integrals from FCIDUMP file.
+     * @throws std::runtime_error on I/O or parse failure
      */
     void load_from_fcidump(const std::string& filename);
 
     /**
-     * @brief Counts non-zero integrals.
-     * @param threshold Numerical threshold for zero detection.
-     * @return {h1e_count, h2e_count}.
+     * Count non-zero integrals above threshold.
+     * @return {n_h1e, n_h2e} counts
      */
-    [[nodiscard]] std::pair<size_t, size_t> get_nonzero_count(double threshold = 1e-12) const noexcept;
+    [[nodiscard]] std::pair<size_t, size_t> 
+    get_nonzero_count(double threshold = 1e-12) const noexcept;
 
     /**
-     * @brief Retrieves one-electron integral h(p,q).
-     * @param p,q MO indices (0-indexed).
-     * @return Integral value.
+     * Retrieve one-electron integral h_pq.
      */
     [[nodiscard]] double get_h1e(int p, int q) const noexcept {
         return h1e_[h1e_key(p, q)];
     }
 
     /**
-     * @brief Retrieves two-electron integral in Chemists' notation: (pq|rs).
+     * Retrieve two-electron integral (pq|rs) in Chemists' notation.
      *
-     * This corresponds to the Physicists' notation <pr|qs>.
-     * The FCIDUMP format standardly uses Chemists' notation.
-     *
-     * @param p,q,r,s MO indices (0-indexed).
-     * @return Integral value.
+     * Note: Chemists' (pq|rs) ≡ Physicists' ⟨pr|qs⟩
+     * FCIDUMP uses Chemists' convention.
      */
     [[nodiscard]] double get_h2e(int p, int q, int r, int s) const noexcept {
         return h2e_[h2e_key(p, q, r, s)];
     }
 
 private:
-    std::vector<double> h1e_;  ///< One-electron integrals (triangular packed).
-    std::vector<double> h2e_;  ///< Two-electron integrals (compound triangular packed).
+    std::vector<double> h1e_;  ///< One-electron integrals (packed)
+    std::vector<double> h2e_;  ///< Two-electron integrals (packed)
 
-    /**
-     * @brief Parses FCIDUMP namelist section for metadata.
-     * @param file Input file stream.
-     * @throws std::runtime_error if namelist parsing fails.
-     */
+    /// Parse FCIDUMP namelist section for system metadata
     void parse_namelist(std::ifstream& file);
 
-    /**
-     * @brief Extracts integer parameter from namelist content.
-     * @param content Namelist string content.
-     * @param param Parameter name to extract.
-     * @param value Reference to store extracted value.
-     * @return True if parameter found and parsed successfully.
-     */
-    bool extract_parameter(const std::string& content, const std::string& param, int& value);
+    /// Extract integer parameter from namelist content
+    bool extract_parameter(
+        const std::string& content, 
+        const std::string& param, 
+        int& value
+    );
 
-    /**
-     * @brief Checks if line is a comment.
-     * @param line Input line.
-     * @return True if line is comment or empty.
-     */
+    /// Check if line is comment or empty
     static bool is_comment_line(const std::string& line) noexcept;
 
-    /**
-     * @brief Parses single integral data line from FCIDUMP.
-     * @param line Integral data line.
-     */
+    /// Parse single integral data line
     void parse_integral_line(std::string& line);
 };
 

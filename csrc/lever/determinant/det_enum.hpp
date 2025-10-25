@@ -1,14 +1,16 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file det_enum.hpp
- * @brief Generators for complete determinant spaces (FCI, CAS, RAS).
+ * @brief Determinant space generators for FCI, CAS, and RAS.
  *
- * Notes:
- * - Bitstring convention: bit i (LSB=0) corresponds to spatial orbital i.
- * - All generators assume u64 bitmasks (<= 64 spatial orbitals).
- * - Outputs are not sorted unless the caller explicitly sorts them.
+ * Generates complete configuration spaces via combinatorial enumeration.
+ * Bitstring convention: bit i (LSB=0) → spatial orbital i (u64, ≤64 orbitals).
+ * Output order is unspecified unless explicitly sorted by caller.
+ *
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: November, 2025
  */
 
 #pragma once
@@ -21,54 +23,56 @@ namespace lever {
 
 /**
  * @class FCISpace
- * @brief Generates the complete Full Configuration Interaction (FCI) space.
+ * @brief Full Configuration Interaction space generator.
  *
- * The FCI space consists of all Slater determinants for a given number of
- * spatial orbitals and alpha/beta electrons. The output order is unspecified.
+ * Enumerates all (n_orb choose n_α) × (n_orb choose n_β) determinants
+ * for a given orbital count and electron numbers.
  */
 class FCISpace {
 public:
     /**
-     * @brief Generating constructor for FCI.
-     * @param n_orb    Number of spatial orbitals (1..64).
-     * @param n_alpha  Number of alpha electrons   (0..n_orb).
-     * @param n_beta   Number of beta  electrons   (0..n_orb).
-     * @throws std::invalid_argument on invalid parameters.
+     * @brief Generate FCI space for given system.
+     * @param n_orb    Spatial orbitals (1..64)
+     * @param n_alpha  α electrons (0..n_orb)
+     * @param n_beta   β electrons (0..n_orb)
+     * @throws std::invalid_argument Invalid parameters
      */
     explicit FCISpace(int n_orb, int n_alpha, int n_beta);
 
-    /// Immutable view of all determinants.
+    /// Immutable determinant view
     [[nodiscard]] const std::vector<Det>& dets() const noexcept;
 
-    /// Total number of determinants.
+    /// Total determinant count
     [[nodiscard]] size_t size() const noexcept;
 
-    /// Iteration helpers.
+    /// Iteration support
     [[nodiscard]] auto begin() const noexcept { return dets_.begin(); }
     [[nodiscard]] auto end()   const noexcept { return dets_.end();   }
 
 protected:
-    /// Non-generating base constructor for derived classes (CAS/RAS).
+    /// Non-generating base constructor for CAS/RAS
     FCISpace() = default;
 
-    std::vector<Det> dets_; ///< Storage for generated determinants.
+    std::vector<Det> dets_; ///< Generated determinants
 };
 
 /**
  * @class CASSpace
- * @brief Complete Active Space (CAS): core orbitals are always doubly occupied,
- *        active orbitals form a full CI, virtual orbitals remain empty.
+ * @brief Complete Active Space generator.
+ *
+ * Partitions orbitals into core (doubly occupied) | active (FCI) | virtual (empty).
+ * Generates all configurations within the active space only.
  */
 class CASSpace : public FCISpace {
 public:
     /**
-     * @brief Construct a CAS space.
-     * @param n_core_orb      # of core orbitals (always doubly occupied).
-     * @param n_active_orb    # of active orbitals (FCI performed here).
-     * @param n_virtual_orb   # of virtual orbitals (always empty).
-     * @param n_alpha_active  # of alpha electrons in the active space (0..n_active_orb).
-     * @param n_beta_active   # of beta  electrons in the active space (0..n_active_orb).
-     * @throws std::invalid_argument on inconsistent parameters.
+     * @brief Generate CAS(n_active, n_elec_active) space.
+     * @param n_core_orb      Core orbitals (doubly occupied)
+     * @param n_active_orb    Active orbitals (FCI region)
+     * @param n_virtual_orb   Virtual orbitals (empty)
+     * @param n_alpha_active  Active α electrons (0..n_active_orb)
+     * @param n_beta_active   Active β electrons (0..n_active_orb)
+     * @throws std::invalid_argument Invalid parameters
      */
     CASSpace(int n_core_orb, int n_active_orb, int n_virtual_orb,
              int n_alpha_active, int n_beta_active);
@@ -76,42 +80,47 @@ public:
 
 /**
  * @struct RASOrbitalPartition
- * @brief Contiguous partitioning for RAS: [core | ras1 | ras2 | ras3 | virtual].
+ * @brief Contiguous orbital blocks: core | RAS1 | RAS2 | RAS3 | virtual.
  */
 struct RASOrbitalPartition {
-    int n_core   = 0;
-    int n_ras1   = 0;
-    int n_ras2   = 0;
-    int n_ras3   = 0;
-    int n_virtual= 0;
+    int n_core    = 0;
+    int n_ras1    = 0;
+    int n_ras2    = 0;
+    int n_ras3    = 0;
+    int n_virtual = 0;
 };
 
 /**
  * @struct RASElectronConstraint
- * @brief Total electron constraints for RAS (applied to total spin population).
+ * @brief Total electron constraints for RAS enumeration.
  */
 struct RASElectronConstraint {
-    int n_alpha_total = 0;   ///< total alpha electrons (includes core)
-    int n_beta_total  = 0;   ///< total beta  electrons (includes core)
-    int max_holes_ras1 = -1; ///< max total holes in RAS1 (across alpha+beta), -1 = no limit
-    int max_elecs_ras3 = -1; ///< max total electrons in RAS3 (alpha+beta),    -1 = no limit
+    int n_alpha_total  = 0;   ///< Total α electrons (includes core)
+    int n_beta_total   = 0;   ///< Total β electrons (includes core)
+    int max_holes_ras1 = -1;  ///< Max total holes in RAS1 (α+β), -1=unlimited
+    int max_elecs_ras3 = -1;  ///< Max total electrons in RAS3 (α+β), -1=unlimited
 };
 
 /**
  * @class RASSpace
- * @brief Restricted Active Space (RAS):
- *        - RAS1: at most K holes (w.r.t. double occupancy),
- *        - RAS2: CAS-like (unrestricted within RAS2),
- *        - RAS3: at most L electrons,
- *        constraints are applied to the total (alpha+beta) counts.
+ * @brief Restricted Active Space generator.
+ *
+ * Tri-partition active space with hole/particle constraints:
+ *   RAS1: ≤K holes w.r.t. double occupancy
+ *   RAS2: Unrestricted (CAS-like)
+ *   RAS3: ≤L electrons
+ * Constraints apply to total (α+β) occupation.
+ *
+ * Algorithm: Constrained combinatorial enumeration over RAS1/RAS2/RAS3
+ * orbital blocks, filtering by total hole/electron counts.
  */
 class RASSpace : public FCISpace {
 public:
     /**
-     * @brief Construct a RAS space.
-     * @param orb_part  Orbital partition (contiguous blocks).
-     * @param elec_con  Total electron counts and RAS1/RAS3 constraints.
-     * @throws std::invalid_argument on inconsistent parameters.
+     * @brief Generate RAS space with occupation constraints.
+     * @param orb_part  Orbital partition (contiguous blocks)
+     * @param elec_con  Electron counts and RAS1/RAS3 limits
+     * @throws std::invalid_argument Invalid parameters
      */
     RASSpace(const RASOrbitalPartition& orb_part,
              const RASElectronConstraint& elec_con);

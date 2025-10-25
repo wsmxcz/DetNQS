@@ -1,8 +1,25 @@
-// Copyright 2025 The Nebula-QC Authors
+// Copyright 2025 The Nebula-QC Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+/**
+ * @file hb_table.cpp
+ * @brief Heat-bath coupling table for FCIQMC excitation generation.
+ *
+ * Stores pre-screened virtual pair couplings |⟨ij||ab⟩| for efficient
+ * stochastic sampling. Uses CSR-like layout with descending weight ordering
+ * within each row for cutoff-based rejection sampling.
+ *
+ * Algorithm: For each occupied pair (i,j), enumerate all spin-conserving
+ * virtual pairs (a,b) and store weights w = |⟨ij||ab⟩| above threshold.
+ *
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: November, 2025
+ */
+
 #include <lever/integral/hb_table.hpp>
+#include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace lever {
 
@@ -13,22 +30,20 @@ HeatBathTable::HeatBathTable(const IntegralSO& so_ints, HBBuildOptions opt)
     , opt_(opt)
 {
     if (n_so_ < 2) {
-        throw std::invalid_argument("HeatBathTable: n_so must be >= 2.");
+        throw std::invalid_argument("HeatBathTable requires n_so >= 2");
     }
-    // Number of unordered pairs {i>j}
+    // Row count = unordered pairs {i,j} where i>j
     num_rows_ = static_cast<std::size_t>(n_so_) * (n_so_ - 1) / 2;
 }
 
 void HeatBathTable::build() {
-    // Temporary storage for each row
     std::vector<std::vector<Entry>> rows(num_rows_);
     std::size_t nnz_total = 0;
     
-    // Reusable buffer for single-row construction
     std::vector<Entry> scratch;
-    scratch.reserve(256);  // Heuristic initial capacity
+    scratch.reserve(256);  // Heuristic capacity for reuse
 
-    // Build all rows
+    // Enumerate all occupied pairs (i,j) with i>j
     for (int i = 1; i < n_so_; ++i) {
         for (int j = 0; j < i; ++j) {
             build_row_(i, j, scratch, nnz_total);
@@ -38,7 +53,6 @@ void HeatBathTable::build() {
         }
     }
 
-    // Finalize CSR-like flat layout
     finalize_layout_(rows, nnz_total);
 }
 
@@ -89,23 +103,23 @@ void HeatBathTable::build_row_(int i, int j, std::vector<Entry>& buffer,
                                 std::size_t& nnz_total) {
     const double thresh = opt_.threshold;
     
-    // Spin pattern of occupied pair (even=alpha, odd=beta)
-    const int si = (i & 1);
-    const int sj = (j & 1);
+    // Spin pattern: even index = α, odd index = β
+    const int s_i = (i & 1);
+    const int s_j = (j & 1);
 
-    // Enumerate all virtual pairs (a>b) disjoint from {i,j}
+    // Enumerate virtual pairs (a,b) with a>b, disjoint from {i,j}
     for (int a = 1; a < n_so_; ++a) {
         for (int b = 0; b < a; ++b) {
-            // Skip if overlaps with occupied
             if (a == i || a == j || b == i || b == j) continue;
 
-            // Spin-preserving check: (a,b) must match (i,j) pattern
-            const int sa = (a & 1);
-            const int sb = (b & 1);
-            const bool pattern_ok = (sa == si && sb == sj) || (sa == sj && sb == si);
-            if (!pattern_ok) continue;
+            // Spin conservation: (s_a, s_b) must match (s_i, s_j) pattern
+            const int s_a = (a & 1);
+            const int s_b = (b & 1);
+            const bool spin_ok = (s_a == s_i && s_b == s_j) || 
+                                  (s_a == s_j && s_b == s_i);
+            if (!spin_ok) continue;
 
-            // Compute antisymmetrized integral
+            // Weight = |⟨ij||ab⟩| with antisymmetrization
             const double val = so_.get_h2e_anti(i, j, a, b);
             const double weight = std::abs(val);
             
@@ -117,18 +131,15 @@ void HeatBathTable::build_row_(int i, int j, std::vector<Entry>& buffer,
 
     if (buffer.empty()) return;
 
-    // Sort descending by weight (critical for with_cutoff() binary search)
-    std::sort(buffer.begin(), buffer.end(), 
-              [](const Entry& x, const Entry& y) { 
-                  return x.w > y.w; 
-              });
+    // Sort descending by weight (enables binary search in cutoff sampling)
+    std::ranges::sort(buffer, std::greater{}, &Entry::w);
 
     nnz_total += buffer.size();
 }
 
 void HeatBathTable::finalize_layout_(const std::vector<std::vector<Entry>>& rows, 
                                       std::size_t nnz_total) {
-    // Build CSR offsets
+    // Build CSR row offsets
     row_offsets_.assign(num_rows_ + 1, 0);
     std::size_t cursor = 0;
     for (std::size_t rid = 0; rid < num_rows_; ++rid) {
@@ -137,7 +148,7 @@ void HeatBathTable::finalize_layout_(const std::vector<std::vector<Entry>>& rows
     }
     row_offsets_[num_rows_] = cursor;
 
-    // Flatten into contiguous arrays
+    // Flatten into SoA (Structure of Arrays) layout
     a_.resize(nnz_total);
     b_.resize(nnz_total);
     w_.resize(nnz_total);

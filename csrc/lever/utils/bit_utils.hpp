@@ -1,9 +1,15 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file bit_utils.hpp
- * @brief High-performance bit manipulation utilities
+ * @brief High-performance bit manipulation for Slater determinants.
+ *
+ * Provides efficient operations for orbital occupancy manipulation,
+ * fermion permutation parity, and second quantization operators.
+ *
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: November, 2025
  */
 
 #pragma once
@@ -19,21 +25,27 @@ namespace lever {
 // Bit Counting and Scanning
 // ============================================================================
 
-/// Count number of set bits (population count)
+/**
+ * Count set bits (population count).
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr int popcount(T x) noexcept {
     return static_cast<int>(std::popcount(x));
 }
 
-/// Count trailing zeros (position of lowest set bit)
-/// Returns sizeof(T)*8 if x == 0
+/**
+ * Count trailing zeros (lowest set bit position).
+ * Returns sizeof(T)*8 if x == 0.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr int ctz(T x) noexcept {
     return static_cast<int>(std::countr_zero(x));
 }
 
-/// Count leading zeros
-/// Returns sizeof(T)*8 if x == 0
+/**
+ * Count leading zeros.
+ * Returns sizeof(T)*8 if x == 0.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr int clz(T x) noexcept {
     return static_cast<int>(std::countl_zero(x));
@@ -43,37 +55,49 @@ template<std::unsigned_integral T>
 // Bit Manipulation
 // ============================================================================
 
-/// Clear the lowest set bit: x & (x - 1)
+/**
+ * Clear lowest set bit: x & (x - 1).
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr T clear_lsb(T x) noexcept {
     return x & (x - 1);
 }
 
-/// Isolate the lowest set bit: x & -x
+/**
+ * Isolate lowest set bit: x & -x.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr T isolate_lsb(T x) noexcept {
     return x & (~x + 1);
 }
 
-/// Test if bit at position pos is set
+/**
+ * Test if bit at position pos is set.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr bool test_bit(T x, int pos) noexcept {
     return (x >> pos) & 1;
 }
 
-/// Set bit at position pos
+/**
+ * Set bit at position pos.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr T set_bit(T x, int pos) noexcept {
     return x | (T{1} << pos);
 }
 
-/// Clear bit at position pos
+/**
+ * Clear bit at position pos.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr T clear_bit(T x, int pos) noexcept {
     return x & ~(T{1} << pos);
 }
 
-/// Flip bit at position pos
+/**
+ * Flip bit at position pos.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr T flip_bit(T x, int pos) noexcept {
     return x ^ (T{1} << pos);
@@ -83,8 +107,10 @@ template<std::unsigned_integral T>
 // Bitmask Utilities
 // ============================================================================
 
-/// Create bitmask with n lowest bits set
-/// Example: make_mask(3) = 0b111
+/**
+ * Create mask with n lowest bits set.
+ * Example: make_mask(3) = 0b111
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr T make_mask(int n) noexcept {
     if (n <= 0) return 0;
@@ -92,7 +118,10 @@ template<std::unsigned_integral T>
     return (T{1} << n) - 1;
 }
 
-/// Extract occupied orbital indices from bitmask
+/**
+ * Extract occupied orbital indices from bitmask.
+ * Returns sorted indices of set bits.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] std::vector<int> extract_bits(T mask) {
     std::vector<int> indices;
@@ -106,10 +135,12 @@ template<std::unsigned_integral T>
     return indices;
 }
 
-/// Extract virtual (unoccupied) orbital indices within range [0, n_orb)
+/**
+ * Extract virtual orbital indices in [0, n_orb).
+ * Returns unoccupied orbital positions.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] std::vector<int> extract_virtuals(T occ_mask, int n_orb) {
-    // Handle n_orb == bitwidth edge case
     const T universe = (n_orb >= static_cast<int>(sizeof(T) * 8)) 
                        ? ~T{0} 
                        : make_mask<T>(n_orb);
@@ -118,24 +149,36 @@ template<std::unsigned_integral T>
 }
 
 // ============================================================================
-// Bit Parity and Permutation Counting
+// Parity and Permutation Analysis
 // ============================================================================
 
-/// Count number of set bits in range [0, pos)
-/// Used for permutation parity calculation
+/**
+ * Count set bits in range [0, pos).
+ * Used for fermion permutation parity calculation.
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr int popcount_below(T x, int pos) noexcept {
     if (pos <= 0) return 0;
     return popcount(x & make_mask<T>(pos));
 }
 
-/// Compute parity of a permutation (0: even, 1: odd)
-/// Counts crossings between two bitmasks
+/**
+ * Compute fermion permutation parity.
+ *
+ * Calculates sign factor (-1)^p where p counts operator crossings
+ * in second quantization: â†_i₁...â†_iₙ â_j₁...â_jₘ.
+ *
+ * Algorithm: For each particle position i_k, count holes j_l with j_l < i_k.
+ * Total crossings determine exchange parity.
+ *
+ * @param particles  Bitmask of creation operator positions
+ * @param holes      Bitmask of annihilation operator positions
+ * @return           0 for even parity (+1), 1 for odd parity (-1)
+ */
 template<std::unsigned_integral T>
 [[nodiscard]] constexpr int parity(T particles, T holes) noexcept {
     int count = 0;
     
-    // Count particles crossing holes
     T temp = particles;
     while (temp) {
         const int p_idx = ctz(temp);

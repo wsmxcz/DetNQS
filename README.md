@@ -1,4 +1,4 @@
-# LEVER: Local-Energy Variational Evolution with deterministic Refinement method for Fock-space quantum chemistry
+# A Sampling-free Optimization Framework for Compact Wavefunctions Driven by a Adaptive Effective Hamiltonian
 
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/std/the-standard)
 [![Python](https://img.shields.io/badge/Python-3.13%2B-EE4C2C.svg)](https://www.python.org/)

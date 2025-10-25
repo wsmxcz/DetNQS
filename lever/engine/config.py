@@ -27,49 +27,45 @@ import jax.numpy as jnp
 class EnergyMode(StrEnum):
     """
     Energy computation formula for Rayleigh quotient E = ⟨ψ|Ĥ|ψ⟩ / ⟨ψ|ψ⟩.
-    
+  
     ASYMMETRIC: E = ⟨ψ_S|Ĥ|ψ⟩ / ||ψ_S||²
-                Fastest; unstable for small ||ψ_S||²
-    
+  
     PROXY:      E = (⟨ψ_S|Ĥ|ψ⟩ + ⟨ψ_C|Ĥ_diag|ψ_C⟩) / (||ψ_S||² + ||ψ_C||²)
-                Diagonal H_CC approximation; balanced speed/stability
-    
-    FULL:       E = (⟨ψ_S|Ĥ|ψ⟩ + ⟨ψ_C|Ĥ|ψ_C⟩) / (||ψ_S||² + ||ψ_C||²)
-                Complete H_CC matrix; most accurate, slowest
+  
+    EFFECTIVE:  E = ⟨ψ_S|Ĥ_eff|ψ_S⟩ / ||ψ_S||²
+                Downfolding via H_eff = H_SS + H_SC(E_ref·I - H_CC^diag)⁻¹H_CS
     """
     ASYMMETRIC = "asymmetric"
     PROXY = "proxy"
-    FULL = "full"
+    EFFECTIVE = "effective"
 
 
 class GradMode(StrEnum):
     """
     Gradient computation domain for ∇_θ E.
-    
+  
     ASYMMETRIC: Renormalize weights over S-space only
                 Ignores C-space gradient contributions
-    
+  
     PROXY:      Full (S ∪ C) space with diagonal H_CC approximation
-                Recommended for most cases
-    
-    FULL:       Full (S ∪ C) space with complete H_CC matrix
-                Most accurate; computationally expensive
+  
+    EFFECTIVE:  S-space only with effective Hamiltonian
     """
     ASYMMETRIC = "asymmetric"
     PROXY = "proxy"
-    FULL = "full"
+    EFFECTIVE = "effective"
 
 
 class ScoreKind(StrEnum):
     """
     Scoring metric for determinant selection in variational space expansion.
-    
+  
     AMPLITUDE: Score = |ψ_k|
                Largest wavefunction coefficients
-    
+  
     PT1:       Score = |N_k|² / |H_kk - E|
                First-order perturbation theory energy lowering
-    
+  
     J_SCORE:   Score = |N_k - E·ψ_k|² / |H_kk - E|
                LEVER specific contribution
     """
@@ -86,7 +82,7 @@ class ScoreKind(StrEnum):
 class EngineConfig:
     """
     Immutable configuration for variational computation engine.
-    
+  
     Attributes:
         compute_dtype: Floating-point precision (complex dtypes derived)
         epsilon: Numerical threshold for division stability

@@ -31,20 +31,24 @@ if TYPE_CHECKING:
 
 def _extract_diagonal(ham_op: HamOp) -> np.ndarray:
     """
-    Extract diagonal H_ii from sparse COO matrix.
-    
-    Algorithm: Filter row==col pairs, index by row number.
+    Extract diagonal H_ii from sparse COO matrix with duplicate accumulation.
     
     Returns:
         H_diag[i] = ⟨i|Ĥ|i⟩
     """
     if ham_op.shape[0] != ham_op.shape[1]:
         raise ValueError("Diagonal extraction requires square operator")
-        
+
     size = ham_op.shape[0]
     H_diag = np.zeros(size, dtype=np.float64)
+    
+    # Filter diagonal entries
     diag_mask = ham_op.rows == ham_op.cols
-    H_diag[ham_op.rows[diag_mask]] = ham_op.vals[diag_mask]
+    rows_diag = ham_op.rows[diag_mask].astype(np.int64, copy=False)
+    vals_diag = ham_op.vals[diag_mask].astype(np.float64, copy=False)
+    
+    # Accumulate duplicates via in-place addition
+    np.add.at(H_diag, rows_diag, vals_diag)
     
     return H_diag
 

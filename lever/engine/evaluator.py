@@ -33,56 +33,58 @@ if TYPE_CHECKING:
 def _compute_contractions_numpy(
     ψ_S_np: np.ndarray,
     ψ_C_np: np.ndarray,
-    ham_ss_rows: np.ndarray, ham_ss_cols: np.ndarray, ham_ss_vals: np.ndarray,
-    ham_sc_rows: np.ndarray, ham_sc_cols: np.ndarray, ham_sc_vals: np.ndarray,
-    ham_cc_rows: np.ndarray | None, ham_cc_cols: np.ndarray | None, ham_cc_vals: np.ndarray | None,
-    size_S: np.ndarray | int, size_C: np.ndarray | int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ham_ss_rows: np.ndarray,
+    ham_ss_cols: np.ndarray,
+    ham_ss_vals: np.ndarray,
+    ham_sc_rows: np.ndarray | None,
+    ham_sc_cols: np.ndarray | None,
+    ham_sc_vals: np.ndarray | None,
+    size_S: np.ndarray | int,
+    size_C: np.ndarray | int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute all Hamiltonian-wavefunction contractions via Numba kernels.
-    
-    Handles PROXY mode (ham_cc_* = None) and FULL mode (ham_cc_* provided).
-    Returns (H_SS@ψ_S, H_SC@ψ_C, H_CS@ψ_S, H_CC@ψ_C).
+    Compute H_SS@ψ_S, H_SC@ψ_C, H_CS@ψ_S via Numba kernels.
+  
+    Handles both ASYMMETRIC/PROXY modes (ham_sc provided) and EFFECTIVE mode
+    (ham_sc=None, returns zero for N_SC and N_CS).
+  
+    Returns:
+        (N_SS, N_SC, N_CS): Hamiltonian-wavefunction products
     """
     # Sanitize arrays for Numba compatibility
     ψ_S = np.asarray(ψ_S_np, dtype=np.complex128)
     ψ_C = np.asarray(ψ_C_np, dtype=np.complex128)
-    
+
     rows_ss = np.asarray(ham_ss_rows, dtype=np.int64)
     cols_ss = np.asarray(ham_ss_cols, dtype=np.int64)
     vals_ss = np.asarray(ham_ss_vals, dtype=np.float64)
 
-    rows_sc = np.asarray(ham_sc_rows, dtype=np.int64)
-    cols_sc = np.asarray(ham_sc_cols, dtype=np.int64)
-    vals_sc = np.asarray(ham_sc_vals, dtype=np.float64)
-    
     size_S_int = int(size_S)
     size_C_int = int(size_C)
 
-    # Compute mandatory contractions: H_SS@ψ_S, H_SC@ψ_C, H_CS@ψ_S
+    # Always compute H_SS@ψ_S
     N_SS = kernels.coo_matvec(rows_ss, cols_ss, vals_ss, ψ_S, size_S_int)
-    N_SC, N_CS = kernels.coo_dual_contract(
-        rows_sc, cols_sc, vals_sc,
-        ψ_S, ψ_C, size_S_int, size_C_int
-    )
 
-    # Conditional H_CC@ψ_C for FULL mode
-    if ham_cc_rows is not None and ham_cc_cols is not None and ham_cc_vals is not None:
-        rows_cc = np.asarray(ham_cc_rows, dtype=np.int64)
-        cols_cc = np.asarray(ham_cc_cols, dtype=np.int64)
-        vals_cc = np.asarray(ham_cc_vals, dtype=np.float64)
-        N_CC = kernels.coo_matvec(rows_cc, cols_cc, vals_cc, ψ_C, size_C_int)
+    # Conditional H_SC and H_CS computation
+    if ham_sc_rows is not None and ham_sc_cols is not None and ham_sc_vals is not None:
+        rows_sc = np.asarray(ham_sc_rows, dtype=np.int64)
+        cols_sc = np.asarray(ham_sc_cols, dtype=np.int64)
+        vals_sc = np.asarray(ham_sc_vals, dtype=np.float64)
+        N_SC, N_CS = kernels.coo_dual_contract(
+            rows_sc, cols_sc, vals_sc, ψ_S, ψ_C, size_S_int, size_C_int
+        )
     else:
-        # PROXY mode: return zeros, diagonal approximation applied in JAX
-        N_CC = np.zeros(size_C_int, dtype=np.complex128)
+        # EFFECTIVE mode: no S-C coupling
+        N_SC = np.zeros(size_S_int, dtype=np.complex128)
+        N_CS = np.zeros(size_C_int, dtype=np.complex128)
 
-    return N_SS, N_SC, N_CS, N_CC
+    return N_SS, N_SC, N_CS
 
 
 class Evaluator:
     """
     Lazy evaluation context with atomic result caching.
-    
+  
     Provides consistent, cached view of wavefunction and contractions for
     single parameter set. Physical computations delegated to pure functions.
     """
@@ -94,8 +96,7 @@ class Evaluator:
         space: SpaceRep,
         n_orbitals: int,
         ham_ss: HamOp,
-        ham_sc: HamOp,
-        ham_cc: HamOp | None = None,
+        ham_sc: HamOp | None = None,
         config: EngineConfig = DEFAULT_CONFIG,
     ) -> None:
         """
@@ -106,9 +107,8 @@ class Evaluator:
             logpsi_fn: Function computing log-amplitudes log(ψ)
             space: Determinant space representation (host memory)
             n_orbitals: Number of spatial orbitals
-            ham_ss: S-space Hamiltonian H_SS (host memory)
-            ham_sc: S-C coupling Hamiltonian H_SC (host memory)
-            ham_cc: Optional full C-C Hamiltonian H_CC (None for PROXY mode)
+            ham_ss: S-space Hamiltonian H_SS or effective H_eff (host memory)
+            ham_sc: S-C coupling Hamiltonian H_SC (None for EFFECTIVE mode)
             config: Engine computation configuration
         """
         self.params = params
@@ -117,7 +117,6 @@ class Evaluator:
         self.n_orbitals = n_orbitals
         self.ham_ss = ham_ss
         self.ham_sc = ham_sc
-        self.ham_cc = ham_cc
         self.config = config
 
     # ========================================================================
@@ -141,7 +140,7 @@ class Evaluator:
     def logpsi_all(self) -> jnp.ndarray:
         """
         Normalized log-amplitudes log(ψ) for all determinants.
-        
+      
         Applies joint L2 normalization: ||ψ_S||² + ||ψ_C||² = 1.
         Gradient flow through norm stopped to preserve variational derivatives.
         """
@@ -172,7 +171,7 @@ class Evaluator:
     def get_batch_logpsi_fn(self) -> Callable[[PyTree], jnp.ndarray]:
         """
         Pure function computing normalized log(ψ) for all determinants.
-        
+      
         Captures static data via closure for cross-module consistency.
         """
         logpsi_fn = self.logpsi_fn
@@ -201,46 +200,47 @@ class Evaluator:
     @functools.cached_property
     def contractions(self) -> Contractions:
         """
-        All Hψ products: (H_SS@ψ_S, H_SC@ψ_C, H_CS@ψ_S, H_CC@ψ_C).
-        
-        Dispatches to Numba kernels via unified callback.
-        PROXY mode: applies diagonal approximation H_CC ≈ diag(H) ⊙ ψ_C.
+        All Hψ products: (H_SS@ψ_S, H_SC@ψ_C, H_CS@ψ_S, H_CC_diag⊙ψ_C).
+      
+        Modes:
+          • ASYMMETRIC/PROXY: Compute H_SC and H_CS via Numba
+          • EFFECTIVE: Skip H_SC/H_CS (returns zeros), H_SS is actually H_eff
+      
+        C-space always uses diagonal approximation: N_CC = H_diag_C ⊙ ψ_C
         """
         ψ_S, ψ_C = self.wavefunction
         complex_dtype = ψ_S.dtype
 
-        # Define output shapes for all four contractions
+        # Define output shapes for three contractions from Numba
         result_shapes = (
             jax.ShapeDtypeStruct((self.space.size_S,), complex_dtype),  # N_SS
             jax.ShapeDtypeStruct((self.space.size_S,), complex_dtype),  # N_SC
             jax.ShapeDtypeStruct((self.space.size_C,), complex_dtype),  # N_CS
-            jax.ShapeDtypeStruct((self.space.size_C,), complex_dtype),  # N_CC
         )
 
-        # Prepare ham_cc arguments (None for PROXY mode)
-        ham_cc_args = (
-            (self.ham_cc.rows, self.ham_cc.cols, self.ham_cc.vals)
-            if self.ham_cc else (None, None, None)
-        )
+        # Prepare ham_sc arguments (None for EFFECTIVE mode)
+        if self.ham_sc is not None:
+            ham_sc_args = (self.ham_sc.rows, self.ham_sc.cols, self.ham_sc.vals)
+        else:
+            ham_sc_args = (None, None, None)
 
-        # Unified callback for both PROXY and FULL modes
-        N_SS, N_SC, N_CS, N_CC_offload = jax.pure_callback(
+        # Offload to Numba kernels
+        N_SS, N_SC, N_CS = jax.pure_callback(
             _compute_contractions_numpy,
             result_shapes,
-            ψ_S, ψ_C,
-            self.ham_ss.rows, self.ham_ss.cols, self.ham_ss.vals,
-            self.ham_sc.rows, self.ham_sc.cols, self.ham_sc.vals,
-            *ham_cc_args,
-            self.space.size_S, self.space.size_C,
+            ψ_S,
+            ψ_C,
+            self.ham_ss.rows,
+            self.ham_ss.cols,
+            self.ham_ss.vals,
+            *ham_sc_args,
+            self.space.size_S,
+            self.space.size_C,
         )
-        
-        # Post-process for PROXY mode: diagonal approximation
-        if self.ham_cc is None:
-            # N_CC_offload is zeros; apply H_diag_C ⊙ ψ_C
-            H_diag_C = jnp.asarray(self.space.H_diag_C)
-            N_CC = H_diag_C * ψ_C
-        else:
-            N_CC = N_CC_offload
+
+        # C-space diagonal approximation (PROXY mode)
+        H_diag_C = jnp.asarray(self.space.H_diag_C)
+        N_CC = H_diag_C * ψ_C
 
         return Contractions(N_SS=N_SS, N_SC=N_SC, N_CS=N_CS, N_CC=N_CC)
 

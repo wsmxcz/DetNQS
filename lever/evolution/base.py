@@ -2,14 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Variational space evolution protocols for adaptive CI.
-
-Defines core abstractions for determinant importance scoring, selection,
-and iterative space refinement in LEVER's S_k → S_{k+1} evolution cycle.
+Space evolution protocols with OuterCtx integration.
 
 File: lever/evolution/base.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
@@ -19,86 +16,67 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol
 import numpy as np
 
 if TYPE_CHECKING:
-    from ..engine import Evaluator
+    from ..engine import OuterCtx
+    from ..engine.utils import PyTree
 
 
 # --- Data Structures ---
 
 class ScoreResult(NamedTuple):
-    """
-    Scored determinant container.
-  
-    Attributes:
-        scores: Importance measure for each determinant (1D array)
-        dets: Corresponding determinant bitmasks (2D array)
-        metadata: Diagnostic information dictionary
-    """
+    """Scored determinant container."""
     scores: np.ndarray
     dets: np.ndarray
-    metadata: dict
+    meta: dict
 
 
 # --- Evolution Protocols ---
 
 class Scorer(Protocol):
-    """
-    Determinant importance evaluator.
-  
-    Computes scalar scores measuring variational significance of each
-    determinant in the active space (S ∪ C) for guiding selection.
-    """
+    """Determinant importance evaluator."""
 
-    def compute_scores(self, evaluator: Evaluator) -> ScoreResult:
+    def score(self, ctx: OuterCtx, params: PyTree) -> ScoreResult:
         """
-        Evaluate determinant importance from current wavefunction state.
+        Compute importance scores from converged state.
       
         Args:
-            evaluator: Lazy evaluation context with ψ(S∪C) and Hamiltonian
+            ctx: Outer cycle context with space/features/Hamiltonian
+            params: Converged neural network parameters
       
         Returns:
-            ScoreResult with importance scores and determinant indices
+            ScoreResult with importance measures
         """
         ...
 
 
 class Selector(Protocol):
-    """
-    Determinant subset selector.
-  
-    Implements selection policy (threshold-based, top-k, etc.) to choose
-    core space S_{k+1} from scored candidates.
-    """
+    """Determinant subset selector."""
 
-    def select(self, score_result: ScoreResult) -> np.ndarray:
+    def select(self, result: ScoreResult) -> np.ndarray:
         """
         Choose new core space from scored determinants.
       
         Args:
-            score_result: Scorer output with importance measures
+            result: Scorer output
       
         Returns:
-            Selected determinant bitmasks (2D array)
+            Selected determinants
         """
         ...
 
 
 class EvolutionStrategy(Protocol):
-    """
-    Complete space evolution orchestrator.
-  
-    Coordinates Scorer(s) and Selector(s) to execute one refinement
-    step: S_k → S_{k+1} at each optimization convergence point.
-    """
+    """Complete evolution orchestrator."""
 
-    def evolve(self, evaluator: Evaluator) -> np.ndarray:
+    def evolve(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
         """
         Execute single evolution cycle.
       
         Args:
-            evaluator: Converged wavefunction state from optimization
+            ctx: Converged outer context
+            params: Converged parameters
       
         Returns:
-            New core space S_{k+1} as determinant bitmasks
+            New S-space determinants
         """
         ...
 

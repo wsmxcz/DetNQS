@@ -2,14 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Lazy evaluator with domain-aware caching for LEVER wavefunction states.
+Closure factory for batch log(ψ) and SpMV operations.
 
-Implements cached evaluation chain:
-  Features → log(ψ) → ψ → H·ψ contractions
-
-Supports three compute modes:
-  - EFFECTIVE: S-space only (H_eff = H_SS + H_SC·D⁻¹·H_CS)
-  - ASYMMETRIC/PROXY: Full T-space (S ∪ C)
+Creates pure JAX callables with captured constants (COO matrices, shapes)
+for efficient JIT compilation and scan loops.
 
 File: lever/engine/evaluator.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -18,369 +14,213 @@ Date: November, 2025
 
 from __future__ import annotations
 
-import functools
 from typing import TYPE_CHECKING, Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .utils import Contractions, LogPsiFn, SpMVFn
 from . import kernels
-from .utils import Contractions, masks_to_vecs
-from ..config import ComputeMode
 
 if TYPE_CHECKING:
-    from ..config import LeverConfig
-    from .utils import HamOp, PyTree, SpaceRep
+    from .utils import PyTree
 
 
-def _compute_contractions_numpy(
-    ψ_S_np: np.ndarray,
-    ψ_C_np: np.ndarray,
+# ============================================================================
+# Log(ψ) Closure Factory
+# ============================================================================
+
+def create_logpsi_fn(
+    model_fn: Callable,
+    feat_s: jnp.ndarray,
+    feat_c: jnp.ndarray,
+    mode: str,
+    normalize: bool,
+    eps: float
+) -> LogPsiFn:
+    """
+    Create batch log(ψ) evaluator with captured features.
+    
+    Applies normalization constraint:
+      - Effective: ||ψ_S||² = 1
+      - Proxy: ||ψ_S||² + ||ψ_C||² = 1
+    
+    Args:
+        model_fn: Neural network mapping (params, features) -> log(ψ)
+        feat_s: S-space occupancy vectors [N_S × n_orb]
+        feat_c: C-space occupancy vectors [N_C × n_orb]
+        mode: "effective" or "proxy"
+        normalize: Apply norm constraint
+        eps: Stability threshold (kept for API compatibility)
+    
+    Returns:
+        Closure: params -> normalized log(ψ) [N_S+N_C]
+    """
+    all_feat = jnp.concatenate([feat_s, feat_c], axis=0)
+    n_s = feat_s.shape[0]
+    is_effective = (mode == "effective")
+    
+    def _batch_logpsi(params: PyTree) -> jnp.ndarray:
+        """Evaluate log(ψ) with optional normalization."""
+        log_all = model_fn(params, all_feat)
+        
+        if not normalize:
+            return log_all
+        
+        # Compute log(||ψ||²) for normalization
+        if is_effective:
+            # S-space only: log(Σ|ψ_S|²)
+            log_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[:n_s]))
+        else:
+            # Full space: log(Σ|ψ_S|² + Σ|ψ_C|²)
+            log_s_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[:n_s]))
+            log_c_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[n_s:]))
+            log_norm_sq = jnp.logaddexp(log_s_norm_sq, log_c_norm_sq)
+        
+        # Apply normalization: log(ψ/||ψ||) = log(ψ) - 0.5·log(||ψ||²)
+        log_norm_sq = jax.lax.stop_gradient(log_norm_sq)
+        return log_all - 0.5 * log_norm_sq
+    
+    return _batch_logpsi
+
+
+# ============================================================================
+# SpMV Closure Factory
+# ============================================================================
+
+def _coo_matvec_cpu(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    vals: np.ndarray,
+    psi: np.ndarray,
+    n_out: int
+) -> np.ndarray:
+    """
+    CPU SpMV via Numba kernel: y = A @ x (COO format).
+    
+    Ensures contiguous memory layout for optimal performance.
+    """
+    psi_c128 = np.ascontiguousarray(psi, dtype=np.complex128)
+    rows_i64 = np.ascontiguousarray(rows, dtype=np.int64)
+    cols_i64 = np.ascontiguousarray(cols, dtype=np.int64)
+    vals_f64 = np.ascontiguousarray(vals, dtype=np.float64)
+    
+    return kernels.coo_matvec(rows_i64, cols_i64, vals_f64, psi_c128, int(n_out))
+
+
+def _dual_contract_cpu(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    vals: np.ndarray,
+    psi_s: np.ndarray,
+    psi_c: np.ndarray,
+    n_s: int,
+    n_c: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    CPU dual contraction for off-diagonal blocks.
+    
+    Computes simultaneously:
+      y_S = H_SC @ ψ_C  (forward)
+      y_C = H_CS @ ψ_S = (H_SC)^T @ ψ_S  (transpose)
+    """
+    psi_s_c128 = np.ascontiguousarray(psi_s, dtype=np.complex128)
+    psi_c_c128 = np.ascontiguousarray(psi_c, dtype=np.complex128)
+    rows_i64 = np.ascontiguousarray(rows, dtype=np.int64)
+    cols_i64 = np.ascontiguousarray(cols, dtype=np.int64)
+    vals_f64 = np.ascontiguousarray(vals, dtype=np.float64)
+    
+    return kernels.coo_dual_contract(
+        rows_i64, cols_i64, vals_f64,
+        psi_s_c128, psi_c_c128,
+        int(n_s), int(n_c)
+    )
+
+
+def create_spmv_eff(
+    ham_eff_rows: np.ndarray,
+    ham_eff_cols: np.ndarray,
+    ham_eff_vals: np.ndarray,
+    n_s: int
+) -> SpMVFn:
+    """
+    Create effective Hamiltonian SpMV operator.
+    
+    Evaluates: N_SS = H_eff @ ψ_S
+    where H_eff = H_SS + H_SC·D^(-1)·H_CS is pre-assembled.
+    
+    Returns:
+        Closure: ψ_S -> Contractions(N_SS, None, None, None)
+    """
+    rows, cols, vals = ham_eff_rows, ham_eff_cols, ham_eff_vals
+    shape_out = jax.ShapeDtypeStruct((n_s,), jnp.complex128)
+    
+    def _spmv_effective(psi_s: jnp.ndarray) -> Contractions:
+        """Apply H_eff to S-space wavefunction."""
+        n_ss = jax.pure_callback(
+            _coo_matvec_cpu,
+            shape_out,
+            rows, cols, vals, psi_s, n_s
+        )
+        return Contractions(n_ss=n_ss, n_sc=None, n_cs=None, n_cc=None)
+    
+    return _spmv_effective
+
+
+def create_spmv_proxy(
     ham_ss_rows: np.ndarray,
     ham_ss_cols: np.ndarray,
     ham_ss_vals: np.ndarray,
-    ham_sc_rows: np.ndarray | None,
-    ham_sc_cols: np.ndarray | None,
-    ham_sc_vals: np.ndarray | None,
-    size_S: np.ndarray | int,
-    size_C: np.ndarray | int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ham_sc_rows: np.ndarray,
+    ham_sc_cols: np.ndarray,
+    ham_sc_vals: np.ndarray,
+    h_diag_c: np.ndarray,
+    n_s: int,
+    n_c: int
+) -> SpMVFn:
     """
-    Compute sparse matrix-vector products via Numba kernels:
+    Create full T-space Hamiltonian SpMV operator.
+    
+    Evaluates all four blocks:
       N_SS = H_SS @ ψ_S
-      N_SC = H_SC @ ψ_C  (if H_SC exists)
-      N_CS = H_CS @ ψ_S  (if H_CS exists, H_CS = H_SC^T)
-
-    Returns zeros for N_SC/N_CS when ham_sc=None (EFFECTIVE mode).
-    """
-    # Type conversion for Numba
-    ψ_S = np.asarray(ψ_S_np, dtype=np.complex128)
-    ψ_C = np.asarray(ψ_C_np, dtype=np.complex128)
-    rows_ss = np.asarray(ham_ss_rows, dtype=np.int64)
-    cols_ss = np.asarray(ham_ss_cols, dtype=np.int64)
-    vals_ss = np.asarray(ham_ss_vals, dtype=np.float64)
-    size_S_int = int(size_S)
-    size_C_int = int(size_C)
-
-    # H_SS @ ψ_S (always required)
-    N_SS = kernels.coo_matvec(rows_ss, cols_ss, vals_ss, ψ_S, size_S_int)
-
-    # H_SC @ ψ_C and H_CS @ ψ_S (skip for EFFECTIVE)
-    if ham_sc_rows is not None and ham_sc_cols is not None and ham_sc_vals is not None:
-        rows_sc = np.asarray(ham_sc_rows, dtype=np.int64)
-        cols_sc = np.asarray(ham_sc_cols, dtype=np.int64)
-        vals_sc = np.asarray(ham_sc_vals, dtype=np.float64)
-        N_SC, N_CS = kernels.coo_dual_contract(
-            rows_sc, cols_sc, vals_sc, ψ_S, ψ_C, size_S_int, size_C_int
-        )
-    else:
-        N_SC = np.zeros(size_S_int, dtype=np.complex128)
-        N_CS = np.zeros(size_C_int, dtype=np.complex128)
-
-    return N_SS, N_SC, N_CS
-
-
-def _compute_contractions_s_only(
-    ψ_S_np: np.ndarray,
-    ham_rows: np.ndarray,
-    ham_cols: np.ndarray,
-    ham_vals: np.ndarray,
-    size_S: np.ndarray | int,
-) -> np.ndarray:
-    """
-    S-only sparse matrix-vector product: N_SS = H_eff @ ψ_S.
+      N_SC = H_SC @ ψ_C
+      N_CS = (H_SC)^T @ ψ_S
+      N_CC = diag(H_CC) @ ψ_C
     
-    Dedicated callback for EFFECTIVE mode to avoid C-space overhead.
+    Returns:
+        Closure: (ψ_S, ψ_C) -> Contractions(N_SS, N_SC, N_CS, N_CC)
     """
-    ψ_S = np.asarray(ψ_S_np, dtype=np.complex128)
-    rows = np.asarray(ham_rows, dtype=np.int64)
-    cols = np.asarray(ham_cols, dtype=np.int64)
-    vals = np.asarray(ham_vals, dtype=np.float64)
-    size_S_int = int(size_S)
+    rows_ss, cols_ss, vals_ss = ham_ss_rows, ham_ss_cols, ham_ss_vals
+    rows_sc, cols_sc, vals_sc = ham_sc_rows, ham_sc_cols, ham_sc_vals
+    diag_c = jnp.asarray(h_diag_c)
     
-    N_SS = kernels.coo_matvec(rows, cols, vals, ψ_S, size_S_int)
-    return N_SS
-
-
-class Evaluator:
-    """
-    Lazy evaluation context with domain-aware computation and caching.
-
-    Evaluation chain (cached via @functools.cached_property):
-      1. features_{S,C} ← occupancy vectors
-      2. log(ψ) ← neural network(features)
-      3. ψ ← exp(normalized log(ψ))
-      4. contractions ← sparse H·ψ products
-
-    Domain logic:
-      - EFFECTIVE: S-only evaluation (||ψ_S||² = 1), unless force_full_space=True
-      - ASYMMETRIC/PROXY: Full T-space (||ψ_S||² + ||ψ_C||² = 1)
-    """
-
-    def __init__(
-        self,
-        params: PyTree,
-        logpsi_fn: Callable[[PyTree, jnp.ndarray], jnp.ndarray],
-        space: SpaceRep,
-        n_orbitals: int,
-        ham_ss: HamOp,
-        ham_sc: HamOp | None,
-        config: LeverConfig,
-        features_S: jnp.ndarray | None = None,
-        features_C: jnp.ndarray | None = None,
-        force_full_space: bool = False,
-    ) -> None:
-        """
-        Initialize evaluator for single optimization step.
-
-        Args:
-            params: Neural network parameters
-            logpsi_fn: Network function: (params, features) → log(ψ)
-            space: Determinant space representation
-            n_orbitals: Number of spatial orbitals
-            ham_ss: ⟨S|H|S⟩ block (COO format)
-            ham_sc: ⟨S|H|C⟩ block (None for EFFECTIVE)
-            config: Global configuration
-            features_S/C: Pre-computed occupancy vectors (optional)
-            force_full_space: Override for T-space evolution in EFFECTIVE mode
-        """
-        self.params = params
-        self.logpsi_fn = logpsi_fn
-        self.space = space
-        self.n_orbitals = n_orbitals
-        self.ham_ss = ham_ss
-        self.ham_sc = ham_sc
-        self.config = config
-        self._features_S = features_S
-        self._features_C = features_C
-
-        # Domain-aware mode: EFFECTIVE → S-only, unless overridden
-        self._is_effective = (
-            config.compute_mode == ComputeMode.EFFECTIVE and not force_full_space
+    shape_ss = jax.ShapeDtypeStruct((n_s,), jnp.complex128)
+    shape_sc = jax.ShapeDtypeStruct((n_s,), jnp.complex128)
+    shape_cs = jax.ShapeDtypeStruct((n_c,), jnp.complex128)
+    
+    def _spmv_proxy(psi_s: jnp.ndarray, psi_c: jnp.ndarray) -> Contractions:
+        """Apply full T-space Hamiltonian blocks."""
+        # S-space diagonal: N_SS = H_SS @ ψ_S
+        n_ss = jax.pure_callback(
+            _coo_matvec_cpu,
+            shape_ss,
+            rows_ss, cols_ss, vals_ss, psi_s, n_s
         )
         
-        # ✅ Solution B: Create SpMV closures with captured COO data
-        self._spmv_fn = self._make_spmv_closure()
-
-    def _make_spmv_closure(self) -> Callable:
-        """
-        Create SpMV closure with statically captured COO matrices.
+        # Off-diagonal blocks: N_SC and N_CS (computed simultaneously)
+        n_sc, n_cs = jax.pure_callback(
+            _dual_contract_cpu,
+            (shape_sc, shape_cs),
+            rows_sc, cols_sc, vals_sc, psi_s, psi_c, n_s, n_c
+        )
         
-        Reduces pure_callback overhead by capturing sparse data in closure,
-        only passing wavefunction arrays as runtime arguments.
-        """
-        if self.ham_sc is None:
-            # S-only mode (EFFECTIVE)
-            rows = self.ham_ss.rows
-            cols = self.ham_ss.cols
-            vals = self.ham_ss.vals
-            size_S = self.space.size_S
-            result_shape = jax.ShapeDtypeStruct((size_S,), jnp.complex128)
-            
-            def spmv_s_only(ψ_S: jnp.ndarray) -> Contractions:
-                """SpMV for EFFECTIVE mode: N_SS = H_eff @ ψ_S"""
-                N_SS = jax.pure_callback(
-                    _compute_contractions_s_only,
-                    result_shape,
-                    ψ_S, rows, cols, vals, size_S,
-                )
-                return Contractions(N_SS=N_SS, N_SC=None, N_CS=None, N_CC=None)
-            
-            return spmv_s_only
+        # C-space diagonal: N_CC = diag(H_CC) @ ψ_C
+        n_cc = diag_c * psi_c
         
-        else:
-            # Full-space mode (PROXY/ASYMMETRIC)
-            rows_ss = self.ham_ss.rows
-            cols_ss = self.ham_ss.cols
-            vals_ss = self.ham_ss.vals
-            rows_sc = self.ham_sc.rows
-            cols_sc = self.ham_sc.cols
-            vals_sc = self.ham_sc.vals
-            size_S = self.space.size_S
-            size_C = self.space.size_C
-            H_diag_C = jnp.asarray(self.space.H_diag_C)
-            
-            result_shapes = (
-                jax.ShapeDtypeStruct((size_S,), jnp.complex128),  # N_SS
-                jax.ShapeDtypeStruct((size_S,), jnp.complex128),  # N_SC
-                jax.ShapeDtypeStruct((size_C,), jnp.complex128),  # N_CS
-            )
-            
-            def spmv_full(ψ_S: jnp.ndarray, ψ_C: jnp.ndarray) -> Contractions:
-                """SpMV for full-space: N_SS, N_SC, N_CS, N_CC"""
-                N_SS, N_SC, N_CS = jax.pure_callback(
-                    _compute_contractions_numpy,
-                    result_shapes,
-                    ψ_S, ψ_C,
-                    rows_ss, cols_ss, vals_ss,
-                    rows_sc, cols_sc, vals_sc,
-                    size_S, size_C,
-                )
-                N_CC = H_diag_C * ψ_C
-                return Contractions(N_SS=N_SS, N_SC=N_SC, N_CS=N_CS, N_CC=N_CC)
-            
-            return spmv_full
-
-    # ========================================================================
-    # Level 0: Neural network input features
-    # ========================================================================
-
-    @functools.cached_property
-    def features_S(self) -> jnp.ndarray:
-        """S-space occupancy vectors: [N_S, 2*n_orb] (spin-up || spin-down)."""
-        if self._features_S is not None:
-            return self._features_S
-        s_dets_dev = jnp.asarray(self.space.s_dets)
-        return masks_to_vecs(s_dets_dev, self.n_orbitals)
-
-    @functools.cached_property
-    def features_C(self) -> jnp.ndarray:
-        """C-space occupancy vectors (empty array for EFFECTIVE)."""
-        if self._is_effective:
-            return jnp.empty((0, 2 * self.n_orbitals), dtype=jnp.float32)
-        if self._features_C is not None:
-            return self._features_C
-        c_dets_dev = jnp.asarray(self.space.c_dets)
-        return masks_to_vecs(c_dets_dev, self.n_orbitals)
-
-    @functools.cached_property
-    def all_features(self) -> jnp.ndarray:
-        """
-        Concatenated features for batch evaluation.
-
-        EFFECTIVE: S-only [N_S, 2*n_orb]
-        Others: S ∥ C [N_S+N_C, 2*n_orb]
-        """
-        if self._is_effective:
-            return self.features_S
-        return jnp.concatenate([self.features_S, self.features_C], axis=0)
-
-    # ========================================================================
-    # Level 1: Wavefunction amplitudes
-    # ========================================================================
-
-    @functools.cached_property
-    def logpsi_all(self) -> jnp.ndarray:
-        """
-        Normalized log-amplitudes with gradient-free normalization.
-
-        Normalization:
-          EFFECTIVE: log(ψ_S) - 0.5·log(Σ|ψ_S|²)
-          Others:    log(ψ) - 0.5·log(Σ|ψ_S|² + Σ|ψ_C|²)
-
-        Ensures ||ψ|| = 1 without backprop through normalization constant.
-        """
-        log_all = self.logpsi_fn(self.params, self.all_features)
-
-        if not self.config.normalize_wf:
-            return log_all
-
-        if self._is_effective:
-            # S-only normalization: ||ψ_S||² = 1
-            log_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all))
-            log_norm_sq = jax.lax.stop_gradient(log_norm_sq)
-            return log_all - 0.5 * log_norm_sq
-        else:
-            # Joint normalization: ||ψ_S||² + ||ψ_C||² = 1
-            n_S = self.space.size_S
-            log_S, log_C = log_all[:n_S], log_all[n_S:]
-            log_norm_sq = jnp.logaddexp(
-                jax.scipy.special.logsumexp(2.0 * jnp.real(log_S)),
-                jax.scipy.special.logsumexp(2.0 * jnp.real(log_C)),
-            )
-            log_norm_sq = jax.lax.stop_gradient(log_norm_sq)
-            return log_all - 0.5 * log_norm_sq
-
-    @functools.cached_property
-    def wavefunction(self) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Exponential amplitudes: ψ = exp(log(ψ)).
-
-        Returns:
-            (ψ_S, ψ_C) where ψ_C is empty for EFFECTIVE mode
-        """
-        ψ_all = jnp.exp(self.logpsi_all)
-        if self._is_effective:
-            return ψ_all, jnp.empty(0, dtype=ψ_all.dtype)
-        n_S = self.space.size_S
-        return ψ_all[:n_S], ψ_all[n_S:]
-
-    def get_batch_logpsi_fn(self) -> Callable[[PyTree], jnp.ndarray]:
-        """
-        Pure function for batch evaluation: params → normalized log(ψ).
-
-        Closure captures features and normalization logic, enabling
-        efficient parameter sweeps without re-initializing Evaluator.
-        """
-        logpsi_fn = self.logpsi_fn
-        all_features = self.all_features
-        normalize = self.config.normalize_wf
-        is_effective = self._is_effective
-        n_S = self.space.size_S
-
-        def _batch_logpsi(params: PyTree) -> jnp.ndarray:
-            log_all = logpsi_fn(params, all_features)
-            if not normalize:
-                return log_all
-
-            if is_effective:
-                log_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all))
-                log_norm_sq = jax.lax.stop_gradient(log_norm_sq)
-                return log_all - 0.5 * log_norm_sq
-            else:
-                log_S, log_C = log_all[:n_S], log_all[n_S:]
-                log_norm_sq = jnp.logaddexp(
-                    jax.scipy.special.logsumexp(2.0 * jnp.real(log_S)),
-                    jax.scipy.special.logsumexp(2.0 * jnp.real(log_C)),
-                )
-                log_norm_sq = jax.lax.stop_gradient(log_norm_sq)
-                return log_all - 0.5 * log_norm_sq
-
-        return _batch_logpsi
-
-    # ========================================================================
-    # Level 2: Hamiltonian contractions
-    # ========================================================================
-
-    def compute_contractions_from_psi(
-        self, 
-        ψ_S: jnp.ndarray, 
-        ψ_C: jnp.ndarray | None = None
-    ) -> Contractions:
-        """
-        ✅ Solution A: Compute contractions from externally provided ψ.
-        
-        Avoids redundant network forward pass by accepting pre-computed
-        wavefunction amplitudes (e.g., from VJP forward pass).
-        
-        Args:
-            ψ_S: S-space wavefunction amplitudes
-            ψ_C: C-space amplitudes (required for PROXY/ASYMMETRIC)
-        
-        Returns:
-            Contractions: Hamiltonian-wavefunction products
-        """
-        if self._is_effective:
-            # S-only mode: delegate to closure
-            return self._spmv_fn(ψ_S)
-        else:
-            # Full-space mode: require ψ_C
-            if ψ_C is None:
-                raise ValueError("ψ_C required for full-space contractions")
-            return self._spmv_fn(ψ_S, ψ_C)
-
-    @functools.cached_property
-    def contractions(self) -> Contractions:
-        """
-        Cached contractions (compatibility interface).
-        
-        Note: Optimization paths should use compute_contractions_from_psi()
-        to avoid redundant network forward passes. This property retained
-        for non-optimization uses (e.g., analysis, evolution).
-        """
-        ψ_S, ψ_C = self.wavefunction
-        return self.compute_contractions_from_psi(ψ_S, ψ_C)
+        return Contractions(n_ss=n_ss, n_sc=n_sc, n_cs=n_cs, n_cc=n_cc)
+    
+    return _spmv_proxy
 
 
-__all__ = ["Evaluator"]
+__all__ = ["create_logpsi_fn", "create_spmv_eff", "create_spmv_proxy"]

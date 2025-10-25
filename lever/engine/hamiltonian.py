@@ -131,7 +131,7 @@ def get_ham_proxy(
         mode: Screening strategy
         psi_S: S-space wavefunction for dynamic mode
         eps1: Screening threshold
-        diag_shift: Level shift for H_diag_C stabilization
+        diag_shift: Level shift for h_diag_c stabilization
     
     Returns:
         (H_SS, H_SC, space): Hamiltonian blocks and Hilbert space representation
@@ -194,8 +194,8 @@ def get_ham_proxy(
     )
 
     # Extract/compute diagonal elements
-    H_diag_S = _extract_diagonal(ham_ss)
-    H_diag_C = (
+    h_diag_s = _extract_diagonal(ham_ss)
+    h_diag_c = (
         core.get_ham_diag(dets=C_dets, int_ctx=int_ctx) + diag_shift
         if size_C > 0
         else np.array([], dtype=np.float64)
@@ -204,8 +204,8 @@ def get_ham_proxy(
     space = SpaceRep(
         s_dets=S,
         c_dets=C_dets,
-        H_diag_S=H_diag_S,
-        H_diag_C=H_diag_C,
+        h_diag_s=h_diag_s,
+        h_diag_c=h_diag_c,
     )
 
     return ham_ss, ham_sc, space
@@ -227,7 +227,7 @@ def get_ham_ss(
     
     Algorithm:
       1. Call C++ backend for ⟨S|Ĥ|S⟩ block construction
-      2. Extract H_diag_S from diagonal elements
+      2. Extract h_diag_s from diagonal elements
       3. Return space with empty C-space
     
     Args:
@@ -257,14 +257,14 @@ def get_ham_ss(
     )
     
     # Extract diagonal elements
-    H_diag_S = _extract_diagonal(ham_ss)
+    h_diag_s = _extract_diagonal(ham_ss)
     
     # Create space representation with empty C-space
     space = SpaceRep(
         s_dets=S,
         c_dets=np.empty((0, 2), dtype=np.uint64),
-        H_diag_S=H_diag_S,
-        H_diag_C=np.array([], dtype=np.float64),
+        h_diag_s=h_diag_s,
+        h_diag_c=np.array([], dtype=np.float64),
     )
     
     return ham_ss, space
@@ -333,14 +333,14 @@ def get_ham_full(
     )
 
     # Extract diagonals
-    H_diag_S = _extract_diagonal(ham_ss)
-    H_diag_C = _extract_diagonal(ham_cc)
+    h_diag_s = _extract_diagonal(ham_ss)
+    h_diag_c = _extract_diagonal(ham_cc)
 
     space = SpaceRep(
         s_dets=S,
         c_dets=C,
-        H_diag_S=H_diag_S,
-        H_diag_C=H_diag_C,
+        h_diag_s=h_diag_s,
+        h_diag_c=h_diag_c,
     )
 
     return ham_ss, ham_sc, ham_cc, space

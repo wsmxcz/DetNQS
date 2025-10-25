@@ -2,14 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-High-level evolution strategies for variational space updates.
-
-Composes scorers and selectors into complete workflows: from simple single-stage
-selection to advanced mass-locking with frontier expansion (ASCI-inspired).
+High-level evolution strategies with OuterCtx integration.
 
 File: lever/evolution/strategies.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
@@ -21,7 +18,8 @@ import numpy as np
 from .base import EvolutionStrategy, Scorer, Selector
 
 if TYPE_CHECKING:
-    from ..engine import Evaluator
+    from ..engine import OuterCtx
+    from ..engine.utils import PyTree
 
 
 # --- Single-Stage Strategy ---
@@ -37,9 +35,9 @@ class BasicStrategy(EvolutionStrategy):
         self.scorer = scorer
         self.selector = selector
 
-    def evolve(self, evaluator: Evaluator) -> np.ndarray:
+    def evolve(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
         """Apply scoring and selection to produce new S-space."""
-        scores = self.scorer.compute_scores(evaluator)
+        scores = self.scorer.score(ctx, params)
         return self.selector.select(scores)
 
 
@@ -65,16 +63,16 @@ class TwoStageStrategy(EvolutionStrategy):
         self.frontier_scorer = frontier_scorer
         self.frontier_selector = frontier_selector
 
-    def evolve(self, evaluator: Evaluator) -> np.ndarray:
+    def evolve(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
         """Select core and frontier independently, return their union."""
         # Stage 1: Core selection
         s_core = self.core_selector.select(
-            self.core_scorer.compute_scores(evaluator)
+            self.core_scorer.score(ctx, params)
         )
 
         # Stage 2: Frontier selection
         s_frontier = self.frontier_selector.select(
-            self.frontier_scorer.compute_scores(evaluator)
+            self.frontier_scorer.score(ctx, params)
         )
 
         # Combine unique determinants
@@ -122,31 +120,37 @@ class MassLockingStrategy(EvolutionStrategy):
         self.frontier_scorer = frontier_scorer
         self.frontier_selector = frontier_selector
 
-    def evolve(self, evaluator: Evaluator) -> np.ndarray:
+    def evolve(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
         """Apply mass-locking core selection + frontier expansion."""
         # Stage 1: Lock core by cumulative probability mass
-        s_locked = self._lock_core(evaluator)
+        s_locked = self._lock_core(ctx, params)
 
         # Stage 2: Expand frontier from active space
         s_frontier = self.frontier_selector.select(
-            self.frontier_scorer.compute_scores(evaluator)
+            self.frontier_scorer.score(ctx, params)
         )
 
         # Combine unique determinants
         return self._unique_union(s_locked, s_frontier)
 
-    def _lock_core(self, evaluator: Evaluator) -> np.ndarray:
+    def _lock_core(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
         """
         Lock determinants with cumulative |ψᵢ|² > threshold.
       
         Returns:
             Array of locked determinants from current S-space
         """
-        psi_s = np.asarray(evaluator.wavefunction[0])
-        current_s = evaluator.space.s_dets
+        import jax.numpy as jnp
+        
+        # Compute ψ_S from cached logpsi_fn
+        log_all = ctx.logpsi_fn(params)
+        psi_s = jnp.exp(log_all[:ctx.space.n_s])
+        psi_s_cpu = np.asarray(psi_s)
+        
+        current_s = ctx.space.s_dets
 
         # Compute probability mass |ψᵢ|²
-        probs = np.abs(psi_s) ** 2
+        probs = np.abs(psi_s_cpu) ** 2
 
         # Sort by probability (descending)
         sorted_idx = np.argsort(probs)[::-1]

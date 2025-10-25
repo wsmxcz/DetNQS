@@ -2,78 +2,89 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LEVER Engine: The core computational subsystem for variational Monte Carlo.
+LEVER Engine: JIT-optimized variational Monte Carlo computational core.
 
-This package provides a comprehensive toolkit for performing single-iteration
-variational optimization steps. It is designed around a JAX-first philosophy,
-ensuring that the entire computational graph is JIT-compatible, while seamlessly
-integrating with high-performance CPU kernels for specialized tasks.
+Architecture:
+  - OuterCycle: Immutable build artifacts (H, features, closures)
+  - InnerCycle: Mutable optimization state (params, optimizer)
+  - Factory pattern: Pure JAX closures with captured constants
+  - Hybrid execution: CPU SpMV (pure_callback) + GPU autodiff
 
-The public API exposes key components:
-- Configuration objects (`EngineConfig`, `EnergyMode`, etc.) to control behavior.
-- Data structures (`HamOp`, `SpaceRep`, `GradientResult`) for data exchange.
-- The `Evaluator` class, a lazy-caching context for a single optimization step.
-- Pure computation functions (`compute_energy_and_gradient`, `compute_S_matvec`)
-  that operate on an `Evaluator` instance.
-- A bridge function (`get_ham_ops`) to the C++ backend for Hamiltonian construction.
+Key components:
+  - Closure factories: create_logpsi_fn, create_spmv_{eff,proxy}
+  - Step kernels: create_step_fn, create_scan_fn (lax.scan compatible)
+  - Hamiltonian builders: get_ham_{ss,proxy,full,eff}
 
-File: lever/engine/__init__.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025 (Refactored)
+Date: November, 2025
 """
 
-# --- Core Data Structures ---
-# Note: Other data structures are typically used internally or returned by functions.
 from .utils import (
-    Contractions,
-    GradientResult,
-    HamOp,
-    MatVecOp,
-    PyTree,
-    SOperatorMetadata,
-    SpaceRep,
-    SubspaceMetadata
+    # Type aliases
+    PyTree,       # JAX pytree type
+    SpMVFn,       # Sparse matrix-vector product: (ψ, params) -> H@ψ
+    LogPsiFn,     # Wavefunction evaluator: (config, params) -> log(ψ)
+  
+    # CPU sparse matrix storage
+    HamOp,        # Hamiltonian operator (CSR/COO)
+    SpaceRep,     # Hilbert space representation (S/C/T partitions)
+  
+    # Computational contexts
+    OuterCtx,     # Outer loop artifacts (immutable per cycle)
+    InnerState,   # Inner loop state (mutable parameters)
+  
+    # Result containers
+    Contractions, # Hamiltonian-wavefunction products (H@ψ, ⟨H⟩, etc.)
+    StepResult,   # Single optimization step output
+    GradResult,   # Energy + gradient computation result
+  
+    # Utilities
+    masks_to_vecs,  # Bitmask -> occupancy vector converter
 )
 
-# --- Lazy Evaluation Context ---
-from .evaluator import Evaluator
-
-# --- Hamiltonian Construction Bridge ---
-from .hamiltonian import get_ham_proxy, get_ham_full
-
-# --- Physics Computations ---
-from .physics import (
-    compute_energy,
-    compute_energy_and_gradient,
-    compute_local_energy
+from .evaluator import (
+    create_logpsi_fn,   # Build log(ψ) evaluator with captured features
+    create_spmv_eff,    # Build H_eff@ψ_S (EFFECTIVE mode, S-space only)
+    create_spmv_proxy,  # Build H@ψ (PROXY mode, full T-space)
 )
 
-# --- Geometry Computations ---
-from .geometry import (
-    compute_S_matvec,
-    compute_subspace_matrices
+from .step import (
+    create_step_fn,  # Single-step gradient descent: (state, key) -> new_state
+    create_scan_fn,  # JIT-compiled scan wrapper for multi-step iteration
 )
 
+from .hamiltonian import (
+    get_ham_ss,     # H_SS: S-space block only
+    get_ham_proxy,  # H_SS + H_SC: Proxy mode with PT2 screening
+    get_ham_full,   # H_SS + H_SC + H_CC: Full subspace
+    get_ham_eff,    # H_eff = H_SS + H_SC·D⁻¹·H_CS: Schur complement
+)
 
-# Define what symbols are exported when a user does `from lever.engine import *`.
+from . import kernels  # Numba-accelerated SpMV primitives
+
+# ============================================================================
+# Public API
+# ============================================================================
 __all__ = [
-    # Data Structures
-    "HamOp",
-    "SpaceRep",
-    "Contractions",
-    "GradientResult",
-    "SOperatorMetadata",
-    "SubspaceMetadata",
-    "PyTree",
-    "MatVecOp",
-
-    # Core Classes and Functions
-    "Evaluator",
-    "get_ham_proxy",
-    "get_ham_full",
-    "compute_energy_and_gradient",
-    "compute_energy",
-    "compute_local_energy",
-    "compute_S_matvec",
-    "compute_subspace_matrices",
+    # Types
+    "PyTree", "SpMVFn", "LogPsiFn",
+  
+    # Data structures
+    "HamOp", "SpaceRep", "OuterCtx", "InnerState",
+    "Contractions", "StepResult", "GradResult",
+  
+    # Utilities
+    "masks_to_vecs",
+  
+    # Closure factories
+    "create_logpsi_fn", "create_spmv_eff", "create_spmv_proxy",
+  
+    # Optimization kernels
+    "create_step_fn", "create_scan_fn",
+  
+    # Hamiltonian builders
+    "get_ham_ss", "get_ham_proxy", "get_ham_full", "get_ham_eff",
+  
+    # Low-level primitives
+    "kernels",
 ]

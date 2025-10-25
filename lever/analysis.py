@@ -2,18 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Analysis and visualization tools for LEVER results.
+Post-processing and visualization tools for LEVER calculations.
 
-Computes reference energies, processes driver output, and generates convergence plots.
+Provides energy evaluation via Davidson diagonalization and convergence
+analysis with comparison to FCI reference.
 
-File: lever/analysis/__init__.py
+File: lever/analysis.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,241 +22,381 @@ import scipy.sparse as sp
 from pyscf import lib
 
 from . import core, engine
+
 if TYPE_CHECKING:
     from .driver import DriverResults
 
 
-class EvaluationSuite:
-    """Helper for computing energies during active calculations."""
+class EvalSuite:
+    """
+    Energy evaluation toolkit for active-space calculations.
     
-    def __init__(self, int_ctx: core.IntCtx, n_orbitals: int, e_nuc: float):
+    Supports exact diagonalization and variational energy computation.
+    """
+    
+    def __init__(self, int_ctx: core.IntCtx, n_orb: int, e_nuc: float):
+        """
+        Initialize evaluation context.
+        
+        Args:
+            int_ctx: Integral provider
+            n_orb: Number of active orbitals
+            e_nuc: Nuclear repulsion energy
+        """
         self.int_ctx = int_ctx
-        self.n_orbitals = n_orbitals
+        self.n_orb = n_orb
         self.e_nuc = e_nuc
 
-    def diagonalize_hamiltonian(self, ham_op):
+    def diag_ham(self, ham_op: engine.HamOp) -> float:
         """
-        Davidson with proper 3-arg preconditioner and block initial guesses.
+        Compute ground-state energy via Davidson diagonalization.
+        
+        Algorithm: Iterative subspace method with 3-argument preconditioner
+        P(r,e) = r / (H_diag - e + τ·sign(H_diag - e)), τ ~ 1e-3·||H_diag||
+        
+        Initial guesses: [argmin(H_diag), orthogonal random vector]
+        
+        Args:
+            ham_op: Hamiltonian in COO format
+            
+        Returns:
+            Total ground-state energy E₀ + E_nuc
         """
+        # Trivial cases
         if ham_op.shape[0] == 0:
             return self.e_nuc
         if ham_op.shape[0] == 1:
             return float(ham_op.vals[0]) + self.e_nuc
 
-        # build CSR once
+        # Build CSR for efficient SpMV
         H = sp.coo_matrix(
             (ham_op.vals, (ham_op.rows, ham_op.cols)),
             shape=ham_op.shape
         ).tocsr()
         H.sum_duplicates()
 
-        # diagonal (may be complex for general Hermitian)
         diag = H.diagonal()
 
-        # better initial guesses: index of min diagonal + one random orthogonal vec
-        i0 = int(np.argmin(diag.real))  # use real part as heuristic
+        # Initial guess: lowest diagonal + orthogonal random
+        i_min = int(np.argmin(diag.real))
         x0 = np.zeros(H.shape[0], dtype=diag.dtype)
-        x0[i0] = 1.0
+        x0[i_min] = 1.0
+        
         rng = np.random.default_rng(0)
         x1 = rng.standard_normal(H.shape[0]).astype(diag.real.dtype)
-        x1 = x1 - (x1 @ x0.real) * x0  # orthogonalize
-        x1 = x1 / np.linalg.norm(x1)
+        x1 -= (x1 @ x0.real) * x0
+        x1 /= np.linalg.norm(x1)
         X0 = [x0, x1.astype(x0.dtype, copy=False)]
 
-        # 3-argument preconditioner: (r, e, x) -> approx (D - e I)^{-1} r
-        def precond_fun(r, e, _x_unused):
+        # Preconditioner: P(r, e) = r / (diag - e + τ·sign(diag - e))
+        def precond(r: np.ndarray, e: float, _x: np.ndarray) -> np.ndarray:
             denom = diag - e
-            # damping to avoid division by tiny numbers
             tau = 1e-3 * (np.linalg.norm(diag, ord=np.inf) + 1.0)
-            safe = np.where(np.abs(denom) > 1e-8, denom, np.sign(denom) * tau)
-            return r / safe
+            safe_denom = np.where(np.abs(denom) > 1e-8, denom, np.sign(denom) * tau)
+            return r / safe_denom
 
-        e, _ = lib.linalg_helper.davidson(
-            lambda v: H @ v,              # matvec
-            X0,                           # block initial guesses
-            precond_fun,                  # 3-arg preconditioner
+        # Davidson iteration
+        e_vals, _ = lib.linalg_helper.davidson(
+            lambda v: H @ v,
+            X0,
+            precond,
             nroots=1,
             max_space=50,
             max_cycle=200,
             tol=1e-10
         )
-        return float(np.atleast_1d(e)[0]) + self.e_nuc
+        return float(np.atleast_1d(e_vals)[0]) + self.e_nuc
 
-    def compute_variational_energy(
-        self, variables: Any, logpsi_fn: Callable, ham_op: engine.HamOp,
+    def var_energy(
+        self,
+        params,
+        logpsi_fn: Callable,
+        ham_op: engine.HamOp,
         dets: np.ndarray
     ) -> float:
         """
-        Computes variational energy E = ⟨ψ|H|ψ⟩ / ⟨ψ|ψ⟩.
+        Compute variational energy E = ⟨ψ|H|ψ⟩ / ⟨ψ|ψ⟩.
         
-        Algorithm: Convert parameters to amplitudes ψ, compute Hψ via sparse matvec,
-        then evaluate Rayleigh quotient.
+        Args:
+            params: Neural network parameters
+            logpsi_fn: log|ψ(det)| evaluator
+            ham_op: Hamiltonian operator
+            dets: Determinant basis (bool masks)
+            
+        Returns:
+            Total variational energy
         """
         from jax import numpy as jnp
       
-        t_vecs = engine.utils.masks_to_vecs(jnp.asarray(dets), self.n_orbitals)
-        log_psi = logpsi_fn(variables, t_vecs)
+        # Evaluate wave function amplitudes
+        t_vecs = engine.utils.masks_to_vecs(jnp.asarray(dets), self.n_orb)
+        log_psi = logpsi_fn(params, t_vecs)
         psi = np.array(jnp.exp(log_psi))
       
+        # Compute H|ψ⟩ via sparse matrix-vector product
         h_psi = engine.kernels.coo_matvec(
             ham_op.rows, ham_op.cols, ham_op.vals, psi, len(dets)
         )
 
+        # Rayleigh quotient: E = ⟨ψ|H|ψ⟩ / ⟨ψ|ψ⟩
         e_elec = np.vdot(psi, h_psi).real / np.vdot(psi, psi).real
         return e_elec + self.e_nuc
 
 
 class AnalysisSuite:
-    """Processes and visualizes results from completed LEVER calculations."""
+    """
+    Post-run analysis and convergence visualization.
+    
+    Compares LEVER energies against exact FCI reference.
+    """
     
     def __init__(self, results: DriverResults, int_ctx: core.IntCtx):
-        self.results = results
-        self.config = results.config
+        """
+        Initialize analysis suite.
+        
+        Args:
+            results: LEVER driver output
+            int_ctx: Integral provider for FCI computation
+        """
+        self.res = results
+        self.cfg = results.config
         self.int_ctx = int_ctx
-        self.e_fci = self._compute_fci_energy()
+        self.e_nuc = int_ctx.get_e_nuc()
+        self.e_fci = self._compute_fci()
 
-    def print_summary(self):
-        """Prints final calculation summary with energy comparisons."""
-        res = self.results
-        final_opt_E = res.full_history[-1]
+    def print_summary(self) -> None:
+        """Print formatted energy summary with FCI comparison."""
+        res = self.res
+        final_e = res.full_hist[-1]
 
-        print("\n--- Final Analysis ---")
-        print(f"Reference FCI Energy: {self.e_fci:.8f} Ha")
-        print("\nLEVER Final Energies:")
+        print("\n" + "="*50)
+        print("LEVER Analysis Summary")
+        print("="*50)
+        print(f"\nFCI Reference: {self.e_fci:.8f} Ha")
+        print("\nLEVER Energies:")
         
-        opt_error_mHa = (final_opt_E - self.e_fci) * 1e3
-        print(f"  Optimization:   {final_opt_E:.8f} Ha "
-              f"(Δ = {opt_error_mHa:+.4f} mHa)")
+        # Optimization energy
+        err_mha = (final_e - self.e_fci) * 1e3
+        print(f"  Optimization: {final_e:.8f} Ha  (Δ = {err_mha:+.4f} mHa)")
 
-        if res.var_energy_history:
-            final_var_E = res.var_energy_history[-1]
-            var_error_mHa = (final_var_E - self.e_fci) * 1e3
-            print(f"  Variational(T): {final_var_E:.8f} Ha "
-                  f"(Δ = {var_error_mHa:+.4f} mHa)")
+        # Variational energy
+        if res.var_hist:
+            e_var = res.var_hist[-1]
+            err_var = (e_var - self.e_fci) * 1e3
+            print(f"  Variational:  {e_var:.8f} Ha  (Δ = {err_var:+.4f} mHa)")
         
-        if res.s_ci_energy_history:
-            final_s_ci_E = res.s_ci_energy_history[-1]
-            s_ci_error_mHa = (final_s_ci_E - self.e_fci) * 1e3
-            print(f"  S-space CI:     {final_s_ci_E:.8f} Ha "
-                  f"(Δ = {s_ci_error_mHa:+.4f} mHa)")
+        # S-space CI energy
+        if res.s_ci_hist:
+            e_s = res.s_ci_hist[-1]
+            err_s = (e_s - self.e_fci) * 1e3
+            print(f"  S-space CI:   {e_s:.8f} Ha  (Δ = {err_s:+.4f} mHa)")
         
-        print(f"\nTotal runtime: {res.total_time:.2f} seconds")
+        print(f"\nWall Time: {res.total_time:.2f} s")
+        print("="*50 + "\n")
 
-    def plot_convergence(self, system_name: str | None = None):
+    def plot_conv(self, sys_name: str | None = None) -> None:
         """
-        Generates dual-panel convergence plot.
+        Generate convergence plot with dual panels.
         
-        Top: Energy trajectory vs cycle with FCI reference
-        Bottom: Absolute error on log scale
+        Top: Energy trajectory with chemical accuracy band
+        Bottom: Logarithmic absolute error
+        
+        Args:
+            sys_name: System identifier (inferred from fcidump if None)
         """
-        res = self.results
+        res = self.res
         
-        if system_name is None:
+        # Infer system name from fcidump path
+        if sys_name is None:
             from pathlib import Path
-            system_name = Path(self.config.system.fcidump_path).stem
+            sys_name = Path(self.cfg.system.fcidump_path).stem
 
+        # Configure matplotlib style
         plt.rcParams.update({
             'font.size': 11,
             'axes.labelsize': 12,
             'axes.titlesize': 14,
             'lines.linewidth': 2.0,
-            'grid.alpha': 0.3,
+            'grid.alpha': 0.3
         })
     
-        fig, (ax1, ax2) = plt.subplots(
-            2, 1, figsize=(8, 6), sharex=True, 
-            height_ratios=[2, 1], gridspec_kw={'hspace': 0.15}
+        # Create dual-panel layout
+        fig, (ax_energy, ax_error) = plt.subplots(
+            2, 1,
+            figsize=(8, 6),
+            sharex=True,
+            height_ratios=[2, 1],
+            gridspec_kw={'hspace': 0.15}
         )
     
-        energy = np.array(res.full_history)
-        cycle_end_steps = [b - 1 for b in res.cycle_boundaries[1:]]
-        cycle_end_energies = energy[cycle_end_steps]
-        cycle_indices = np.arange(1, len(cycle_end_steps) + 1)
-        cycle_end_errors = np.abs(cycle_end_energies - self.e_fci)
+        # Extract cycle-end energies
+        energy = np.array(res.full_hist)
+        cycle_ends = [bound - 1 for bound in res.cycle_bounds[1:]]
+        cycle_energies = energy[cycle_ends]
+        cycles = np.arange(1, len(cycle_ends) + 1)
+        errors = np.abs(cycle_energies - self.e_fci)
         
-        chem_acc = 1.6e-3
+        chem_accuracy = 1.6e-3  # Chemical accuracy threshold (1.6 mHa)
 
-        ax1.axhspan(
-            self.e_fci - chem_acc, self.e_fci + chem_acc,
-            alpha=0.15, color='green', label='Chemical Accuracy (±1.6 mHa)'
-        )
-        ax1.axhline(
-            self.e_fci, color='black', linestyle='--', linewidth=1.5,
-            label=f'FCI: {self.e_fci:.6f} Ha'
-        )
-        ax1.plot(
-            cycle_indices, cycle_end_energies, 'o-', color='steelblue',
-            markersize=8, markeredgecolor='white', markeredgewidth=1.5, 
-            label='LEVER (opt)'
-        )
-    
-        if res.var_energy_history:
-            x_var = self._get_plot_indices(res.var_energy_history, cycle_indices)
-            if len(x_var) > 0:
-                ax1.plot(
-                    x_var, res.var_energy_history, 's-', color='orange',
-                    markersize=6, markeredgecolor='white', markeredgewidth=1.0,
-                    label='LEVER (var)'
-                )
-      
-        if res.s_ci_energy_history:
-            x_sci = self._get_plot_indices(res.s_ci_energy_history, cycle_indices)
-            if len(x_sci) > 0:
-                ax1.plot(
-                    x_sci, res.s_ci_energy_history, 'D-', color='purple',
-                    markersize=5, markeredgecolor='white', markeredgewidth=1.0,
-                    label='S-space CI'
-                )
-
-        ax1.set_ylim(self.e_fci - 5e-3, self.e_fci + 15e-3)
-        ax1.set_ylabel('Total Energy (Ha)')
-        ax1.set_title(f'LEVER Evolution: {system_name}')
-        ax1.legend(loc='upper right')
-        ax1.grid(True)
-        ax1.tick_params(axis='x', which='both', bottom=False, labelbottom=False)
-        ax1.ticklabel_format(style='plain', axis='y', useOffset=False)
-
-        ax2.semilogy(
-            cycle_indices, cycle_end_errors, 's-', color='crimson',
-            markersize=8, markeredgecolor='white', markeredgewidth=1.5,
-            label='Absolute Error'
-        )
-        ax2.axhline(chem_acc, color='green', linestyle='--', alpha=0.6)
-        ax2.set_xlabel('Evolution Cycle')
-        ax2.set_ylabel(r'$|E_{\mathrm{LEVER}} - E_{\mathrm{FCI}}|$ (Ha)')
-        ax2.legend(loc='upper right')
-        ax2.grid(True)
-        ax2.set_xticks(cycle_indices)
+        # Top panel: Energy evolution
+        self._plot_energy_panel(ax_energy, cycles, cycle_energies, sys_name, chem_accuracy)
+        
+        # Bottom panel: Error evolution
+        self._plot_error_panel(ax_error, cycles, errors, chem_accuracy)
     
         plt.tight_layout()
         plt.show()
 
-    def _get_plot_indices(self, data_history: list, cycle_indices: np.ndarray) -> list:
-        """Maps data history to appropriate x-axis indices for plotting."""
-        num_points = len(data_history)
+    def _plot_energy_panel(
+        self,
+        ax: plt.Axes,
+        cycles: np.ndarray,
+        energies: np.ndarray,
+        sys_name: str,
+        chem_acc: float
+    ) -> None:
+        """Plot energy trajectory with FCI reference."""
+        res = self.res
         
-        if num_points == len(cycle_indices):
-            return cycle_indices.tolist()
-        elif num_points == 1:
-            return [cycle_indices[-1]]
+        # Chemical accuracy band
+        ax.axhspan(
+            self.e_fci - chem_acc,
+            self.e_fci + chem_acc,
+            alpha=0.15,
+            color='green',
+            label='Chem. Acc. (±1.6 mHa)'
+        )
+        
+        # FCI reference line
+        ax.axhline(
+            self.e_fci,
+            color='black',
+            linestyle='--',
+            linewidth=1.5,
+            label=f'FCI: {self.e_fci:.6f} Ha'
+        )
+        
+        # Optimization trajectory
+        ax.plot(
+            cycles,
+            energies,
+            'o-',
+            color='steelblue',
+            markersize=8,
+            markeredgecolor='white',
+            markeredgewidth=1.5,
+            label='LEVER (opt)'
+        )
+    
+        # Optional: Variational energies
+        if res.var_hist:
+            x_var = self._align_to_cycles(res.var_hist, cycles)
+            if len(x_var) > 0:
+                ax.plot(
+                    x_var,
+                    res.var_hist,
+                    's-',
+                    color='orange',
+                    markersize=6,
+                    markeredgecolor='white',
+                    markeredgewidth=1.0,
+                    label='LEVER (var)'
+                )
+      
+        # Optional: S-space CI energies
+        if res.s_ci_hist:
+            x_s = self._align_to_cycles(res.s_ci_hist, cycles)
+            if len(x_s) > 0:
+                ax.plot(
+                    x_s,
+                    res.s_ci_hist,
+                    'D-',
+                    color='purple',
+                    markersize=5,
+                    markeredgecolor='white',
+                    markeredgewidth=1.0,
+                    label='S-space CI'
+                )
+
+        # Format panel
+        ax.set_ylim(self.e_fci - 5e-3, self.e_fci + 15e-3)
+        ax.set_ylabel('Total Energy (Ha)')
+        ax.set_title(f'LEVER Evolution: {sys_name}')
+        ax.legend(loc='upper right')
+        ax.grid(True)
+        ax.tick_params(axis='x', which='both', bottom=False, labelbottom=False)
+        ax.ticklabel_format(style='plain', axis='y', useOffset=False)
+
+    def _plot_error_panel(
+        self,
+        ax: plt.Axes,
+        cycles: np.ndarray,
+        errors: np.ndarray,
+        chem_acc: float
+    ) -> None:
+        """Plot logarithmic error evolution."""
+        ax.semilogy(
+            cycles,
+            errors,
+            's-',
+            color='crimson',
+            markersize=8,
+            markeredgecolor='white',
+            markeredgewidth=1.5,
+            label='Absolute Error'
+        )
+        
+        # Chemical accuracy threshold
+        ax.axhline(
+            chem_acc,
+            color='green',
+            linestyle='--',
+            alpha=0.6,
+            label=f'Chem. Acc. ({chem_acc*1e3:.1f} mHa)'
+        )
+        
+        ax.set_xlabel('Evolution Cycle')
+        ax.set_ylabel(r'$|E_{\mathrm{LEVER}} - E_{\mathrm{FCI}}|$ (Ha)')
+        ax.legend(loc='upper right')
+        ax.grid(True)
+        ax.set_xticks(cycles)
+
+    def _align_to_cycles(self, hist: list, cycles: np.ndarray) -> list:
+        """
+        Map data history to cycle x-coordinates.
+        
+        Handles cases: full history, single final value, or empty.
+        """
+        n = len(hist)
+        if n == len(cycles):
+            return cycles.tolist()
+        elif n == 1:
+            return [cycles[-1]]
         else:
             return []
 
-    def _compute_fci_energy(self) -> float:
-        """Computes exact FCI ground state energy via full Hamiltonian diagonalization."""
-        sys = self.config.system
+    def _compute_fci(self) -> float:
+        """
+        Compute exact FCI energy via full diagonalization.
         
+        Returns:
+            FCI ground-state energy
+        """
+        sys = self.cfg.system
+        
+        # Generate full FCI determinant basis
         fci_dets = core.gen_fci_dets(sys.n_orbitals, sys.n_alpha, sys.n_beta)
         
+        # Build full Hamiltonian
         ham_fci, _ = engine.hamiltonian.get_ham_ss(
             S_dets=fci_dets,
-            int_ctx=self.int_ctx, n_orbitals=sys.n_orbitals,
+            int_ctx=self.int_ctx,
+            n_orbitals=sys.n_orbitals
         )
         
-        eval_suite = EvaluationSuite(
-            self.int_ctx, sys.n_orbitals, self.int_ctx.get_e_nuc()
-        )
-        return eval_suite.diagonalize_hamiltonian(ham_fci)
+        # Exact diagonalization
+        evaluator = EvalSuite(self.int_ctx, sys.n_orbitals, self.e_nuc)
+        return evaluator.diag_ham(ham_fci)
 
 
-__all__ = ["EvaluationSuite", "AnalysisSuite"]
+__all__ = ["EvalSuite", "AnalysisSuite"]

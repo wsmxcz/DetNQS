@@ -22,15 +22,6 @@ Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: October, 2025 (Refactored)
 """
 
-# --- Configuration and Computation Modes ---
-from .config import (
-    DEFAULT_CONFIG,
-    EnergyMode,
-    EngineConfig,
-    GradMode,
-    ScoreKind
-)
-
 # --- Core Data Structures ---
 # Note: Other data structures are typically used internally or returned by functions.
 from .utils import (
@@ -66,13 +57,6 @@ from .geometry import (
 
 # Define what symbols are exported when a user does `from lever.engine import *`.
 __all__ = [
-    # Configuration
-    "EngineConfig",
-    "DEFAULT_CONFIG",
-    "EnergyMode",
-    "GradMode",
-    "ScoreKind",
-
     # Data Structures
     "HamOp",
     "SpaceRep",

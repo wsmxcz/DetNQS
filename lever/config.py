@@ -2,36 +2,49 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Centralized configuration for LEVER workflows.
-
-Uses typed dataclasses to define system, optimization, and evaluation
-parameters for clarity, type safety, and reusability.
+Unified configuration management for LEVER workflows.
 
 File: lever/config.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-
-from . import engine
 
 
 class EvalMode(str, Enum):
-    """Timing control for expensive energy evaluations."""
+    """Energy evaluation timing control."""
     NEVER = "never"
     FINAL = "final"
     EVERY = "every"
 
 
 class ScreenMode(str, Enum):
-    """Screening strategy for C-space generation."""
-    NONE = "none"        # Full enumeration without heat-bath
-    STATIC = "static"    # Heat-bath screening on integrals
+    """C-space screening strategy."""
+    NONE = "none"        # Full enumeration
+    STATIC = "static"    # Heat-bath integral screening
     DYNAMIC = "dynamic"  # Amplitude-weighted screening
+
+
+class ComputeMode(str, Enum):
+    """
+    Unified computation mode defining energy/gradient algorithms.
+    
+    ASYMMETRIC: S-norm with full S-C coupling (non-variational)
+                E = ⟨ψ_S|Ĥ|ψ⟩ / ||ψ_S||², ∇_θ over S-space only
+    
+    PROXY:      Full-norm with diagonal C approximation (balanced)
+                E = ⟨ψ|Ĥ̃|ψ⟩ / ||ψ||², ∇_θ over S∪C space
+    
+    EFFECTIVE:  S-norm with Schur downfolding (efficient)
+                E = ⟨ψ_S|Ĥ_eff|ψ_S⟩ / ||ψ_S||², ∇_θ over S-space only
+    """
+    ASYMMETRIC = "asymmetric"
+    PROXY = "proxy"
+    EFFECTIVE = "effective"
 
 
 @dataclass(frozen=True)
@@ -45,7 +58,7 @@ class SystemConfig:
 
 @dataclass(frozen=True)
 class OptimizationConfig:
-    """Optimization process parameters."""
+    """VMC optimization parameters."""
     seed: int = 42
     learning_rate: float = 5e-4
     num_cycles: int = 10
@@ -56,7 +69,7 @@ class OptimizationConfig:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    """Energy computation timing control."""
+    """Energy computation timing."""
     var_energy_mode: EvalMode = EvalMode.FINAL
     t_ci_energy_mode: EvalMode = EvalMode.NEVER
     s_ci_energy_mode: EvalMode = EvalMode.FINAL
@@ -64,16 +77,31 @@ class EvaluationConfig:
 
 @dataclass(frozen=True)
 class ScreeningConfig:
-    """Connection space screening parameters."""
+    """C-space screening parameters."""
     mode: ScreenMode = ScreenMode.DYNAMIC
     eps1: float = 1e-6
 
 
 @dataclass(frozen=True)
 class LeverConfig:
-    """Top-level LEVER run configuration."""
+    """
+    Top-level LEVER run configuration.
+    
+    Numerical parameters:
+        epsilon: Stability threshold for division/normalization
+        normalize_wf: Apply joint L2 norm ||ψ_S||² + ||ψ_C||² = 1
+    
+    Compute mode:
+        compute_mode: Unified energy/gradient algorithm (ASYMMETRIC/PROXY/EFFECTIVE)
+    """
     system: SystemConfig
     optimization: OptimizationConfig
     evaluation: EvaluationConfig
     screening: ScreeningConfig
-    engine: engine.EngineConfig = field(default_factory=engine.EngineConfig)
+    
+    # Numerical parameters (previously in EngineConfig)
+    epsilon: float = 1e-12
+    normalize_wf: bool = True
+    
+    # Unified computation mode
+    compute_mode: ComputeMode = ComputeMode.PROXY

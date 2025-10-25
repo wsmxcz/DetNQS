@@ -13,7 +13,7 @@ Date: October, 2025
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,7 +21,8 @@ import scipy.sparse as sp
 from pyscf import lib
 
 from . import core, engine
-from .driver import DriverResults
+if TYPE_CHECKING:
+    from .driver import DriverResults
 
 
 class EvaluationSuite:

@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Variational energy and gradient computations for quantum many-body systems.
+Variational energy and gradient computations for LEVER.
 
-Implements pure functions for calculating observables. Supports multiple
-computation modes (ASYMMETRIC, PROXY, EFFECTIVE) with mode-specific logic
-encapsulated in the Evaluator.
+Implements three computation modes:
+  - ASYMMETRIC: E = ⟨ψ_S|(H_SS + H_SC·ψ_C)|ψ_S⟩ / ||ψ_S||²
+  - PROXY:      E = ⟨ψ|H̃|ψ⟩ / ||ψ||² with proxy Hamiltonian
+  - EFFECTIVE:  E = ⟨ψ_S|H_eff|ψ_S⟩ / ||ψ_S||² using effective H
+
+Gradient computation via VJP with variance-optimal weighting.
 
 File: lever/engine/physics.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 
-from .config import EnergyMode, GradMode
+from ..config import ComputeMode
 from .utils import GradientResult
 
 if TYPE_CHECKING:
@@ -30,184 +33,182 @@ if TYPE_CHECKING:
 
 def compute_energy(evaluator: Evaluator) -> jnp.ndarray:
     """
-    Compute variational energy via Rayleigh quotient: E = ⟨ψ|Ĥ|ψ⟩ / ⟨ψ|ψ⟩.
-  
-    Mode-specific formulas:
-      ASYMMETRIC: E = ⟨ψ_S|(H_SS + H_SC)|ψ⟩ / ||ψ_S||²
-                  Full S-C coupling with S-space normalization.
-                  Non-Hermitian functional—lacks "force terms" from ∂_θψ_C.
-    
-      PROXY:      E = ⟨ψ|H̃|ψ⟩ / ||ψ||²
-                  where H̃ = [[H_SS, H_SC], [H_CS, H_CC^diag]]
-                  Full-space Rayleigh quotient over S∪C with diagonal C approximation.
-    
-      EFFECTIVE:  E = ⟨ψ_S|H_eff|ψ_S⟩ / ||ψ_S||²
-                  Downfolded Hamiltonian via Schur complement (energy-independent).
-                  Efficient for small S-space; no runtime S-C coupling.
-  
-    Args:
-        evaluator: Lazy evaluation context with cached Ĥψ contractions
-  
-    Returns:
-        Scalar energy (real part)
-    """
+    Compute variational energy E = ⟨ψ|Ĥ|ψ⟩ / ⟨ψ|ψ⟩.
 
+    Args:
+        evaluator: Evaluator instance with wavefunction and contractions.
+
+    Returns:
+        Real-valued energy scalar.
+
+    Algorithm:
+        - ASYMMETRIC/EFFECTIVE: S-space normalized
+        - PROXY: Full-space normalized with proxy Hamiltonian
+    """
     ψ_S, ψ_C = evaluator.wavefunction
     N = evaluator.contractions
-    config = evaluator.config
+    mode = evaluator.config.compute_mode
+    eps = evaluator.config.epsilon
 
-    # S-space contribution: ⟨ψ_S| (H_SS + H_SC) |ψ⟩
-    # Note: In EFFECTIVE mode, H_SS is actually H_eff and N_SC = 0
-    num_S = jnp.vdot(ψ_S, N.N_SS + N.N_SC)
+    # Numerator: ⟨ψ|Ĥ|ψ⟩
+    if mode == ComputeMode.EFFECTIVE:
+        num_S = jnp.vdot(ψ_S, N.N_SS)
+    else:
+        num_S = jnp.vdot(ψ_S, N.N_SS + N.N_SC)
 
-    if config.energy_mode in {EnergyMode.ASYMMETRIC, EnergyMode.EFFECTIVE}:
-        # Both modes: normalize over S-space only
-        # ASYMMETRIC uses H_SS + H_SC; EFFECTIVE uses H_eff (with N_SC=0)
+    # Denominator: ⟨ψ|ψ⟩
+    if mode in {ComputeMode.ASYMMETRIC, ComputeMode.EFFECTIVE}:
         denom = jnp.vdot(ψ_S, ψ_S)
-        return (num_S / jnp.maximum(denom, config.epsilon)).real
+        return (num_S / jnp.maximum(denom, eps)).real
 
-    if config.energy_mode == EnergyMode.PROXY:
-        # C-space contribution with diagonal approximation: ⟨ψ_C| (H_CS + H_diag) |ψ_C⟩
+    if mode == ComputeMode.PROXY:
         num_C = jnp.vdot(ψ_C, N.N_CS + N.N_CC)
         denom = jnp.vdot(ψ_S, ψ_S) + jnp.vdot(ψ_C, ψ_C)
-        return ((num_S + num_C) / jnp.maximum(denom, config.epsilon)).real
+        return ((num_S + num_C) / jnp.maximum(denom, eps)).real
 
-    raise ValueError(f"Unknown energy mode: {config.energy_mode}")
+    raise ValueError(f"Unknown compute mode: {mode}")
 
 
 def compute_local_energy(evaluator: Evaluator) -> jnp.ndarray:
     """
-    Compute local energy E_loc[i] = (Ĥψ)[i] / ψ[i] for all determinants.
-  
-    Handles singular points |ψ[i]| < ε via zero assignment to avoid
-    numerical instabilities.
-  
+    Compute local energy E_loc[i] = (Ĥψ)[i] / ψ[i].
+
     Args:
-        evaluator: Lazy evaluation context
-  
+        evaluator: Evaluator instance.
+
     Returns:
-        Concatenated local energies [E_loc,S; E_loc,C] of shape (n_S + n_C,)
-        For EFFECTIVE mode, returns only E_loc,S (C-space not used)
+        Local energy array:
+          - EFFECTIVE: S-space only (size n_S)
+          - Others: Full space [S; C] (size n_S + n_C)
     """
     ψ_S, ψ_C = evaluator.wavefunction
     N = evaluator.contractions
-    config = evaluator.config
+    mode = evaluator.config.compute_mode
+    eps = evaluator.config.epsilon
 
-    # S-space: E_loc,S = (H_SS@ψ_S + H_SC@ψ_C) / ψ_S
-    # Note: In EFFECTIVE mode, N.N_SC = 0
-    num_S = N.N_SS + N.N_SC
-    E_loc_S = jnp.where(jnp.abs(ψ_S) >= config.epsilon, num_S / ψ_S, 0.0)
+    # S-space local energy
+    num_S = N.N_SS if mode == ComputeMode.EFFECTIVE else N.N_SS + N.N_SC
+    E_loc_S = jnp.where(jnp.abs(ψ_S) >= eps, num_S / ψ_S, 0.0)
 
-    # EFFECTIVE mode: skip C-space computation (not used in energy/gradient)
-    if config.grad_mode == GradMode.EFFECTIVE:
+    if mode == ComputeMode.EFFECTIVE:
         return E_loc_S
 
-    # C-space: E_loc,C = (H_CS@ψ_S + H_diag⊙ψ_C) / ψ_C
+    # C-space local energy
     num_C = N.N_CS + N.N_CC
-    E_loc_C = jnp.where(jnp.abs(ψ_C) >= config.epsilon, num_C / ψ_C, 0.0)
+    E_loc_C = jnp.where(jnp.abs(ψ_C) >= eps, num_C / ψ_C, 0.0)
 
     return jnp.concatenate([E_loc_S, E_loc_C])
 
 
 def compute_energy_and_gradient(evaluator: Evaluator) -> GradientResult:
     """
-    Compute variational gradient ∇_θ E via reverse-mode differentiation.
+    ✅ Solution A: Compute energy and gradient with single network forward pass.
     
-    Algorithm (VJP-based gradient):
-      1. Forward: log(ψ(θ)) → E_loc[i]
-      2. Mode-specific weights: w[i] = exp(2·Re[log ψ]) / Σ exp(2·Re[log ψ])
-         Normalization domain aligned with energy mode (S-only vs S∪C)
-      3. Energy: E computed identically to compute_energy()
-      4. Cotangent: c[i] = w[i]·(E_loc[i] - E)
-         Weights and E_loc treated as constants (no gradient flow) for VJP
-      5. Backward: ∇_θ E = conj(VJP(conj(log ψ), conj(c)))
+    Uses variance-reduced VJP where log(ψ) from VJP forward is the single
+    source of truth, avoiding redundant network evaluations.
     
-    Gradient modes:
-      ASYMMETRIC: S-space normalization (||ψ_S||²)
-                  Omits non-Hermitian "force terms" from ∂_θψ_C via H_SC
-                  Faster but lacks full variational consistency
-      
-      EFFECTIVE:  S-space normalization (||ψ_S||²)
-                  Uses downfolded H_eff; no runtime S-C coupling
-      
-      PROXY:      Full-space normalization (||ψ_S||² + ||ψ_C||²)
-                  Diagonal H_CC approximation; balanced accuracy/cost
-    
-    Args:
-        evaluator: Lazy evaluation context
-    
-    Returns:
-        GradientResult(gradient=∇_θ E, energy_elec=E)
+    Algorithm:
+      1. VJP forward: params → log(ψ) [SINGLE network evaluation]
+      2. Derive ψ from log(ψ) directly
+      3. Compute contractions from pre-computed ψ
+      4. Calculate energy and cotangent vector
+      5. VJP backward: cotangent → gradient
     """
-    config = evaluator.config
-    n_S, n_C = evaluator.space.size_S, evaluator.space.size_C
-    ψ_S, ψ_C = evaluator.wavefunction
-    N = evaluator.contractions
+    mode = evaluator.config.compute_mode
+    eps = evaluator.config.epsilon
+    n_S = evaluator.space.size_S
 
-    # Forward pass with VJP setup
-    # vjp_fn computes gradients w.r.t. params only; weights/E_loc are constants
+    # ✅ VJP forward pass (SINGLE network evaluation)
     batch_logpsi_fn = evaluator.get_batch_logpsi_fn()
     log_all, vjp_fn = jax.vjp(batch_logpsi_fn, evaluator.params)
+    
+    # ✅ Derive wavefunction from VJP's log_all (avoid 2nd forward pass)
+    ψ_all = jnp.exp(log_all)
+    ψ_S = ψ_all[:n_S]
+    ψ_C = (ψ_all[n_S:] if mode != ComputeMode.EFFECTIVE 
+           else jnp.empty(0, dtype=ψ_all.dtype))
+    
+    # ✅ Use externally computed ψ (no internal forward pass triggered)
+    N = evaluator.compute_contractions_from_psi(ψ_S, ψ_C)
 
-    # Compute local energies for all determinants
-    # These serve as constants in the cotangent vector construction
-    E_loc_all = compute_local_energy(evaluator)
-
-    # Mode-specific energy and cotangent construction
-    if config.grad_mode in {GradMode.ASYMMETRIC, GradMode.EFFECTIVE}:
-        # S-space only: weights and energy consistent with compute_energy()
-        log_S = log_all[:n_S]
+    # Mode-specific energy and gradient computation
+    if mode in {ComputeMode.ASYMMETRIC, ComputeMode.EFFECTIVE}:
+        # S-space normalization
+        weights_S = _compute_normalized_weights(log_all[:n_S], eps)
         
-        # Weights w_S = exp(2·Re[log ψ_S]) / Σ exp(2·Re[log ψ_S])
-        # Treated as constants (no gradient) when constructing cotangent
-        weights_raw_S = jnp.exp(2.0 * jnp.real(log_S))
-        weights_S = weights_raw_S / jnp.maximum(
-            jnp.sum(weights_raw_S), config.epsilon
-        )
-
-        # Energy: E = ⟨ψ_S|(H_SS + H_SC)|ψ⟩ / ||ψ_S||²
-        # Note: N.N_SC = 0 for EFFECTIVE mode
-        num_S = jnp.vdot(ψ_S, N.N_SS + N.N_SC)
+        # Energy: E = ⟨ψ_S|H|ψ_S⟩ / ||ψ_S||²
+        num_S = jnp.vdot(ψ_S, N.N_SS if mode == ComputeMode.EFFECTIVE 
+                         else N.N_SS + N.N_SC)
         denom_S = jnp.vdot(ψ_S, ψ_S)
-        E_mode = (num_S / jnp.maximum(denom_S, config.epsilon)).real
-
-        # Cotangent vector: c_S = w_S·(E_loc,S - E), c_C = 0
-        # Weights and (E_loc - E) are constants for VJP backward pass
-        cot_S = weights_S * (E_loc_all[:n_S] - E_mode)
-        cot_full = jnp.concatenate([cot_S, jnp.zeros(n_C, dtype=cot_S.dtype)])
-        E_report = E_mode
-
-    elif config.grad_mode == GradMode.PROXY:
-        # Full-space weights and energy (diagonal H_CC approximation)
+        E = (num_S / jnp.maximum(denom_S, eps)).real
         
-        # Weights w = exp(2·Re[log ψ]) / Σ exp(2·Re[log ψ]) over S∪C
-        # Treated as constants in cotangent construction
-        weights_raw = jnp.exp(2.0 * jnp.real(log_all))
-        weights_full = weights_raw / jnp.maximum(
-            jnp.sum(weights_raw), config.epsilon
+        # Local energy for S-space
+        E_loc_S = jnp.where(
+            jnp.abs(ψ_S) >= eps,
+            (N.N_SS if mode == ComputeMode.EFFECTIVE else N.N_SS + N.N_SC) / ψ_S,
+            0.0
         )
+        
+        # Cotangent vector: w_i · (E_loc[i] - E)
+        cot_S = weights_S * (E_loc_S - E)
+        cot_full = (cot_S if mode == ComputeMode.EFFECTIVE 
+                    else _pad_c_space(cot_S, evaluator.space.size_C))
 
-        # Energy: E = (⟨ψ_S|H|ψ⟩ + ⟨ψ_C|H_diag|ψ_C⟩) / (||ψ_S||² + ||ψ_C||²)
+    elif mode == ComputeMode.PROXY:
+        # Full-space normalization
+        weights_full = _compute_normalized_weights(log_all, eps)
+        
+        # Energy: E = (⟨ψ_S|H|ψ⟩ + ⟨ψ_C|H|ψ⟩) / ||ψ||²
         num_S = jnp.vdot(ψ_S, N.N_SS + N.N_SC)
         num_C = jnp.vdot(ψ_C, N.N_CS + N.N_CC)
         denom = jnp.vdot(ψ_S, ψ_S) + jnp.vdot(ψ_C, ψ_C)
-        E_mode = ((num_S + num_C) / jnp.maximum(denom, config.epsilon)).real
-
-        # Cotangent: c = w·(E_loc - E) over full space
-        # Weights and (E_loc - E) are constants for VJP
-        cot_full = weights_full * (E_loc_all - E_mode)
-        E_report = E_mode
+        E = ((num_S + num_C) / jnp.maximum(denom, eps)).real
+        
+        # Local energy for both spaces
+        E_loc_S = jnp.where(jnp.abs(ψ_S) >= eps, (N.N_SS + N.N_SC) / ψ_S, 0.0)
+        E_loc_C = jnp.where(jnp.abs(ψ_C) >= eps, (N.N_CS + N.N_CC) / ψ_C, 0.0)
+        E_loc_all = jnp.concatenate([E_loc_S, E_loc_C])
+        
+        # Cotangent vector
+        cot_full = weights_full * (E_loc_all - E)
 
     else:
-        raise ValueError(f"Unknown gradient mode: {config.grad_mode}")
+        raise ValueError(f"Unknown compute mode: {mode}")
 
-    # Backward pass: ∇_θ E = conj(VJP(conj(log ψ), conj(cotangent)))
-    # VJP only differentiates through log_ψ(θ); cotangent is treated as constant
-    # Complex conjugation handles Wirtinger derivatives for real-valued E
+    # VJP backward pass with complex conjugation
     (grad_conj,) = vjp_fn(jnp.conj(cot_full))
     grad = jax.tree.map(jnp.conj, grad_conj)
 
-    return GradientResult(gradient=grad, energy_elec=E_report)
+    return GradientResult(gradient=grad, energy_elec=E)
+
+
+def _compute_normalized_weights(log_psi: jnp.ndarray, eps: float) -> jnp.ndarray:
+    """
+    Compute normalized probability weights w[i] = |ψ[i]|² / Σ|ψ|².
+
+    Args:
+        log_psi: Logarithm of wavefunction values.
+        eps: Numerical stability threshold.
+
+    Returns:
+        Normalized weights summing to 1.
+    """
+    weights_raw = jnp.exp(2.0 * jnp.real(log_psi))
+    return weights_raw / jnp.maximum(jnp.sum(weights_raw), eps)
+
+
+def _pad_c_space(array_S: jnp.ndarray, n_C: int) -> jnp.ndarray:
+    """
+    Pad S-space array with C-space zeros.
+
+    Args:
+        array_S: S-space array.
+        n_C: C-space dimension.
+
+    Returns:
+        Concatenated array [array_S; zeros(n_C)].
+    """
+    return jnp.concatenate([array_S, jnp.zeros(n_C, dtype=array_S.dtype)])
 
 
 __all__ = ["compute_energy", "compute_local_energy", "compute_energy_and_gradient"]

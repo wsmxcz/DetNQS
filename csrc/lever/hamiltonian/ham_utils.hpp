@@ -1,18 +1,19 @@
-// Copyright 2025 The LEVER Authors
+// Copyright 2025 The LEVER Authors - All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file ham_utils.hpp
- * @brief Sparse matrix structures and utilities for Hamiltonian assembly.
+ * @brief Sparse matrix utilities (COO/CSC/CSR) for Hamiltonian assembly.
  *
- * Provides COO/CSC formats with conversion and manipulation routines.
- * Used across Hamiltonian construction and Python interface modules.
+ * Provides coordinate (COO), compressed sparse column (CSC), and compressed
+ * sparse row (CSR) formats with conversion, merge, and arithmetic operations.
  *
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
  * Date: November, 2025
  */
 
 #pragma once
+
 #include <lever/determinant/det_space.hpp>
 #include <cstdint>
 #include <span>
@@ -26,29 +27,29 @@ using u32 = std::uint32_t;
 // Numerical Thresholds
 // ============================================================================
 
-/** Drop matrix elements with |H_ij| ≤ threshold */
+/** Matrix element pruning: drop |H_ij| ≤ MAT_ELEMENT_THRESH */
 inline constexpr double MAT_ELEMENT_THRESH = 1e-15;
 
 /** Heat-bath integral screening cutoff */
 inline constexpr double HEATBATH_THRESH = 1e-15;
 
-/** Skip outer product contributions with |value| < threshold */
-inline constexpr double MICRO_CONTRIB_THRESH = 1e-18;
+/** Micro contribution filter: skip terms with negligible impact */
+inline constexpr double MICRO_CONTRIB_THRESH = 1e-12;
 
 // ============================================================================
 // Sparse Matrix Formats
 // ============================================================================
 
 /**
- * Coordinate (COO) sparse matrix: triplet (row, col, val) storage.
- * May contain unsorted entries and duplicates before consolidation.
+ * Coordinate (COO) format: unsorted triplets (row, col, val).
+ * May contain duplicates; use sort_and_merge_coo() to canonicalize.
  */
 struct COOMatrix {
     std::vector<u32>    rows;
     std::vector<u32>    cols;
     std::vector<double> vals;
-    u32 n_rows = 0;  // Row dimension metadata
-    u32 n_cols = 0;  // Column dimension metadata
+    u32 n_rows = 0;
+    u32 n_cols = 0;
 
     [[nodiscard]] size_t nnz() const noexcept { return vals.size(); }
     [[nodiscard]] bool empty() const noexcept { return vals.empty(); }
@@ -73,26 +74,25 @@ struct COOMatrix {
 };
 
 /**
- * Compressed Sparse Column (CSC) format: column-wise compressed storage.
- * Each column stores sorted, unique row indices with corresponding values.
+ * Compressed Sparse Column (CSC): column-major storage.
+ * Each column has sorted, unique row indices.
  */
 struct CSCMatrix {
-    std::vector<u32>    row_indices;  // Concatenated row indices
-    std::vector<double> values;       // Corresponding matrix values
-    std::vector<size_t> col_ptrs;     // Column pointers: size = n_cols + 1
+    std::vector<u32>    row_indices;  ///< Concatenated row IDs
+    std::vector<double> values;       ///< Corresponding values
+    std::vector<size_t> col_ptrs;     ///< Column pointers (size = n_cols + 1)
     u32 n_rows = 0;
     u32 n_cols = 0;
 
-    /** Column slice: lightweight view into row indices and values */
     struct ColView {
         std::span<const u32>    rows;
         std::span<const double> vals;
     };
 
-    /** Access column j as a view: O(1) operation */
+    /** Access j-th column as read-only view */
     [[nodiscard]] ColView col(u32 j) const noexcept {
         const size_t start = col_ptrs[j];
-        const size_t end   = col_ptrs[j + 1];
+        const size_t end = col_ptrs[j + 1];
         return {
             {row_indices.data() + start, end - start},
             {values.data() + start, end - start}
@@ -101,11 +101,39 @@ struct CSCMatrix {
 };
 
 /**
- * Hamiltonian assembly result: separated S and C space blocks.
- * 
- * H_SS: ⟨S|H|S⟩ block (S-space interactions)
- * H_SC: ⟨S|H|C⟩ block (S-C coupling)
- * map_C: Determinant indexing for C-space
+ * Compressed Sparse Row (CSR): row-major storage.
+ * Each row has sorted, unique column indices.
+ */
+struct CSRMatrix {
+    std::vector<size_t> row_ptrs;     ///< Row pointers (size = n_rows + 1)
+    std::vector<u32>    col_indices;  ///< Concatenated column IDs
+    std::vector<double> values;       ///< Corresponding values
+    u32 n_rows = 0;
+    u32 n_cols = 0;
+
+    struct RowView {
+        std::span<const u32>    cols;
+        std::span<const double> vals;
+    };
+
+    /** Access i-th row as read-only view */
+    [[nodiscard]] RowView row(u32 i) const noexcept {
+        const size_t start = row_ptrs[i];
+        const size_t end = row_ptrs[i + 1];
+        return {
+            {col_indices.data() + start, end - start},
+            {values.data() + start, end - start}
+        };
+    }
+};
+
+/**
+ * Hamiltonian block decomposition: H = [H_SS  H_SC]
+ *                                       [H_CS  H_CC]
+ *
+ * H_SS: S-space internal interactions ⟨S|H|S⟩
+ * H_SC: S-C space coupling ⟨S|H|C⟩
+ * map_C: C-space determinant indexing
  */
 struct HamBlocks {
     COOMatrix H_SS;
@@ -118,22 +146,24 @@ struct HamBlocks {
 // ============================================================================
 
 /**
- * Sort COO matrix by (row, col) and merge duplicate entries.
- * Algorithm: lexicographic sort → accumulate duplicates → drop zeros.
+ * Canonicalize COO matrix: sort by (row, col), merge duplicates, drop zeros.
  *
- * @param coo Matrix modified in-place
- * @return max|value| after merge
+ * Algorithm: Indirect sort via index permutation, then single-pass merge.
+ *
+ * @param coo  Input/output matrix
+ * @return     Maximum absolute value: max_ij |H_ij|
  */
 [[nodiscard]] double sort_and_merge_coo(COOMatrix& coo);
 
 /**
- * Add two sorted COO matrices: C = A + B.
- * Algorithm: two-pointer merge with duplicate accumulation.
+ * Matrix addition C = A + B for sorted COO matrices.
  *
- * @param A First sorted matrix
- * @param B Second sorted matrix
- * @param thresh Drop entries with |val| ≤ thresh
- * @return Merged matrix C
+ * Algorithm: Two-pointer merge (O(nnz_A + nnz_B) time).
+ *
+ * @param A      First matrix (sorted)
+ * @param B      Second matrix (sorted)
+ * @param thresh Drop elements with |val| ≤ thresh
+ * @return       Sum matrix (sorted, unique entries)
  */
 [[nodiscard]] COOMatrix coo_add(
     const COOMatrix& A,
@@ -142,16 +172,20 @@ struct HamBlocks {
 );
 
 /**
- * Mirror upper triangle to full symmetric matrix.
- * Algorithm: duplicate off-diagonal (i,j) as (j,i) for i < j.
+ * Mirror upper triangle to symmetric full matrix.
  *
- * @param upper Upper triangular input
- * @return Full symmetric matrix (unsorted)
+ * For each (i,j) with i < j, adds (j,i). Unsorted output.
+ *
+ * @param upper  Upper triangular matrix
+ * @return       Full symmetric matrix (unsorted)
  */
 [[nodiscard]] COOMatrix mirror_upper_to_full(const COOMatrix& upper);
 
 /**
- * Infer row dimension from maximum row index.
+ * Infer row dimension from data: n_rows = max(rows) + 1.
+ *
+ * @param coo  Input matrix
+ * @return     Inferred number of rows
  */
 [[nodiscard]] u32 infer_n_rows(const COOMatrix& coo) noexcept;
 
@@ -160,18 +194,60 @@ struct HamBlocks {
 // ============================================================================
 
 /**
- * Convert COO to CSC format with column-wise sorting and deduplication.
- * Algorithm: bucket by column → sort rows within each column → merge duplicates.
+ * Convert COO to CSC format.
  *
- * @param coo Input COO matrix
- * @param n_rows Target row dimension
- * @param n_cols Target column dimension
- * @return CSC matrix with sorted, unique entries per column
+ * Algorithm: Bucket sort by column, then per-column merge of duplicates.
+ *
+ * @param coo     Input COO matrix
+ * @param n_rows  Number of rows
+ * @param n_cols  Number of columns
+ * @return        CSC matrix with sorted, unique row indices per column
  */
 [[nodiscard]] CSCMatrix coo_to_csc(
     const COOMatrix& coo,
     u32 n_rows,
     u32 n_cols
+);
+
+/**
+ * Convert COO to CSR format.
+ *
+ * Algorithm: Bucket sort by row, then per-row merge of duplicates.
+ *
+ * @param coo     Input COO matrix
+ * @param n_rows  Number of rows
+ * @param n_cols  Number of columns
+ * @return        CSR matrix with sorted, unique column indices per row
+ */
+[[nodiscard]] CSRMatrix coo_to_csr(
+    const COOMatrix& coo,
+    u32 n_rows,
+    u32 n_cols
+);
+
+/**
+ * Convert CSR to COO format (preserves row-major order).
+ *
+ * @param csr  Input CSR matrix
+ * @return     COO matrix with entries in row-major order
+ */
+[[nodiscard]] COOMatrix csr_to_coo(const CSRMatrix& csr);
+
+/**
+ * CSR matrix addition: C = A + B (same shape).
+ *
+ * Algorithm: Row-wise two-pointer merge with two-pass (count + write).
+ *
+ * @param A      First matrix
+ * @param B      Second matrix
+ * @param thresh Drop elements with |val| ≤ thresh
+ * @return       Sum matrix in CSR format
+ * @throws       std::invalid_argument if shapes mismatch
+ */
+[[nodiscard]] CSRMatrix csr_add(
+    const CSRMatrix& A,
+    const CSRMatrix& B,
+    double thresh = 0.0
 );
 
 } // namespace lever

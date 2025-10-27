@@ -3,10 +3,10 @@
 
 /**
  * @file ham_eff.cpp
- * @brief Effective Hamiltonian assembly implementation.
+ * @brief Gustavson-style SpGEMM for effective Hamiltonian.
  *
- * Algorithm: Column-wise sparse outer products
- * H_eff = H_SS + H_SC·D⁻¹·H_CS where D_jj = E_ref - H_CC[j,j]
+ * Computes H_add = H_SC·D⁻¹·H_CS via CSR(H_SC) × CSC(H_SC) to avoid
+ * outer-product temporary storage. Final result: H_eff = H_SS + H_add.
  *
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
  * Date: November, 2025
@@ -18,92 +18,37 @@
 #include <stdexcept>
 
 #ifdef _OPENMP
-#include <omp.h>
+  #include <omp.h>
 #endif
 
 namespace lever {
 
 namespace {
 
-// ============================================================================
-// Diagonal inverse computation
-// ============================================================================
-
 /**
- * Compute regularized D_jj⁻¹ with specified strategy.
- *
- * LinearShift: d_inv = 1/(d + ε·sign(d))
- * Sigma:       d_inv = d/(d² + ε²)
+ * Compute regularized inverse D⁻¹ for denominators d = E_ref - H_CC[j,j].
  */
-[[nodiscard]] std::vector<double> compute_diagonal_inverse(
+[[nodiscard]] std::vector<double> compute_dinv(
     std::span<const double> h_cc_diag,
     double e_ref,
-    double epsilon,
-    Regularization reg_type
+    double eps,
+    Regularization reg
 ) {
-    const size_t n_c = h_cc_diag.size();
-    std::vector<double> d_inv(n_c);
-
-    for (size_t j = 0; j < n_c; ++j) {
+    const size_t n = h_cc_diag.size();
+    std::vector<double> dinv(n);
+    
+    for (size_t j = 0; j < n; ++j) {
         const double d = e_ref - h_cc_diag[j];
-
-        switch (reg_type) {
+        switch (reg) {
         case Regularization::LinearShift:
-            d_inv[j] = 1.0 / (d + std::copysign(epsilon, d));
+            dinv[j] = 1.0 / (d + std::copysign(eps, d));
             break;
-
         case Regularization::Sigma:
-            d_inv[j] = d / (d * d + epsilon * epsilon);
+            dinv[j] = d / (d * d + eps * eps);
             break;
         }
     }
-
-    return d_inv;
-}
-
-/**
- * Add scaled outer product: ΔH += scale·b_j⊗b_jᵀ.
- *
- * Screens contributions at column and entry levels using MICRO_CONTRIB_THRESH.
- * Optionally builds upper triangle only for symmetric matrices.
- */
-inline void add_scaled_outer_product(
-    CSCMatrix::ColView col_view,
-    double scale,
-    bool upper_only,
-    COOMatrix& out_coo
-) {
-    const size_t len = col_view.rows.size();
-    if (len == 0) return;
-
-    // Column-level screening: |scale|·‖b_j‖² < threshold
-    double col_norm_sq = 0.0;
-    for (double v : col_view.vals) {
-        col_norm_sq += v * v;
-    }
-    if (std::abs(scale) * col_norm_sq < MICRO_CONTRIB_THRESH) {
-        return;
-    }
-
-    // Reserve capacity for outer product entries
-    const size_t reserve_size = upper_only ? (len * (len + 1)) / 2 : len * len;
-    out_coo.reserve(out_coo.nnz() + reserve_size);
-
-    // Generate outer product: (b_j)_i · (b_j)_k for all (i,k) pairs
-    for (size_t p = 0; p < len; ++p) {
-        const u32 i = col_view.rows[p];
-        const double v_i = col_view.vals[p];
-
-        const size_t q_start = upper_only ? p : 0;
-        for (size_t q = q_start; q < len; ++q) {
-            const u32 k = col_view.rows[q];
-            const double contrib = scale * v_i * col_view.vals[q];
-
-            if (std::abs(contrib) > MICRO_CONTRIB_THRESH) {
-                out_coo.push_back(i, k, contrib);
-            }
-        }
-    }
+    return dinv;
 }
 
 } // anonymous namespace
@@ -113,92 +58,174 @@ inline void add_scaled_outer_product(
 // ============================================================================
 
 COOMatrix get_ham_eff(
-    const COOMatrix& H_SS,
-    const COOMatrix& H_SC,
+    const COOMatrix& H_SS_in,
+    const COOMatrix& H_SC_in,
     std::span<const double> h_cc_diag,
     double e_ref,
-    const HeffConfig& config
+    const HeffConfig& cfg
 ) {
+    // Edge case: empty C-space
     const size_t n_c = h_cc_diag.size();
-
-    // Edge case: no C-space → H_eff = H_SS
     if (n_c == 0) {
-        return H_SS;
+        COOMatrix H = H_SS_in;
+        (void)sort_and_merge_coo(H);
+        return H;
     }
 
-    // Validate input dimensions
-    if (H_SC.n_cols != static_cast<u32>(n_c)) {
-        throw std::invalid_argument(
-            "get_ham_eff: H_SC column count mismatch with h_cc_diag size"
-        );
+    // Validate dimensions
+    if (H_SC_in.n_cols != static_cast<u32>(n_c)) {
+        throw std::invalid_argument("H_SC columns != h_cc_diag size");
+    }
+    const u32 n_s = H_SS_in.n_rows ? H_SS_in.n_rows : H_SC_in.n_rows;
+    if (H_SC_in.n_rows != n_s) {
+        throw std::invalid_argument("H_SC rows != H_SS rows");
     }
 
-    const u32 n_s = H_SS.n_rows;
+    // Convert to CSR/CSC (includes dedup & sort)
+    CSRMatrix SC_csr = coo_to_csr(H_SC_in, n_s, static_cast<u32>(n_c));
+    CSCMatrix SC_csc = coo_to_csc(H_SC_in, n_s, static_cast<u32>(n_c));
 
-    // Convert to CSC for efficient column access
-    CSCMatrix h_sc_csc = coo_to_csc(H_SC, n_s, static_cast<u32>(n_c));
+    // Precompute D⁻¹ with regularization
+    std::vector<double> dinv = compute_dinv(h_cc_diag, e_ref, cfg.epsilon, cfg.reg_type);
 
-    // Compute D_jj⁻¹ for all C-space determinants
-    auto d_inv = compute_diagonal_inverse(
-        h_cc_diag, e_ref, config.epsilon, config.reg_type
-    );
+    // Column screening: skip if |D⁻¹_j|·||col_j||² < threshold
+    std::vector<double> col_norm2(n_c, 0.0);
+    for (u32 j = 0; j < SC_csc.n_cols; ++j) {
+        auto col = SC_csc.col(j);
+        double s = 0.0;
+        for (double v : col.vals) s += v * v;
+        col_norm2[j] = s;
+    }
+    std::vector<uint8_t> skip(n_c, 0);
+    for (size_t j = 0; j < n_c; ++j) {
+        if (std::abs(dinv[j]) * col_norm2[j] < MICRO_CONTRIB_THRESH) {
+            skip[j] = 1;
+        }
+    }
 
-    // Parallel accumulation: ΔH = Σ_j D_jj⁻¹·b_j⊗b_jᵀ
-    int n_threads = 1;
-#ifdef _OPENMP
-    n_threads = omp_get_max_threads();
-#endif
-
-    std::vector<COOMatrix> thread_coo(n_threads);
+    // ========================================================================
+    // Phase 1: SYMBOLIC - Determine sparsity pattern
+    // ========================================================================
+    std::vector<size_t> row_nnz(n_s, 0);
+    std::vector<std::vector<u32>> row_cols(n_s);
 
 #pragma omp parallel for schedule(guided)
-    for (std::ptrdiff_t j_idx = 0; j_idx < static_cast<std::ptrdiff_t>(n_c); ++j_idx) {
-        const u32 j = static_cast<u32>(j_idx);
+    for (std::ptrdiff_t ii = 0; ii < static_cast<std::ptrdiff_t>(n_s); ++ii) {
+        const u32 i = static_cast<u32>(ii);
+        auto r = SC_csr.row(i);
 
-#ifdef _OPENMP
-        const int tid = omp_get_thread_num();
-#else
-        const int tid = 0;
-#endif
+        // Sparse accumulator (SPA) with stamp-based marking
+        std::vector<int> mark(n_s, -1);
+        std::vector<u32> cols;
+        cols.reserve(128);
 
-        add_scaled_outer_product(
-            h_sc_csc.col(j),
-            d_inv[j],
-            config.upper_only,
-            thread_coo[tid]
-        );
-    }
+        for (size_t p = 0; p < r.cols.size(); ++p) {
+            const u32 k = r.cols[p];
+            if (skip[k]) continue;
 
-    // Merge thread-local contributions
-    COOMatrix delta_h;
-    {
-        size_t total_nnz = 0;
-        for (const auto& local : thread_coo) {
-            total_nnz += local.nnz();
+            auto colk = SC_csc.col(k);
+            for (size_t q = 0; q < colk.rows.size(); ++q) {
+                const u32 j = colk.rows[q];
+                if (mark[j] != static_cast<int>(i)) {
+                    mark[j] = static_cast<int>(i);
+                    cols.push_back(j);
+                }
+            }
         }
-        delta_h.reserve(total_nnz);
-
-        for (auto& local : thread_coo) {
-            delta_h.rows.insert(delta_h.rows.end(), local.rows.begin(), local.rows.end());
-            delta_h.cols.insert(delta_h.cols.end(), local.cols.begin(), local.cols.end());
-            delta_h.vals.insert(delta_h.vals.end(), local.vals.begin(), local.vals.end());
+        
+        if (!cols.empty()) {
+            std::sort(cols.begin(), cols.end());
         }
+        row_nnz[i] = cols.size();
+        row_cols[i] = std::move(cols);
     }
 
-    delta_h.n_rows = delta_h.n_cols = n_s;
+    // Build CSR structure for H_add
+    CSRMatrix ADD;
+    ADD.n_rows = n_s;
+    ADD.n_cols = n_s;
+    ADD.row_ptrs.resize(n_s + 1);
+    
+    size_t total_nnz = 0;
+    for (u32 i = 0; i < n_s; ++i) {
+        ADD.row_ptrs[i] = total_nnz;
+        total_nnz += row_nnz[i];
+    }
+    ADD.row_ptrs[n_s] = total_nnz;
+    
+    ADD.col_indices.resize(total_nnz);
+    ADD.values.assign(total_nnz, 0.0);
 
-    // Complete symmetric matrix if upper triangle only
-    if (config.upper_only) {
-        delta_h = mirror_upper_to_full(delta_h);
+    // Copy patterns into col_indices
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t ii = 0; ii < static_cast<std::ptrdiff_t>(n_s); ++ii) {
+        const u32 i = static_cast<u32>(ii);
+        const size_t s = ADD.row_ptrs[i];
+        std::copy(row_cols[i].begin(), row_cols[i].end(), 
+                  ADD.col_indices.begin() + static_cast<std::ptrdiff_t>(s));
     }
 
-    sort_and_merge_coo(delta_h);
+    // ========================================================================
+    // Phase 2: NUMERIC - Accumulate values
+    // ========================================================================
+#pragma omp parallel for schedule(guided)
+    for (std::ptrdiff_t ii = 0; ii < static_cast<std::ptrdiff_t>(n_s); ++ii) {
+        const u32 i = static_cast<u32>(ii);
+        const size_t row_start = ADD.row_ptrs[i];
+        const size_t row_end   = ADD.row_ptrs[i + 1];
+        const size_t row_len   = row_end - row_start;
 
-    // Final assembly: H_eff = H_SS + ΔH
-    COOMatrix h_eff = coo_add(H_SS, delta_h, MAT_ELEMENT_THRESH);
-    h_eff.n_rows = h_eff.n_cols = n_s;
+        if (row_len == 0) continue;
 
-    return h_eff;
+        // Build position map for this row
+        std::vector<int> pos(n_s, -1);
+        std::vector<u32> touched;
+        touched.reserve(row_len);
+
+        for (size_t t = 0; t < row_len; ++t) {
+            const u32 j = ADD.col_indices[row_start + t];
+            pos[j] = static_cast<int>(row_start + t);
+            touched.push_back(j);
+        }
+
+        // Accumulate: H_add[i,j] += Σ_k H_SC[i,k]·D⁻¹[k]·H_SC[j,k]
+        auto r = SC_csr.row(i);
+        for (size_t p = 0; p < r.cols.size(); ++p) {
+            const u32 k = r.cols[p];
+            if (skip[k]) continue;
+
+            const double a = r.vals[p];     // H_SC(i,k)
+            if (a == 0.0) continue;
+
+            const double s = dinv[k];       // D⁻¹(k,k)
+            if (s == 0.0) continue;
+
+            const double as = a * s;
+            auto colk = SC_csc.col(k);
+            for (size_t q = 0; q < colk.rows.size(); ++q) {
+                const u32 j = colk.rows[q];
+                const double b = colk.vals[q];  // H_SC(j,k)
+                const int at = pos[j];
+                if (at >= 0) {
+                    ADD.values[static_cast<size_t>(at)] += as * b;
+                }
+            }
+        }
+
+        // Reset position map
+        for (u32 j : touched) pos[j] = -1;
+    }
+
+    // ========================================================================
+    // Finalize: H_eff = H_SS + H_add
+    // ========================================================================
+    CSRMatrix SS = coo_to_csr(H_SS_in, n_s, n_s);
+    CSRMatrix EFF = csr_add(SS, ADD, MAT_ELEMENT_THRESH);
+
+    COOMatrix H_eff = csr_to_coo(EFF);
+    H_eff.n_rows = n_s;
+    H_eff.n_cols = n_s;
+    return H_eff;
 }
 
 } // namespace lever

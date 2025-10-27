@@ -169,6 +169,50 @@ def geom_c2h6(cc: float = 1.536, ang: float = 0) -> list:
     return _round([("C", c1), ("C", c2_rot), ("H", h3), ("H", h4), ("H", h5),
                    ("H", h6_rot), ("H", h7_rot), ("H", h8_rot)])
 
+def geom_c3h8() -> list:
+    """Propane (C₃H₈) geometry."""
+    geom = [
+        ('C', ( 0.0000,  0.0000,  0.5862)),
+        ('C', ( 0.0000,  1.2745, -0.2600)),
+        ('C', ( 0.0000, -1.2745, -0.2600)),
+        ('H', ( 0.8717,  0.0000,  1.2403)),
+        ('H', (-0.8717,  0.0000,  1.2403)),
+        ('H', ( 0.0000,  2.1655,  0.3650)),
+        ('H', ( 0.0000, -2.1655,  0.3650)),
+        ('H', ( 0.8788,  1.3196, -0.9019)),
+        ('H', (-0.8788,  1.3196, -0.9019)),
+        ('H', (-0.8788, -1.3196, -0.9019)),
+        ('H', ( 0.8788, -1.3196, -0.9019)),
+    ]
+    return _round(geom)
+
+def geom_c2h4o() -> list:
+    """Ethylene oxide (C₂H₄O) geometry."""
+    geom = [
+        ('O', ( 1.1820,  0.4045,  0.0000)),
+        ('C', ( 0.0000,  0.4638,  0.0000)),
+        ('C', (-0.9152, -0.7335,  0.0000)),
+        ('H', (-0.5066,  1.4396,  0.0000)),
+        ('H', (-0.3360, -1.6503,  0.0000)),
+        ('H', (-1.5609, -0.7034,  0.8767)),
+        ('H', (-1.5609, -0.7034, -0.8767)),
+    ]
+    return _round(geom)
+
+
+def geom_c2h4o2() -> list:
+    """1,2-Dioxetane (C₂H₄O₂) geometry."""
+    geom = [
+        ('C', (-0.9702,  0.0000,  0.0000)),
+        ('C', ( 0.9702,  0.0000,  0.0000)),
+        ('O', ( 0.0000,  1.0129,  0.0000)),
+        ('O', ( 0.0000, -1.0129,  0.0000)),
+        ('H', (-1.5867,  0.0000,  0.8958)),
+        ('H', ( 1.5867,  0.0000,  0.8958)),
+        ('H', (-1.5867,  0.0000, -0.8958)),
+        ('H', ( 1.5867,  0.0000, -0.8958)),
+    ]
+    return _round(geom)
 
 # ============================================================================
 # Natural Orbital Transforms
@@ -567,6 +611,12 @@ def main():
         "ethylene": lambda: geom_c2h4(args.cc_dist or 1.339, args.cc_angle),
         "c2h6": lambda: geom_c2h6(args.cc_dist or 1.536, args.cc_angle),
         "ethane": lambda: geom_c2h6(args.cc_dist or 1.536, args.cc_angle),
+        "c3h8": lambda: geom_c3h8(),
+        "propane": lambda: geom_c3h8(),
+        "c2h4o": lambda: geom_c2h4o(),
+        "ethylene_oxide": lambda: geom_c2h4o(),
+        "c2h4o2": lambda: geom_c2h4o2(),
+        "dioxetane": lambda: geom_c2h4o2(),
     }
 
     if mol not in geom_map:

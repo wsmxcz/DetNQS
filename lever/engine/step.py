@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-JIT-compiled VMC optimization step kernels.
+JIT-compiled VMC optimization step kernels with unified mode abstraction.
 
-Assembles pure JAX step functions from closures (logpsi, spmv)
-for efficient lax.scan execution in variational Monte Carlo.
+Provides ModeKernel factory for ASYMMETRIC, PROXY, and EFFECTIVE modes.
+Each mode implements energy E = ⟨ψ|H|ψ⟩/⟨ψ|ψ⟩ with mode-specific Hamiltonian
+and variance-reduced gradient ∇E via VJP with weighted cotangent vectors.
 
 File: lever/engine/step.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -20,157 +21,262 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .utils import GradResult, InnerState, StepResult
+from ..dtypes import GradResult, InnerState
+from ..config import ComputeMode
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from .utils import OuterCtx, PyTree
+    from ..dtypes import OuterCtx, PyTree
 
 
 # ============================================================================
-# Energy & Gradient Computation
+# Mode Kernel Factory
 # ============================================================================
 
-def _compute_energy_grad_eff(
-    ctx: OuterCtx,
-    params: PyTree,
-    eps: float
-) -> GradResult:
-    """
-    EFFECTIVE mode: Energy E = ⟨ψ_S|H_eff|ψ_S⟩ / ||ψ_S||².
+class ModeKernel:
+    """Factory for mode-specific energy/gradient kernels."""
     
-    Variance-reduced gradient via VJP with cotangent:
-        ∂E/∂θ = 2·Re[⟨(E_loc - E)·ψ_S | ∂ψ_S/∂θ⟩]
-    where E_loc[i] = (H_eff·ψ_S)[i]/ψ_S[i].
-    
-    Args:
-        ctx: Outer context with logpsi_fn, spmv_fn, space metadata
-        params: Neural network parameters
-        eps: Numerical stability threshold
+    @staticmethod
+    def make(ctx: OuterCtx, num_eps: float) -> Callable[[PyTree], GradResult]:
+        """
+        Create mode-specific kernel via Enum dispatch.
         
-    Returns:
-        GradResult with variance-reduced gradient and energy
+        Args:
+            ctx: Outer context with logpsi_fn, spmv_fn, mode specification
+            num_eps: Numerical stability threshold for division
+            
+        Returns:
+            Energy/gradient function: params → (grad, energy)
+        """
+        mode = ctx.mode
+        
+        if mode is ComputeMode.ASYMMETRIC:
+            return _make_asym_kernel(ctx, num_eps)
+        elif mode is ComputeMode.PROXY:
+            return _make_proxy_kernel(ctx, num_eps)
+        elif mode is ComputeMode.EFFECTIVE:
+            return _make_eff_kernel(ctx, num_eps)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+
+# ============================================================================
+# ASYMMETRIC Mode: Non-variational S-norm
+# ============================================================================
+
+def _make_asym_kernel(ctx: OuterCtx, num_eps: float) -> Callable:
+    """
+    ASYMMETRIC mode: E = ⟨ψ_S|H|ψ⟩ / ||ψ_S||² (non-Hermitian numerator).
+    
+    Algorithm:
+      1. Forward: log(ψ) → ψ = exp(log(ψ)) for S ∪ C
+      2. SpMV: N = H_SS·ψ_S + H_SC·ψ_C
+      3. Energy: E = ⟨ψ_S|N⟩ / ||ψ_S||²
+      4. Local energy: E_loc[i] = N[i]/ψ_S[i]
+      5. Cotangent: c_S = w_S·(E_loc - E), c_C = 0 (blocks C-space backprop)
+      6. Backward: VJP with conj(c) → ∇E
+      
+    S-space optimization only; C amplitudes propagate but don't train.
+    """
+    n_s, n_c = ctx.space.n_s, ctx.space.n_c
+    logpsi_fn = ctx.logpsi_fn
+    spmv_fn = ctx.spmv_fn
+    e_nuc = ctx.e_nuc
+    
+    def energy_grad_fn(params: PyTree) -> GradResult:
+        # Forward VJP: params → log(ψ)
+        log_all, vjp_fn = jax.vjp(logpsi_fn, params)
+        psi_all = jnp.exp(log_all)
+        psi_s, psi_c = psi_all[:n_s], psi_all[n_s:]
+        
+        # SpMV: N = H·ψ in S-space
+        N = spmv_fn(psi_s, psi_c)
+        
+        # Energy: E = ⟨ψ_S|H·ψ⟩ / ||ψ_S||²
+        num = jnp.vdot(psi_s, N.n_ss + N.n_sc)
+        denom = jnp.vdot(psi_s, psi_s)
+        energy = (num / jnp.maximum(denom, num_eps)).real
+        
+        # Local energy: E_loc = (H·ψ)/ψ_S
+        e_loc_s = jnp.where(
+            jnp.abs(psi_s) >= num_eps,
+            (N.n_ss + N.n_sc) / psi_s,
+            0.0
+        )
+        
+        # Variance-reduced cotangent (S-only, zero C to block gradients)
+        weights_s = jnp.exp(2.0 * jnp.real(log_all[:n_s]))
+        weights_s /= jnp.maximum(jnp.sum(weights_s), num_eps)
+        cot_s = weights_s * (e_loc_s - energy)
+        cot_c = jnp.zeros(n_c, dtype=cot_s.dtype)
+        cot_full = jnp.concatenate([cot_s, cot_c])
+        cot_full = jnp.asarray(cot_full, dtype=log_all.dtype)
+        
+        # Backward VJP: c → ∇E
+        (grad_conj,) = vjp_fn(jnp.conj(cot_full))
+        grad = jax.tree.map(jnp.conj, grad_conj)
+        
+        return GradResult(grad=grad, energy=energy + e_nuc)
+    
+    return energy_grad_fn
+
+
+# ============================================================================
+# PROXY Mode: Variational Hermitian surrogate
+# ============================================================================
+
+def _make_proxy_kernel(ctx: OuterCtx, num_eps: float) -> Callable:
+    """
+    PROXY mode: E = ⟨ψ|H̃|ψ⟩ / ||ψ||² (Hermitian, full-space).
+    
+    Algorithm:
+      1. Surrogate H̃ = [H_SS, H_SC; H_CS, diag(H_CC)]
+      2. Full-space SpMV for S ∪ C
+      3. Energy: E = [⟨ψ_S|H_S⟩ + ⟨ψ_C|H_C⟩] / ||ψ||²
+      4. Cotangent: c = w·(E_loc - E) for both S and C
+      5. VJP: c → ∇E with full-space optimization
+      
+    Standard Rayleigh quotient gradient descent.
     """
     n_s = ctx.space.n_s
+    logpsi_fn = ctx.logpsi_fn
+    spmv_fn = ctx.spmv_fn
+    e_nuc = ctx.e_nuc
     
-    # Forward VJP: params → log(ψ)
-    log_all, vjp_fn = jax.vjp(ctx.logpsi_fn, params)
-    psi_all = jnp.exp(log_all)
-    psi_s = psi_all[:n_s]
-    
-    # SpMV: N = H_eff @ ψ_S
-    N = ctx.spmv_fn(psi_s)
-    
-    # Energy: E = ⟨ψ_S|N⟩ / ||ψ_S||²
-    num = jnp.vdot(psi_s, N.n_ss)
-    denom = jnp.vdot(psi_s, psi_s)
-    energy = (num / jnp.maximum(denom, eps)).real
-    
-    # Local energy: E_loc = N / ψ_S (element-wise)
-    e_loc = jnp.where(jnp.abs(psi_s) >= eps, N.n_ss / psi_s, 0.0)
-    
-    # Variance-reduced cotangent: w·(E_loc - E) with w = |ψ_S|²/Σ|ψ_S|²
-    weights = jnp.exp(2.0 * jnp.real(log_all[:n_s]))
-    weights /= jnp.maximum(jnp.sum(weights), eps)
-    cot_s = weights * (e_loc - energy)
-    
-    # Zero-pad C-space (features present but unused in optimization)
-    n_c = ctx.feat_c.shape[0]
-    cot_full = jnp.concatenate([cot_s, jnp.zeros(n_c, dtype=cot_s.dtype)])
-    
-    # Backward VJP: cotangent → gradient
-    (grad_conj,) = vjp_fn(jnp.conj(cot_full))
-    grad = jax.tree.map(jnp.conj, grad_conj)
-    
-    return GradResult(grad=grad, energy=energy)
-
-
-def _compute_energy_grad_proxy(
-    ctx: OuterCtx,
-    params: PyTree,
-    eps: float
-) -> GradResult:
-    """
-    PROXY mode: Energy E = ⟨ψ|H̃|ψ⟩ / ||ψ||² over full T-space.
-    
-    Variance-reduced gradient with E_loc = (H̃·ψ)/ψ for both S- and C-spaces.
-    
-    Args:
-        ctx: Outer context
-        params: Neural network parameters
-        eps: Numerical stability threshold
+    def energy_grad_fn(params: PyTree) -> GradResult:
+        log_all, vjp_fn = jax.vjp(logpsi_fn, params)
+        psi_all = jnp.exp(log_all)
+        psi_s, psi_c = psi_all[:n_s], psi_all[n_s:]
         
-    Returns:
-        GradResult with full T-space gradient and energy
-    """
-    n_s = ctx.space.n_s
+        # Full-space SpMV
+        N = spmv_fn(psi_s, psi_c)
+        
+        # Energy: E = ⟨ψ|H̃·ψ⟩ / ||ψ||²
+        num_s = jnp.vdot(psi_s, N.n_ss + N.n_sc)
+        num_c = jnp.vdot(psi_c, N.n_cs + N.n_cc)
+        denom = jnp.vdot(psi_s, psi_s) + jnp.vdot(psi_c, psi_c)
+        energy = ((num_s + num_c) / jnp.maximum(denom, num_eps)).real
+        
+        # Local energies for S and C
+        e_loc_s = jnp.where(
+            jnp.abs(psi_s) >= num_eps,
+            (N.n_ss + N.n_sc) / psi_s,
+            0.0
+        )
+        e_loc_c = jnp.where(
+            jnp.abs(psi_c) >= num_eps,
+            (N.n_cs + N.n_cc) / psi_c,
+            0.0
+        )
+        e_loc_all = jnp.concatenate([e_loc_s, e_loc_c])
+        
+        # Full-space variance-reduced cotangent
+        weights = jnp.exp(2.0 * jnp.real(log_all))
+        weights /= jnp.maximum(jnp.sum(weights), num_eps)
+        cot_full = weights * (e_loc_all - energy)
+        cot_full = jnp.asarray(cot_full, dtype=log_all.dtype)
+        
+        # VJP: c → ∇E
+        (grad_conj,) = vjp_fn(jnp.conj(cot_full))
+        grad = jax.tree.map(jnp.conj, grad_conj)
+        
+        return GradResult(grad=grad, energy=energy + e_nuc)
     
-    # Forward VJP
-    log_all, vjp_fn = jax.vjp(ctx.logpsi_fn, params)
-    psi_all = jnp.exp(log_all)
-    psi_s, psi_c = psi_all[:n_s], psi_all[n_s:]
-    
-    # Full T-space SpMV
-    N = ctx.spmv_fn(psi_s, psi_c)
-    
-    # Energy: E = [⟨ψ_S|H_S⟩ + ⟨ψ_C|H_C⟩] / ||ψ||²
-    num_s = jnp.vdot(psi_s, N.n_ss + N.n_sc)
-    num_c = jnp.vdot(psi_c, N.n_cs + N.n_cc)
-    denom = jnp.vdot(psi_s, psi_s) + jnp.vdot(psi_c, psi_c)
-    energy = ((num_s + num_c) / jnp.maximum(denom, eps)).real
-    
-    # Local energies
-    e_loc_s = jnp.where(jnp.abs(psi_s) >= eps, (N.n_ss + N.n_sc) / psi_s, 0.0)
-    e_loc_c = jnp.where(jnp.abs(psi_c) >= eps, (N.n_cs + N.n_cc) / psi_c, 0.0)
-    e_loc_all = jnp.concatenate([e_loc_s, e_loc_c])
-    
-    # Variance-reduced cotangent
-    weights = jnp.exp(2.0 * jnp.real(log_all))
-    weights /= jnp.maximum(jnp.sum(weights), eps)
-    cot_full = weights * (e_loc_all - energy)
-    
-    # Backward VJP
-    (grad_conj,) = vjp_fn(jnp.conj(cot_full))
-    grad = jax.tree.map(jnp.conj, grad_conj)
-    
-    return GradResult(grad=grad, energy=energy)
+    return energy_grad_fn
 
 
 # ============================================================================
-# Step Kernel Factory
+# EFFECTIVE Mode: S-space downfolded Hamiltonian
+# ============================================================================
+
+def _make_eff_kernel(ctx: OuterCtx, num_eps: float) -> Callable:
+    """
+    EFFECTIVE mode: E = ⟨ψ_S|H_eff|ψ_S⟩ / ||ψ_S||².
+    
+    Algorithm:
+      1. Use S-only logpsi closure for hot path (training)
+      2. H_eff = H_SS + H_SC·D⁻¹·H_CS (C-space downfolded)
+      3. S-space SpMV: N = H_eff @ ψ_S
+      4. Energy: E = ⟨ψ_S|N⟩ / ||ψ_S||²
+      5. Cotangent: c_S = w_S·(E_loc - E), no C-space
+      6. VJP: c_S → ∇E (S-only optimization)
+      
+    C amplitudes computed separately for evolution/analysis.
+    """
+    # Extract S-only closure for optimization hot path
+    if isinstance(ctx.logpsi_fn, tuple):
+        logpsi_s_fn, _ = ctx.logpsi_fn
+    else:
+        logpsi_s_fn = ctx.logpsi_fn  # Backward compatibility
+    
+    spmv_fn = ctx.spmv_fn
+    e_nuc = ctx.e_nuc
+    
+    def energy_grad_fn(params: PyTree) -> GradResult:
+        # S-space forward VJP
+        log_s, vjp_fn = jax.vjp(logpsi_s_fn, params)
+        psi_s = jnp.exp(log_s)
+        
+        # SpMV: N = H_eff @ ψ_S
+        N = spmv_fn(psi_s)
+        
+        # Energy: E = ⟨ψ_S|H_eff|ψ_S⟩ / ||ψ_S||²
+        num = jnp.vdot(psi_s, N.n_ss)
+        denom = jnp.vdot(psi_s, psi_s)
+        energy = (num / jnp.maximum(denom, num_eps)).real
+        
+        # Local energy
+        e_loc_s = jnp.where(
+            jnp.abs(psi_s) >= num_eps,
+            N.n_ss / psi_s,
+            0.0
+        )
+        
+        # Variance-reduced cotangent (S-only)
+        weights_s = jnp.exp(2.0 * jnp.real(log_s))
+        weights_s /= jnp.maximum(jnp.sum(weights_s), num_eps)
+        cot_s = weights_s * (e_loc_s - energy)
+        cot_s = jnp.asarray(cot_s, dtype=log_s.dtype)
+        
+        # VJP: c_S → ∇E (no C-space)
+        (grad_conj,) = vjp_fn(jnp.conj(cot_s))
+        grad = jax.tree.map(jnp.conj, grad_conj)
+        
+        return GradResult(grad=grad, energy=energy + e_nuc)
+    
+    return energy_grad_fn
+
+
+# ============================================================================
+# Step Function Factories
 # ============================================================================
 
 def create_step_fn(
     ctx: OuterCtx,
     optimizer,
-    eps: float
+    num_eps: float
 ) -> Callable[[InnerState, None], tuple[InnerState, jnp.ndarray]]:
     """
-    Create mode-specific VMC step function.
-    
-    Closure captures ctx, optimizer, eps for pure JAX execution.
+    Create single VMC optimization step: gradient → parameter update.
     
     Args:
-        ctx: Outer context with mode="effective" or "proxy"
-        optimizer: Optax optimizer (e.g., AdamW)
-        eps: Numerical threshold for stability
+        ctx: Outer context with mode specification
+        optimizer: Optax optimizer (AdamW, etc.)
+        num_eps: Numerical stability threshold
         
     Returns:
-        Step function: (state, _) → (new_state, total_energy)
+        Step function: (state, _) → (new_state, energy)
     """
-    energy_grad_fn = (
-        _compute_energy_grad_eff if ctx.mode == "effective" 
-        else _compute_energy_grad_proxy
-    )
-    e_nuc = ctx.e_nuc
+    energy_grad_fn = ModeKernel.make(ctx, num_eps)
     
     def _step(state: InnerState, _unused) -> tuple[InnerState, jnp.ndarray]:
-        """Single VMC step: gradient → AdamW update."""
-        # Compute energy and variance-reduced gradient
-        result = energy_grad_fn(ctx, state.params, eps)
-        
-        # AdamW parameter update
+        """Single step: compute gradient and apply optimizer update."""
         import optax
+        
+        # Compute variance-reduced gradient
+        result = energy_grad_fn(state.params)
+        
+        # Apply optimizer update
         updates, new_opt = optimizer.update(
             result.grad, state.opt_state, state.params
         )
@@ -182,9 +288,7 @@ def create_step_fn(
             step=state.step + 1
         )
         
-        # Add nuclear repulsion to electronic energy
-        e_total = result.energy + e_nuc
-        return new_state, e_total
+        return new_state, result.energy
     
     return _step
 
@@ -192,22 +296,23 @@ def create_step_fn(
 def create_scan_fn(
     ctx: OuterCtx,
     optimizer,
-    eps: float
+    num_eps: float
 ) -> Callable[[InnerState, int], tuple[InnerState, jnp.ndarray]]:
     """
     Create JIT-compiled scan wrapper for multi-step execution.
     
-    Uses lax.scan for efficient loop unrolling.
+    Uses lax.scan for XLA loop unrolling. For CPU with callbacks,
+    single-step JIT + Python loop may outperform.
     
     Args:
         ctx: Outer context
         optimizer: Optax optimizer
-        eps: Numerical threshold
+        num_eps: Numerical threshold
         
     Returns:
         Scan function: (state, n_steps) → (final_state, energy_history)
     """
-    step_fn = create_step_fn(ctx, optimizer, eps)
+    step_fn = create_step_fn(ctx, optimizer, num_eps)
     
     def _scan_wrapper(state: InnerState, n_steps: int):
         """Execute n_steps via lax.scan with XLA compilation."""
@@ -222,4 +327,4 @@ def create_scan_fn(
     return jax.jit(_scan_wrapper, static_argnames=['n_steps'])
 
 
-__all__ = ["create_step_fn", "create_scan_fn"]
+__all__ = ["ModeKernel", "create_step_fn", "create_scan_fn"]

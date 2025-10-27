@@ -19,48 +19,47 @@ Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
-from .utils import (
+from ..dtypes import (
     # Type aliases
-    PyTree,       # JAX pytree type
-    SpMVFn,       # Sparse matrix-vector product: (ψ, params) -> H@ψ
-    LogPsiFn,     # Wavefunction evaluator: (config, params) -> log(ψ)
-  
-    # CPU sparse matrix storage
-    HamOp,        # Hamiltonian operator (CSR/COO)
-    SpaceRep,     # Hilbert space representation (S/C/T partitions)
-  
-    # Computational contexts
-    OuterCtx,     # Outer loop artifacts (immutable per cycle)
-    InnerState,   # Inner loop state (mutable parameters)
-  
+    PyTree,
+    SpMVFn,
+    LogPsiFn,
+    
+    # Data structures
+    HamOp,
+    SpaceRep,
+    PsiCache,
+    OuterCtx,
+    InnerState,
+    
     # Result containers
-    Contractions, # Hamiltonian-wavefunction products (H@ψ, ⟨H⟩, etc.)
-    StepResult,   # Single optimization step output
-    GradResult,   # Energy + gradient computation result
-  
-    # Utilities
-    masks_to_vecs,  # Bitmask -> occupancy vector converter
+    Contractions,
+    StepResult,
+    GradResult,
 )
 
+from .utils import masks_to_vecs
+
 from .evaluator import (
-    create_logpsi_fn,   # Build log(ψ) evaluator with captured features
-    create_spmv_eff,    # Build H_eff@ψ_S (EFFECTIVE mode, S-space only)
-    create_spmv_proxy,  # Build H@ψ (PROXY mode, full T-space)
+    create_logpsi_fn,
+    create_spmv_eff,
+    create_spmv_proxy,
 )
 
 from .step import (
-    create_step_fn,  # Single-step gradient descent: (state, key) -> new_state
-    create_scan_fn,  # JIT-compiled scan wrapper for multi-step iteration
+    ModeKernel,
+    create_step_fn,
+    create_scan_fn,
 )
 
 from .hamiltonian import (
-    get_ham_ss,     # H_SS: S-space block only
-    get_ham_proxy,  # H_SS + H_SC: Proxy mode with PT2 screening
-    get_ham_full,   # H_SS + H_SC + H_CC: Full subspace
-    get_ham_eff,    # H_eff = H_SS + H_SC·D⁻¹·H_CS: Schur complement
+    get_ham_ss,
+    get_ham_proxy,
+    get_ham_full,
+    get_ham_eff,
 )
 
-from . import kernels  # Numba-accelerated SpMV primitives
+from . import kernels
 
 # ============================================================================
 # Public API
@@ -68,23 +67,23 @@ from . import kernels  # Numba-accelerated SpMV primitives
 __all__ = [
     # Types
     "PyTree", "SpMVFn", "LogPsiFn",
-  
+    
     # Data structures
-    "HamOp", "SpaceRep", "OuterCtx", "InnerState",
+    "HamOp", "SpaceRep", "PsiCache", "OuterCtx", "InnerState",
     "Contractions", "StepResult", "GradResult",
-  
+    
     # Utilities
     "masks_to_vecs",
-  
+    
     # Closure factories
     "create_logpsi_fn", "create_spmv_eff", "create_spmv_proxy",
-  
+    
     # Optimization kernels
-    "create_step_fn", "create_scan_fn",
-  
+    "ModeKernel", "create_step_fn", "create_scan_fn",
+    
     # Hamiltonian builders
     "get_ham_ss", "get_ham_proxy", "get_ham_full", "get_ham_eff",
-  
+    
     # Low-level primitives
     "kernels",
 ]

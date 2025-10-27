@@ -239,9 +239,10 @@ def make_model(
     n_orbitals: Optional[int] = None,
     feature_fn_for_dummy: Optional[FeatureFn] = None,
     force_holomorphic: Optional[bool] = None,
+    precision_config: Optional[Any] = None,  # Add parameter
 ) -> WavefunctionModel:
     """
-    Create and initialize stateful wavefunction model.
+    Create and initialize stateful wavefunction model with precision control.
     
     Args:
         module: Flax Linen module
@@ -250,11 +251,22 @@ def make_model(
         n_orbitals: Number of orbitals (auto-generates dummy input)
         feature_fn_for_dummy: Optional feature function for dummy generation
         force_holomorphic: Override automatic holomorphic detection
+        precision_config: PrecisionConfig for dtype control (optional)
     
     Returns:
         Initialized model ready for stateful calls
     """
+    
     din = _infer_dummy_input(dummy_input, n_orbitals, feature_fn_for_dummy)
+    
+    # Cast dummy input to appropriate dtype
+    if precision_config is not None:
+        target_dtype = (
+            jnp.float64 if precision_config.enable_x64_device 
+            else jnp.float32
+        )
+        din = jnp.asarray(din, dtype=target_dtype)
+    
     return WavefunctionModel.create(
         module,
         jax.random.PRNGKey(int(seed)),

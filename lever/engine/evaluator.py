@@ -20,11 +20,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .utils import Contractions, LogPsiFn, SpMVFn
+from ..dtypes import Contractions, LogPsiFn, SpMVFn
+from ..config import ComputeMode, PrecisionConfig
 from . import kernels
 
 if TYPE_CHECKING:
-    from .utils import PyTree
+    from ..dtypes import PyTree
 
 
 # ============================================================================
@@ -35,50 +36,49 @@ def create_logpsi_fn(
     model_fn: Callable,
     feat_s: jnp.ndarray,
     feat_c: jnp.ndarray,
-    mode: str,
+    mode: ComputeMode,
     normalize: bool,
-    eps: float
+    eps: float,
+    device_complex: jnp.dtype
 ) -> LogPsiFn:
     """
-    Create batch log(ψ) evaluator with captured features.
+    Create batch log(ψ) evaluator with mode-specific normalization.
     
-    Applies normalization constraint:
-      - Effective: ||ψ_S||² = 1
-      - Proxy: ||ψ_S||² + ||ψ_C||² = 1
+    Normalization schemes:
+      - Effective: ‖ψ‖² = Σᵢ∈S |ψᵢ|²
+      - Proxy:     ‖ψ‖² = Σᵢ∈S |ψᵢ|² + Σⱼ∈C |ψⱼ|²
     
     Args:
-        model_fn: Neural network mapping (params, features) -> log(ψ)
-        feat_s: S-space occupancy vectors [N_S × n_orb]
-        feat_c: C-space occupancy vectors [N_C × n_orb]
-        mode: "effective" or "proxy"
-        normalize: Apply norm constraint
-        eps: Stability threshold (kept for API compatibility)
+        model_fn: Neural network forward pass
+        feat_s: S-space feature matrix [n_s, d_feat]
+        feat_c: C-space feature matrix [n_c, d_feat]
+        mode: ComputeMode.EFFECTIVE or ComputeMode.PROXY
+        normalize: Apply log-domain normalization
+        eps: Numerical stability (unused, kept for interface compatibility)
+        device_complex: Output dtype (jnp.complex64/128)
     
     Returns:
-        Closure: params -> normalized log(ψ) [N_S+N_C]
+        Pure function: params → log(ψ) [n_s + n_c]
     """
     all_feat = jnp.concatenate([feat_s, feat_c], axis=0)
     n_s = feat_s.shape[0]
-    is_effective = (mode == "effective")
+    is_effective = (mode is ComputeMode.EFFECTIVE)
     
     def _batch_logpsi(params: PyTree) -> jnp.ndarray:
-        """Evaluate log(ψ) with optional normalization."""
         log_all = model_fn(params, all_feat)
+        log_all = jnp.asarray(log_all, dtype=device_complex)
         
         if not normalize:
             return log_all
         
-        # Compute log(||ψ||²) for normalization
+        # Mode-specific norm: log(‖ψ‖²) = log(Σ |ψᵢ|²)
         if is_effective:
-            # S-space only: log(Σ|ψ_S|²)
             log_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[:n_s]))
         else:
-            # Full space: log(Σ|ψ_S|² + Σ|ψ_C|²)
-            log_s_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[:n_s]))
-            log_c_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[n_s:]))
-            log_norm_sq = jnp.logaddexp(log_s_norm_sq, log_c_norm_sq)
+            log_s = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[:n_s]))
+            log_c = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[n_s:]))
+            log_norm_sq = jnp.logaddexp(log_s, log_c)
         
-        # Apply normalization: log(ψ/||ψ||) = log(ψ) - 0.5·log(||ψ||²)
         log_norm_sq = jax.lax.stop_gradient(log_norm_sq)
         return log_all - 0.5 * log_norm_sq
     
@@ -89,80 +89,44 @@ def create_logpsi_fn(
 # SpMV Closure Factory
 # ============================================================================
 
-def _coo_matvec_cpu(
-    rows: np.ndarray,
-    cols: np.ndarray,
-    vals: np.ndarray,
-    psi: np.ndarray,
-    n_out: int
-) -> np.ndarray:
-    """
-    CPU SpMV via Numba kernel: y = A @ x (COO format).
-    
-    Ensures contiguous memory layout for optimal performance.
-    """
-    psi_c128 = np.ascontiguousarray(psi, dtype=np.complex128)
-    rows_i64 = np.ascontiguousarray(rows, dtype=np.int64)
-    cols_i64 = np.ascontiguousarray(cols, dtype=np.int64)
-    vals_f64 = np.ascontiguousarray(vals, dtype=np.float64)
-    
-    return kernels.coo_matvec(rows_i64, cols_i64, vals_f64, psi_c128, int(n_out))
-
-
-def _dual_contract_cpu(
-    rows: np.ndarray,
-    cols: np.ndarray,
-    vals: np.ndarray,
-    psi_s: np.ndarray,
-    psi_c: np.ndarray,
-    n_s: int,
-    n_c: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    CPU dual contraction for off-diagonal blocks.
-    
-    Computes simultaneously:
-      y_S = H_SC @ ψ_C  (forward)
-      y_C = H_CS @ ψ_S = (H_SC)^T @ ψ_S  (transpose)
-    """
-    psi_s_c128 = np.ascontiguousarray(psi_s, dtype=np.complex128)
-    psi_c_c128 = np.ascontiguousarray(psi_c, dtype=np.complex128)
-    rows_i64 = np.ascontiguousarray(rows, dtype=np.int64)
-    cols_i64 = np.ascontiguousarray(cols, dtype=np.int64)
-    vals_f64 = np.ascontiguousarray(vals, dtype=np.float64)
-    
-    return kernels.coo_dual_contract(
-        rows_i64, cols_i64, vals_f64,
-        psi_s_c128, psi_c_c128,
-        int(n_s), int(n_c)
-    )
-
-
 def create_spmv_eff(
     ham_eff_rows: np.ndarray,
     ham_eff_cols: np.ndarray,
     ham_eff_vals: np.ndarray,
-    n_s: int
+    n_s: int,
+    precision_config: PrecisionConfig
 ) -> SpMVFn:
     """
-    Create effective Hamiltonian SpMV operator.
+    Create effective Hamiltonian SpMV: y = H_eff @ ψ_S.
     
-    Evaluates: N_SS = H_eff @ ψ_S
-    where H_eff = H_SS + H_SC·D^(-1)·H_CS is pre-assembled.
+    Precision flow: device → host complex128 → device to minimize rounding
+    errors in pure_callback boundary crossings.
+    
+    Args:
+        ham_eff_rows/cols/vals: COO format H_eff
+        n_s: S-space dimension
+        precision_config: Device dtype configuration
     
     Returns:
-        Closure: ψ_S -> Contractions(N_SS, None, None, None)
+        Pure function: ψ_S → Contractions(n_ss=H_eff@ψ_S)
     """
-    rows, cols, vals = ham_eff_rows, ham_eff_cols, ham_eff_vals
-    shape_out = jax.ShapeDtypeStruct((n_s,), jnp.complex128)
+    # Pre-convert constants to contiguous host arrays
+    rows = np.ascontiguousarray(ham_eff_rows, dtype=np.int64)
+    cols = np.ascontiguousarray(ham_eff_cols, dtype=np.int64)
+    vals = np.ascontiguousarray(ham_eff_vals, dtype=np.float64)
+    
+    device_complex = precision_config.jax_complex
+    target_np_dtype = precision_config.numpy_complex
+    shape_out = jax.ShapeDtypeStruct((n_s,), device_complex)
+    
+    def _matvec_host(x: np.ndarray, n: int) -> np.ndarray:
+        """Host callback: SpMV with explicit dtype control."""
+        x_c128 = np.asarray(x, dtype=np.complex128)
+        y_c128 = kernels.coo_matvec(rows, cols, vals, x_c128, int(n))
+        return y_c128.astype(target_np_dtype, copy=False)
     
     def _spmv_effective(psi_s: jnp.ndarray) -> Contractions:
-        """Apply H_eff to S-space wavefunction."""
-        n_ss = jax.pure_callback(
-            _coo_matvec_cpu,
-            shape_out,
-            rows, cols, vals, psi_s, n_s
-        )
+        n_ss = jax.pure_callback(_matvec_host, shape_out, psi_s, n_s)
         return Contractions(n_ss=n_ss, n_sc=None, n_cs=None, n_cc=None)
     
     return _spmv_effective
@@ -177,47 +141,77 @@ def create_spmv_proxy(
     ham_sc_vals: np.ndarray,
     h_diag_c: np.ndarray,
     n_s: int,
-    n_c: int
+    n_c: int,
+    precision_config: PrecisionConfig
 ) -> SpMVFn:
     """
-    Create full T-space Hamiltonian SpMV operator.
+    Create full T-space SpMV with block structure:
     
-    Evaluates all four blocks:
-      N_SS = H_SS @ ψ_S
-      N_SC = H_SC @ ψ_C
-      N_CS = (H_SC)^T @ ψ_S
-      N_CC = diag(H_CC) @ ψ_C
+        ┌─────────┬─────────┐   ┌───┐   ┌────────┐   ┌────────┐
+        │  H_SS   │  H_SC   │ @ │ψ_S│ = │H_SS@ψ_S│ + │H_SC@ψ_C│
+        ├─────────┼─────────┤   ├───┤   ├────────┤   ├────────┤
+        │ H_SC^T  │  H_CC   │   │ψ_C│   │H_CS@ψ_S│   │H_CC@ψ_C│
+        └─────────┴─────────┘   └───┘   └────────┘   └────────┘
+    
+    Single callback computes all four contractions with shared data transfers.
+    
+    Args:
+        ham_ss_*/ham_sc_*: COO format blocks
+        h_diag_c: H_CC diagonal elements
+        n_s, n_c: Space dimensions
+        precision_config: Device dtype configuration
     
     Returns:
-        Closure: (ψ_S, ψ_C) -> Contractions(N_SS, N_SC, N_CS, N_CC)
+        Pure function: (ψ_S, ψ_C) → Contractions(n_ss, n_sc, n_cs, n_cc)
     """
-    rows_ss, cols_ss, vals_ss = ham_ss_rows, ham_ss_cols, ham_ss_vals
-    rows_sc, cols_sc, vals_sc = ham_sc_rows, ham_sc_cols, ham_sc_vals
-    diag_c = jnp.asarray(h_diag_c)
+    # Pre-convert constants to contiguous host arrays
+    rows_ss = np.ascontiguousarray(ham_ss_rows, dtype=np.int64)
+    cols_ss = np.ascontiguousarray(ham_ss_cols, dtype=np.int64)
+    vals_ss = np.ascontiguousarray(ham_ss_vals, dtype=np.float64)
     
-    shape_ss = jax.ShapeDtypeStruct((n_s,), jnp.complex128)
-    shape_sc = jax.ShapeDtypeStruct((n_s,), jnp.complex128)
-    shape_cs = jax.ShapeDtypeStruct((n_c,), jnp.complex128)
+    rows_sc = np.ascontiguousarray(ham_sc_rows, dtype=np.int64)
+    cols_sc = np.ascontiguousarray(ham_sc_cols, dtype=np.int64)
+    vals_sc = np.ascontiguousarray(ham_sc_vals, dtype=np.float64)
+    
+    diag_c = jnp.asarray(h_diag_c)
+    device_complex = precision_config.jax_complex
+    target_np_dtype = precision_config.numpy_complex
+    
+    shape_out = (
+        jax.ShapeDtypeStruct((n_s,), device_complex),
+        jax.ShapeDtypeStruct((n_s,), device_complex),
+        jax.ShapeDtypeStruct((n_c,), device_complex),
+    )
+    
+    def _triple_contract_host(xs, xc, ns, nc):
+        """
+        Host callback: compute three off-diagonal contractions.
+        
+        Returns: (H_SS@ψ_S, H_SC@ψ_C, H_CS@ψ_S)
+        """
+        xs_c128 = np.asarray(xs, dtype=np.complex128)
+        xc_c128 = np.asarray(xc, dtype=np.complex128)
+        
+        # H_SS @ ψ_S
+        y_ss = kernels.coo_matvec(rows_ss, cols_ss, vals_ss, xs_c128, int(ns))
+        
+        # H_SC @ ψ_C and H_CS @ ψ_S (exploits H_CS = H_SC^T symmetry)
+        y_sc, y_cs = kernels.coo_dual_contract(
+            rows_sc, cols_sc, vals_sc, xs_c128, xc_c128, int(ns), int(nc)
+        )
+        
+        # Downcast to device precision
+        return (
+            y_ss.astype(target_np_dtype, copy=False),
+            y_sc.astype(target_np_dtype, copy=False),
+            y_cs.astype(target_np_dtype, copy=False)
+        )
     
     def _spmv_proxy(psi_s: jnp.ndarray, psi_c: jnp.ndarray) -> Contractions:
-        """Apply full T-space Hamiltonian blocks."""
-        # S-space diagonal: N_SS = H_SS @ ψ_S
-        n_ss = jax.pure_callback(
-            _coo_matvec_cpu,
-            shape_ss,
-            rows_ss, cols_ss, vals_ss, psi_s, n_s
+        n_ss, n_sc, n_cs = jax.pure_callback(
+            _triple_contract_host, shape_out, psi_s, psi_c, n_s, n_c
         )
-        
-        # Off-diagonal blocks: N_SC and N_CS (computed simultaneously)
-        n_sc, n_cs = jax.pure_callback(
-            _dual_contract_cpu,
-            (shape_sc, shape_cs),
-            rows_sc, cols_sc, vals_sc, psi_s, psi_c, n_s, n_c
-        )
-        
-        # C-space diagonal: N_CC = diag(H_CC) @ ψ_C
-        n_cc = diag_c * psi_c
-        
+        n_cc = diag_c * psi_c  # H_CC is diagonal
         return Contractions(n_ss=n_ss, n_sc=n_sc, n_cs=n_cs, n_cc=n_cc)
     
     return _spmv_proxy

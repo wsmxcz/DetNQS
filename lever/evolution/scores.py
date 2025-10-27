@@ -19,34 +19,26 @@ import numpy as np
 from .base import ScoreResult
 
 if TYPE_CHECKING:
-    from ..engine import OuterCtx
-    from ..engine.utils import PyTree
+    from ..dtypes import OuterCtx, PyTree, PsiCache
 
 
 class AmpScorer:
     """Scores by wavefunction amplitude |ψ_i|."""
     
-    def score(self, ctx: OuterCtx, params: PyTree) -> ScoreResult:
+    def score(self, ctx: OuterCtx, psi_cache: PsiCache) -> ScoreResult:
         """
-        Compute amplitude-based scores.
+        Compute amplitude-based scores from cache.
         
         Args:
-            ctx: Outer context with cached features
-            params: Converged parameters
-            
+            ctx: Outer context for determinant merging
+            psi_cache: Cached wavefunction amplitudes
+        
         Returns:
             ScoreResult with |ψ| scores for S ∪ C
         """
-        # Use cached batch_logpsi (no redundant network call)
-        log_all = ctx.logpsi_fn(params)
-        psi_all = np.array(jnp.exp(log_all))
-        
-        # Merge determinant sets
+        psi_all = np.array(psi_cache.psi_all)
         dets_all = np.concatenate([ctx.space.s_dets, ctx.space.c_dets], axis=0)
-        
-        # Score = absolute amplitude
         scores = np.abs(psi_all)
-        
         return ScoreResult(scores=scores, dets=dets_all, meta={})
 
 

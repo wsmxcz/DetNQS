@@ -9,7 +9,7 @@ accumulation to avoid race conditions while maximizing throughput.
 
 File: lever/engine/kernels.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
@@ -29,26 +29,30 @@ def coo_matvec(
 ) -> np.ndarray:
     """
     Parallel sparse matrix-vector product: y = A @ x.
-    
-    Uses thread-local accumulation with reduction to avoid race conditions.
-    Work is statically distributed across threads for load balancing.
+
+    Algorithm: Thread-local accumulation with reduction:
+      y[i] = Σⱼ A[i,j] · x[j]  (parallel over non-zeros)
+
+    Complexity: O(nnz/P) per thread, P = number of threads
     
     Args:
-        rows: Row indices of nonzeros
-        cols: Column indices of nonzeros
-        vals: Nonzero values
-        x: Dense input vector
-        n_rows: Matrix row count
+        rows: Row indices (int32/int64)
+        cols: Column indices (int32/int64)
+        vals: Non-zero values (complex128)
+        x: Input vector (complex128)
+        n_rows: Output vector dimension
         
     Returns:
-        Dense output vector y
+        Result vector y (complex128)
+        
+    Note:
+        Input x must be complex128 for Numba dtype inference.
     """
     n_threads = nb.get_num_threads()
     nnz = len(vals)
     chunk_size = (nnz + n_threads - 1) // n_threads
-    
-    # Thread-local accumulation buffers
-    y_local = np.zeros((n_threads, n_rows), dtype=x.dtype)
+
+    y_local = np.zeros((n_threads, n_rows), dtype=np.complex128)
 
     for tid in prange(n_threads):
         start = tid * chunk_size
@@ -70,28 +74,33 @@ def coo_dual_contract(
     n_cols: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Dual Hamiltonian contractions: (H_SC @ psi_C, H_CS @ psi_S).
-    
-    Computes both products in one pass by exploiting Hermitian symmetry:
-    H_CS = H_SC†. Single traversal of nonzeros reduces memory traffic.
-    
+    Dual Hamiltonian contractions in S/C partitioned space.
+
+    Algorithm: Simultaneous forward/adjoint products:
+      y_S[i] = Σⱼ H_SC[i,j] · ψ_C[j]    (forward)
+      y_C[j] = Σᵢ H_SC*[i,j] · ψ_S[i]   (adjoint, exploiting Hermiticity)
+
+    Complexity: O(nnz/P) per thread, single matrix traversal
+
     Args:
-        rows: Row indices (S-space dimension)
-        cols: Column indices (C-space dimension)
-        vals: H_SC matrix elements
-        psi_S: S-space amplitudes
-        psi_C: C-space amplitudes
-        n_rows: S-space size
-        n_cols: C-space size
-        
+        rows: Row indices of H_SC (S-space)
+        cols: Column indices of H_SC (C-space)
+        vals: Non-zero values (complex128)
+        psi_S: S-space vector (complex128)
+        psi_C: C-space vector (complex128)
+        n_rows: S-space dimension
+        n_cols: C-space dimension
+
     Returns:
-        (H_SC @ psi_C, H_CS @ psi_S)
+        (y_S, y_C): Contracted vectors in S-space and C-space
+
+    Note:
+        Inputs must be complex128 for Numba dtype inference.
     """
     n_threads = nb.get_num_threads()
     nnz = len(vals)
     chunk_size = (nnz + n_threads - 1) // n_threads
 
-    # Separate buffers for S and C contractions
     s_local = np.zeros((n_threads, n_rows), dtype=np.complex128)
     c_local = np.zeros((n_threads, n_cols), dtype=np.complex128)
 
@@ -100,10 +109,8 @@ def coo_dual_contract(
         end = min(nnz, (tid + 1) * chunk_size)
         for idx in range(start, end):
             i, j, h_ij = rows[idx], cols[idx], vals[idx]
-            # Forward: H_SC @ psi_C
             s_local[tid, i] += h_ij * psi_C[j]
-            # Adjoint: H_CS @ psi_S = (H_SC†) @ psi_S
-            c_local[tid, j] += np.conjugate(h_ij) * psi_S[i]
+            c_local[tid, j] += np.conj(h_ij) * psi_S[i]
 
     return np.sum(s_local, axis=0), np.sum(c_local, axis=0)
 

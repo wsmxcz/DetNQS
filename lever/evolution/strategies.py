@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-High-level evolution strategies with OuterCtx integration.
+Evolution strategies with OuterCtx integration.
+
+Provides single-stage, two-stage, and mass-locking determinant selection
+strategies for iterative CI space evolution.
 
 File: lever/evolution/strategies.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -18,36 +21,29 @@ import numpy as np
 from .base import EvolutionStrategy, Scorer, Selector
 
 if TYPE_CHECKING:
-    from ..engine import OuterCtx
-    from ..engine.utils import PyTree
+    from ..dtypes import OuterCtx, PsiCache
 
+__all__ = ["BasicStrategy", "TwoStageStrategy", "MassLockingStrategy"]
 
-# --- Single-Stage Strategy ---
 
 class BasicStrategy(EvolutionStrategy):
-    """
-    Single-stage evolution: score → select.
-  
-    Applies one scorer to entire active space (S ∪ C), then selects new S.
-    """
+    """Single-stage evolution: score → select."""
 
     def __init__(self, scorer: Scorer, selector: Selector) -> None:
         self.scorer = scorer
         self.selector = selector
 
-    def evolve(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
-        """Apply scoring and selection to produce new S-space."""
-        scores = self.scorer.score(ctx, params)
+    def evolve(self, ctx: OuterCtx, psi_cache: PsiCache) -> np.ndarray:
+        """Apply scoring and selection using cached amplitudes."""
+        scores = self.scorer.score(ctx, psi_cache)
         return self.selector.select(scores)
 
 
-# --- Two-Stage Strategy ---
-
 class TwoStageStrategy(EvolutionStrategy):
     """
-    Two-stage evolution: separate core and frontier selection.
+    Two-stage evolution: independent core and frontier selection.
   
-    Enables hybrid criteria (e.g., amplitude-based core + PT2-based frontier).
+    Enables hybrid criteria (e.g., amplitude-based core, PT2-based frontier).
     Final space: S_new = S_core ∪ S_frontier
     """
 
@@ -63,19 +59,14 @@ class TwoStageStrategy(EvolutionStrategy):
         self.frontier_scorer = frontier_scorer
         self.frontier_selector = frontier_selector
 
-    def evolve(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
-        """Select core and frontier independently, return their union."""
-        # Stage 1: Core selection
+    def evolve(self, ctx: OuterCtx, psi_cache: PsiCache) -> np.ndarray:
+        """Select core and frontier determinants independently."""
         s_core = self.core_selector.select(
-            self.core_scorer.score(ctx, params)
+            self.core_scorer.score(ctx, psi_cache)
         )
-
-        # Stage 2: Frontier selection
         s_frontier = self.frontier_selector.select(
-            self.frontier_scorer.score(ctx, params)
+            self.frontier_scorer.score(ctx, psi_cache)
         )
-
-        # Combine unique determinants
         return self._unique_union(s_core, s_frontier)
 
     @staticmethod
@@ -88,21 +79,18 @@ class TwoStageStrategy(EvolutionStrategy):
         return np.unique(np.concatenate([arr1, arr2], axis=0), axis=0)
 
 
-# --- Mass-Locking Strategy ---
-
 class MassLockingStrategy(EvolutionStrategy):
     """
-    ASCI-inspired mass-locking evolution strategy.
+    ASCI-inspired mass-locking evolution.
   
     Algorithm:
-      1. Core Locking: Retain S-space determinants with cumulative probability
-         mass ∑|ψᵢ|² > threshold (sorted by |ψᵢ|² descending)
-      2. Frontier Expansion: Select from full active space (S ∪ C) using
-         specified scorer (typically PT2 energy contribution)
+      1. Lock S-space determinants with cumulative probability mass
+         ∑|ψᵢ|² ≥ threshold (sorted by |ψᵢ|² descending)
+      2. Expand frontier using scorer (typically PT2 energy contribution)
       3. Final space: S_new = S_locked ∪ S_frontier
   
     Parameters:
-        mass_threshold: Cumulative probability mass threshold ∈ (0, 1)
+        mass_threshold: Cumulative probability threshold ∈ (0, 1)
         frontier_scorer: Scorer for frontier selection (e.g., E2Scorer)
         frontier_selector: Selector for frontier space
     """
@@ -114,52 +102,32 @@ class MassLockingStrategy(EvolutionStrategy):
         frontier_selector: Selector,
     ) -> None:
         if not 0 < mass_threshold < 1:
-            raise ValueError(f"mass_threshold must be in (0, 1), got {mass_threshold}")
+            raise ValueError(
+                f"mass_threshold must be in (0, 1), got {mass_threshold}"
+            )
       
         self.mass_threshold = mass_threshold
         self.frontier_scorer = frontier_scorer
         self.frontier_selector = frontier_selector
 
-    def evolve(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
-        """Apply mass-locking core selection + frontier expansion."""
-        # Stage 1: Lock core by cumulative probability mass
-        s_locked = self._lock_core(ctx, params)
-
-        # Stage 2: Expand frontier from active space
+    def evolve(self, ctx: OuterCtx, psi_cache: PsiCache) -> np.ndarray:
+        """Apply mass-locking with frontier expansion."""
+        s_locked = self._lock_core(ctx, psi_cache)
         s_frontier = self.frontier_selector.select(
-            self.frontier_scorer.score(ctx, params)
+            self.frontier_scorer.score(ctx, psi_cache)
         )
-
-        # Combine unique determinants
         return self._unique_union(s_locked, s_frontier)
 
-    def _lock_core(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
-        """
-        Lock determinants with cumulative |ψᵢ|² > threshold.
-      
-        Returns:
-            Array of locked determinants from current S-space
-        """
-        import jax.numpy as jnp
-        
-        # Compute ψ_S from cached logpsi_fn
-        log_all = ctx.logpsi_fn(params)
-        psi_s = jnp.exp(log_all[:ctx.space.n_s])
-        psi_s_cpu = np.asarray(psi_s)
-        
+    def _lock_core(self, ctx: OuterCtx, psi_cache: PsiCache) -> np.ndarray:
+        """Lock determinants with cumulative |ψᵢ|² ≥ threshold."""
+        psi_s = np.asarray(psi_cache.psi_s)
         current_s = ctx.space.s_dets
-
-        # Compute probability mass |ψᵢ|²
-        probs = np.abs(psi_s_cpu) ** 2
-
-        # Sort by probability (descending)
+      
+        probs = np.abs(psi_s) ** 2
         sorted_idx = np.argsort(probs)[::-1]
-
-        # Find cutoff where cumulative mass exceeds threshold
         cumsum = np.cumsum(probs[sorted_idx])
+      
         cutoff = np.searchsorted(cumsum, self.mass_threshold, side="right")
-
-        # Return locked determinants (include determinant at cutoff)
         return current_s[sorted_idx[: cutoff + 1]]
 
     @staticmethod

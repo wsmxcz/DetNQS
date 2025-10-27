@@ -11,8 +11,12 @@ Date: November, 2025
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+import logging
+from typing import Any
+import jax
+import numpy as np
 
 
 class EvalMode(str, Enum):
@@ -31,16 +35,16 @@ class ScreenMode(str, Enum):
 
 class ComputeMode(str, Enum):
     """
-    Unified computation mode defining energy/gradient algorithms.
+    Energy/gradient computation algorithms.
     
-    ASYMMETRIC: S-norm with full S-C coupling (non-variational)
-                E = ⟨ψ_S|Ĥ|ψ⟩ / ||ψ_S||², ∇_θ over S-space only
+    ASYMMETRIC: S-norm with full S-C coupling
+                E = ⟨ψ_S|Ĥ|ψ⟩ / ||ψ_S||², gradient over S-space
     
-    PROXY:      Full-norm with diagonal C approximation (balanced)
-                E = ⟨ψ|Ĥ̃|ψ⟩ / ||ψ||², ∇_θ over S∪C space
+    PROXY:      Full-norm with diagonal C approximation
+                E = ⟨ψ|Ĥ̃|ψ⟩ / ||ψ||², gradient over S∪C
     
-    EFFECTIVE:  S-norm with Schur downfolding (efficient)
-                E = ⟨ψ_S|Ĥ_eff|ψ_S⟩ / ||ψ_S||², ∇_θ over S-space only
+    EFFECTIVE:  S-norm with Schur downfolding (Ĥ_eff = Ĥ_SS + Ĥ_SC·D⁻¹·Ĥ_CS)
+                E = ⟨ψ_S|Ĥ_eff|ψ_S⟩ / ||ψ_S||², gradient over S-space
     """
     ASYMMETRIC = "asymmetric"
     PROXY = "proxy"
@@ -48,8 +52,38 @@ class ComputeMode(str, Enum):
 
 
 @dataclass(frozen=True)
+class PrecisionConfig:
+    """Numerical precision policy with JAX/NumPy dtype management."""
+    enable_x64: bool = False
+    override_device_complex: type | None = None
+    override_device_float: type | None = None
+    
+    @property
+    def jax_float(self) -> Any:
+        """JAX float dtype (respects global x64 setting)."""
+        from jax import dtypes
+        return self.override_device_float or dtypes.canonicalize_dtype(float)
+    
+    @property
+    def jax_complex(self) -> Any:
+        """JAX complex dtype (respects global x64 setting)."""
+        from jax import dtypes
+        return self.override_device_complex or dtypes.canonicalize_dtype(complex)
+    
+    @property
+    def numpy_float(self) -> type:
+        """NumPy float dtype matching device precision."""
+        return np.dtype(self.jax_float).type
+    
+    @property
+    def numpy_complex(self) -> type:
+        """NumPy complex dtype matching device precision."""
+        return np.dtype(self.jax_complex).type
+
+
+@dataclass(frozen=True)
 class SystemConfig:
-    """Physical system definition."""
+    """Physical system definition from FCIDUMP."""
     fcidump_path: str
     n_orbitals: int
     n_alpha: int
@@ -61,6 +95,7 @@ class OptimizationConfig:
     """VMC optimization parameters."""
     seed: int = 42
     learning_rate: float = 5e-4
+    weight_decay: float = 1e-4
     num_cycles: int = 10
     s_space_size: int = 200
     steps_per_cycle: int = 500
@@ -69,7 +104,7 @@ class OptimizationConfig:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    """Energy computation timing."""
+    """Energy computation timing control."""
     var_energy_mode: EvalMode = EvalMode.FINAL
     t_ci_energy_mode: EvalMode = EvalMode.NEVER
     s_ci_energy_mode: EvalMode = EvalMode.FINAL
@@ -77,31 +112,27 @@ class EvaluationConfig:
 
 @dataclass(frozen=True)
 class ScreeningConfig:
-    """C-space screening parameters."""
+    """C-space screening configuration."""
     mode: ScreenMode = ScreenMode.DYNAMIC
-    eps1: float = 1e-6
+    screen_eps: float = 1e-6      # Screening threshold
+    diag_shift: float = 0.5       # Level shift for Ĥ_CC stabilization
 
 
 @dataclass(frozen=True)
 class LeverConfig:
-    """
-    Top-level LEVER run configuration.
-    
-    Numerical parameters:
-        epsilon: Stability threshold for division/normalization
-        normalize_wf: Apply joint L2 norm ||ψ_S||² + ||ψ_C||² = 1
-    
-    Compute mode:
-        compute_mode: Unified energy/gradient algorithm (ASYMMETRIC/PROXY/EFFECTIVE)
-    """
+    """Top-level LEVER workflow configuration."""
     system: SystemConfig
     optimization: OptimizationConfig
     evaluation: EvaluationConfig
     screening: ScreeningConfig
     
-    # Numerical parameters (previously in EngineConfig)
-    epsilon: float = 1e-12
-    normalize_wf: bool = True
-    
-    # Unified computation mode
+    num_eps: float = 1e-12           # Numerical zero threshold
+    normalize_wf: bool = True         # Enforce ||ψ||² = 1
+    precision: PrecisionConfig = field(default_factory=PrecisionConfig)
     compute_mode: ComputeMode = ComputeMode.PROXY
+    
+    def __post_init__(self):
+        """Apply precision policy during initialization."""
+        if self.precision.enable_x64:
+            jax.config.update("jax_enable_x64", True)
+            logging.info("Precision policy: 64-bit enabled")

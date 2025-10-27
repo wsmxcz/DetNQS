@@ -4,6 +4,11 @@
 """
 Space evolution protocols with OuterCtx integration.
 
+Defines interfaces for:
+  - Scoring: Determinant importance evaluation
+  - Selection: Core space subset selection
+  - Evolution: Complete cycle orchestration
+
 File: lever/evolution/base.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
@@ -16,67 +21,81 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol
 import numpy as np
 
 if TYPE_CHECKING:
-    from ..engine import OuterCtx
-    from ..engine.utils import PyTree
+    from ..dtypes import OuterCtx, PyTree, PsiCache
 
 
 # --- Data Structures ---
 
 class ScoreResult(NamedTuple):
     """Scored determinant container."""
-    scores: np.ndarray
-    dets: np.ndarray
-    meta: dict
+    scores: np.ndarray  # Importance measures
+    dets: np.ndarray    # Determinants
+    meta: dict          # Additional metadata
 
 
 # --- Evolution Protocols ---
 
 class Scorer(Protocol):
-    """Determinant importance evaluator."""
-
-    def score(self, ctx: OuterCtx, params: PyTree) -> ScoreResult:
+    """
+    Determinant importance evaluator.
+    
+    Computes importance scores from converged wavefunction amplitudes
+    to guide space selection in next iteration.
+    """
+    
+    def score(self, ctx: OuterCtx, psi_cache: PsiCache) -> ScoreResult:
         """
-        Compute importance scores from converged state.
-      
+        Evaluate determinant importance from cached wavefunction.
+        
         Args:
-            ctx: Outer cycle context with space/features/Hamiltonian
-            params: Converged neural network parameters
-      
+            ctx: Outer cycle context (space/Hamiltonian info)
+            psi_cache: Cached wavefunction amplitudes
+        
         Returns:
-            ScoreResult with importance measures
+            Scored determinants with metadata
         """
         ...
 
 
 class Selector(Protocol):
-    """Determinant subset selector."""
+    """
+    Determinant subset selector.
+    
+    Chooses new core space from scored candidates based on
+    importance thresholds or size constraints.
+    """
 
     def select(self, result: ScoreResult) -> np.ndarray:
         """
-        Choose new core space from scored determinants.
+        Select new S-space from scored determinants.
       
         Args:
-            result: Scorer output
+            result: Scored determinants from Scorer
       
         Returns:
-            Selected determinants
+            Selected determinants (N×M array)
         """
         ...
 
 
 class EvolutionStrategy(Protocol):
-    """Complete evolution orchestrator."""
-
-    def evolve(self, ctx: OuterCtx, params: PyTree) -> np.ndarray:
+    """
+    Complete evolution orchestrator.
+    
+    Combines scoring and selection into single evolution cycle,
+    potentially with custom logic (e.g., adaptive thresholds).
+    """
+    
+    def evolve(self, ctx: OuterCtx, psi_cache: PsiCache) -> np.ndarray:
         """
         Execute single evolution cycle.
-      
+        
         Args:
             ctx: Converged outer context
-            params: Converged parameters
-      
+            psi_cache: Cached wavefunction amplitudes
+        
         Returns:
-            New S-space determinants
+            New S-space determinants (N×M array)
         """
         ...
 

@@ -20,12 +20,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..dtypes import Contractions, LogPsiFn, SpMVFn
+from ..utils.dtypes import Contractions, LogPsiFn, SpMVFn
 from ..config import ComputeMode, PrecisionConfig
 from . import kernels
 
 if TYPE_CHECKING:
-    from ..dtypes import PyTree
+    from ..utils.dtypes import PyTree
 
 
 # ============================================================================

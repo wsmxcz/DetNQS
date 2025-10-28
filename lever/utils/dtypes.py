@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import ComputeMode
+from ..config import ComputeMode
 
 # ============================================================================
 # Type Aliases
@@ -34,7 +34,7 @@ from .config import ComputeMode
 PyTree = Any
 SpMVFn = Callable[[jnp.ndarray, ...], tuple[jnp.ndarray, ...]]  # type: ignore # Sparse H·ψ
 LogPsiFn = Callable[[PyTree], jnp.ndarray]  # params → log|ψ⟩
-
+OptimizerState = Any  # Protocol-based, defined in optimizers.base
 # ============================================================================
 # Sparse Matrix Storage (Host)
 # ============================================================================
@@ -179,6 +179,11 @@ class GradResult(NamedTuple):
     grad: PyTree                  # ∇_θ E(θ)
     energy: jnp.ndarray           # E(θ)
 
+class ScoreResult(NamedTuple):
+    """Scored determinant container."""
+    scores: np.ndarray  # Importance measures
+    dets: np.ndarray    # Determinants
+    meta: dict          # Additional metadata
 
 __all__ = [
     # Type aliases

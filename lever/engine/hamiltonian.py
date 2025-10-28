@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from .. import core
-from ..dtypes import HamOp, SpaceRep
+from ..utils.dtypes import HamOp, SpaceRep
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray

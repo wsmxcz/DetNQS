@@ -19,19 +19,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import numpy as np
+from ..utils.dtypes import ScoreResult
 
 if TYPE_CHECKING:
-    from ..dtypes import OuterCtx, PyTree, PsiCache
-
-
-# --- Data Structures ---
-
-class ScoreResult(NamedTuple):
-    """Scored determinant container."""
-    scores: np.ndarray  # Importance measures
-    dets: np.ndarray    # Determinants
-    meta: dict          # Additional metadata
-
+    from ..utils.dtypes import OuterCtx, PyTree, PsiCache
 
 # --- Evolution Protocols ---
 

@@ -22,7 +22,7 @@ import scipy.sparse as sp
 from pyscf import lib
 
 from . import core, engine
-from .dtypes import HamOp, PsiCache
+from .utils.dtypes import HamOp, PsiCache
 
 if TYPE_CHECKING:
     from .driver import DriverResults

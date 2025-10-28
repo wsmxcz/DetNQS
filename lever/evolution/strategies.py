@@ -19,9 +19,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .base import EvolutionStrategy, Scorer, Selector
+from ..utils.dtypes import ScoreResult
 
 if TYPE_CHECKING:
-    from ..dtypes import OuterCtx, PsiCache
+    from ..utils.dtypes import OuterCtx, PsiCache
 
 __all__ = ["BasicStrategy", "TwoStageStrategy", "MassLockingStrategy"]
 

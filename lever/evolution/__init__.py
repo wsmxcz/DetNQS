@@ -27,7 +27,7 @@ Date: October, 2025
 """
 
 from . import scores, selectors, strategies
-from .base import EvolutionStrategy, ScoreResult, Scorer, Selector
+from .base import EvolutionStrategy, Scorer, Selector
 from .strategies import BasicStrategy, MassLockingStrategy, TwoStageStrategy
 
 __all__ = [
@@ -35,7 +35,6 @@ __all__ = [
     "EvolutionStrategy",
     "Scorer", 
     "Selector",
-    "ScoreResult",
     # Concrete strategies
     "BasicStrategy",
     "MassLockingStrategy", 

@@ -27,8 +27,9 @@ import optax
 from . import analysis, core, engine, evolution
 from .config import ComputeMode, LeverConfig, ScreenMode, EvalMode
 from .models import WavefunctionModel
-from .dtypes import PyTree, PsiCache, HamOp
-from .logger import get_logger
+from .utils.dtypes import PyTree, PsiCache, HamOp
+from .utils.logger import get_logger
+from .utils.features import masks_to_vecs
 
 
 @dataclass(frozen=True)
@@ -348,7 +349,7 @@ class Driver:
             return jnp.empty((0, 2 * n_orb), dtype=jnp.float32)
       
         dets_dev = jax.device_put(dets)
-        return engine.utils.masks_to_vecs(dets_dev, self.cfg.system.n_orbitals)
+        return masks_to_vecs(dets_dev, self.cfg.system.n_orbitals)
 
     def _create_spmv_closure(self, ham_opt, ham_sc, space, mode):
         """Create SpMV closure with unified precision config."""

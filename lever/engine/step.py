@@ -20,13 +20,15 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 from jax import lax
+from ..optimizers import Optimizer
+from .geometry import prepare_tape
 
-from ..dtypes import GradResult, InnerState
+from ..utils.dtypes import GradResult, InnerState
 from ..config import ComputeMode
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from ..dtypes import OuterCtx, PyTree
+    from ..utils.dtypes import OuterCtx, PyTree
 
 
 # ============================================================================

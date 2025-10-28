@@ -15,11 +15,10 @@ from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
-
-from .base import ScoreResult
+from ..utils.dtypes import ScoreResult
 
 if TYPE_CHECKING:
-    from ..dtypes import OuterCtx, PyTree, PsiCache
+    from ..utils.dtypes import OuterCtx, PyTree, PsiCache
 
 
 class AmpScorer:

@@ -19,7 +19,7 @@ Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
-from ..dtypes import (
+from ..utils.dtypes import (
     # Type aliases
     PyTree,
     SpMVFn,
@@ -38,7 +38,7 @@ from ..dtypes import (
     GradResult,
 )
 
-from .utils import masks_to_vecs
+from ..utils.features import masks_to_vecs
 
 from .evaluator import (
     create_logpsi_fn,

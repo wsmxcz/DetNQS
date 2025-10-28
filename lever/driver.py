@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LEVER driver with OuterCycle/InnerCycle architecture.
+LEVER dual-loop optimization driver.
 
-Implements dual-loop optimization:
-  Outer: Core space evolution (S_k -> S_{k+1})
-  Inner: Parameter optimization via JIT scan
-  
+Architecture:
+  Outer: Determinant space evolution S_k → S_{k+1}
+  Inner: Variational parameter optimization via JIT scan
+
 File: lever/driver.py
 Author: Zheng (Alex) Che, wsmxcz@gmail.com
 Date: November, 2025
@@ -22,7 +22,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from . import analysis, core, engine, evolution
 from .config import ComputeMode, LeverConfig, ScreenMode, EvalMode
@@ -34,23 +33,37 @@ from .utils.features import masks_to_vecs
 
 @dataclass(frozen=True)
 class DriverResults:
-    """LEVER execution results with optimization history."""
+    """
+    LEVER optimization results with convergence history.
+    
+    Attributes:
+        config: Runtime configuration
+        final_vars: Optimized model parameters
+        full_hist: Per-step energy trajectory
+        cycle_bounds: Cycle boundaries in full_hist
+        var_hist: E_var(T) at cycle endpoints
+        s_ci_hist: E_CI(S) at cycle endpoints
+        t_ci_hist: E_CI(T) at cycle endpoints
+        total_time: Wall-clock execution time (s)
+    """
     config: LeverConfig
     final_vars: Any
-    full_hist: list[float]          # Per-step energies
-    cycle_bounds: list[int]         # Cycle start indices in full_hist
-    var_hist: list[float]           # E_var(T) at cycle end
-    s_ci_hist: list[float]          # E_CI(S) at cycle end
-    t_ci_hist: list[float]          # E_CI(T) at cycle end
+    full_hist: list[float]
+    cycle_bounds: list[int]
+    var_hist: list[float]
+    s_ci_hist: list[float]
+    t_ci_hist: list[float]
     total_time: float
 
 
 class Driver:
     """
-    LEVER driver executing outer/inner optimization loops.
-  
-    Outer cycle: Evolution of determinant space S
-    Inner cycle: VMC parameter optimization via scan
+    LEVER workflow orchestrator implementing dual-loop optimization.
+    
+    Outer cycle: Evolution of active determinant space S via EvolutionStrategy
+    Inner cycle: VMC parameter optimization with automatic differentiation
+    
+    Threading: JAX manages XLA compilation and device placement
     """
 
     def __init__(
@@ -58,17 +71,18 @@ class Driver:
         config: LeverConfig,
         model: WavefunctionModel,
         strategy: evolution.EvolutionStrategy,
+        optimizer = None
     ):
         self.cfg = config
         self.model = model
         self.strategy = strategy
         self.params = model.variables
         self.logger = get_logger()
+        self.optimizer = optimizer
         
-        # Track shape for recompilation detection
-        self._last_shape = None
+        self._last_shape = None  # Track space shape for recompilation detection
         
-        # Initialize integral context
+        # Initialize electronic integrals
         self.int_ctx = core.IntCtx(
             config.system.fcidump_path,
             config.system.n_orbitals
@@ -78,7 +92,7 @@ class Driver:
         self.e_ref: float | None = None
         
     def run(self) -> DriverResults:
-        """Execute complete LEVER workflow."""
+        """Execute complete LEVER workflow with timing."""
         self._print_header()
         
         s_dets = self._initialize_hf_space()
@@ -98,7 +112,7 @@ class Driver:
     # ==================== Initialization ====================
 
     def _print_header(self) -> None:
-        """Print workflow initialization header."""
+        """Log workflow configuration."""
         self.logger.header("LEVER Initialization")
         
         config_items = {
@@ -110,26 +124,23 @@ class Driver:
         self.logger.config_info(config_items)
 
     def _print_space_info(self, ctx: engine.OuterCtx) -> None:
-        """Log space info with recompilation detection."""
+        """Log space dimensions with recompilation warning."""
         n_s, n_c = ctx.space.n_s, ctx.space.n_c
-        
-        # Check for shape change
         current_shape = (n_s, n_c)
+        
         if self._last_shape is not None and self._last_shape != current_shape:
             self.logger.recompilation_warning(self._last_shape, current_shape)
         self._last_shape = current_shape
         
-        # Log space dimensions
         self.logger.space_dimensions(n_s, n_c)
         
-        # Log Hamiltonian sparsity
         if self.cfg.compute_mode == ComputeMode.EFFECTIVE:
             self.logger.hamiltonian_sparsity(n_s, ctx.ham_opt.nnz)
         else:
             self.logger.hamiltonian_sparsity(n_s, ctx.ham_opt.nnz, ctx.ham_sc.nnz)
 
     def _initialize_hf_space(self) -> np.ndarray:
-        """Initialize S-space with HF determinant."""
+        """Initialize S-space with Hartree-Fock determinant."""
         sys = self.cfg.system
         hf_det = np.array([
             [(1 << sys.n_alpha) - 1, (1 << sys.n_beta) - 1]
@@ -143,7 +154,7 @@ class Driver:
 
     @staticmethod
     def _create_history_dict() -> dict[str, list]:
-        """Create history tracking dictionary."""
+        """Create optimization history container."""
         return {
             "full": [],
             "bounds": [0],
@@ -160,26 +171,24 @@ class Driver:
         s_dets: np.ndarray,
         hist: dict[str, list]
     ) -> tuple[PsiCache, engine.OuterCtx]:
-        """Execute outer cycle with timing."""
-        t0 = time.time()
+        """
+        Execute single outer cycle: context setup → optimization → diagnostics.
         
+        Updates E_ref for EFFECTIVE mode from converged energy.
+        """
+        t0 = time.time()
         self.logger.cycle_start(cycle + 1, self.cfg.optimization.num_cycles)
         
-        # Build context
         outer_ctx = self._build_outer_context(s_dets)
         self._print_space_info(outer_ctx)
         
-        # Optimize
         self.params, energies, psi_cache = self._optimize_parameters(outer_ctx)
         self._update_history(hist, energies)
         
-        # Update reference
         if self.cfg.compute_mode == ComputeMode.EFFECTIVE:
             self.e_ref = energies[-1] - self.e_nuc
         
-        # Diagnostics
         self._evaluate_energies(cycle, outer_ctx, hist, psi_cache)
-        
         self.logger.timing(f"Cycle {cycle+1}", time.time() - t0)
         
         return psi_cache, outer_ctx
@@ -188,23 +197,30 @@ class Driver:
         """
         Build outer cycle context with precomputed invariants.
         
-        EFFECTIVE mode creates two logpsi closures:
-        - logpsi_s_fn: S-only for optimization (hot path)
-        - logpsi_full_fn: S∪C for evolution/cache (cold path)
+        Pipeline:
+          1. Bootstrap: Compute ψ_S for dynamic screening (optional)
+          2. Build: Construct Hamiltonian blocks H_SS, H_SC, H_CC
+          3. Assemble: Form H_eff or proxy operator
+          4. Features: Convert determinants to NN inputs
+          5. Closures: Create logpsi/spmv JIT functions
+        
+        EFFECTIVE mode uses dual logpsi closures:
+          - S-only for optimization (minimal overhead)
+          - S∪C for evolution and cache (full space)
         """
         cfg = self.cfg
         mode = cfg.compute_mode
         
-        # Phase 1: Dynamic screening bootstrap (optional)
+        # Bootstrap phase: amplitude estimation for dynamic screening
         psi_s_est = None
         if cfg.screening.mode == ScreenMode.DYNAMIC:
             psi_s_est = self._compute_normalized_amplitudes(s_dets)
             self.logger.bootstrap_amplitudes(psi_s_est.min(), psi_s_est.max())
         
-        # Phase 2: Build Hamiltonian blocks
+        # Build Hamiltonian blocks with screening
         ham_ss_raw, ham_sc, space = self._build_ham_blocks(s_dets, psi_s_est)
         
-        # Phase 3: Mode-specific Hamiltonian preparation
+        # Assemble effective Hamiltonian for EFFECTIVE mode
         if mode == ComputeMode.EFFECTIVE:
             ham_opt = self._assemble_effective_hamiltonian(
                 ham_ss_raw, ham_sc, space.h_diag_c
@@ -213,40 +229,48 @@ class Driver:
         else:
             ham_opt = ham_ss_raw
         
-        # Phase 4: Precompute features
+        # Precompute determinant features
         feat_s = self._dets_to_features(space.s_dets)
-        feat_c = (
-            self._dets_to_features(space.c_dets)
-            if mode != ComputeMode.EFFECTIVE or len(space.c_dets) > 0
-            else jnp.empty((0, 2 * cfg.system.n_orbitals), dtype=jnp.float32)
-        )
         
-        # Phase 5: Create evaluation closures
         if mode == ComputeMode.EFFECTIVE:
+            feat_c_opt = jnp.empty((0, 2 * cfg.system.n_orbitals), dtype=jnp.float32)
+            feat_c_full = (self._dets_to_features(space.c_dets) 
+                          if len(space.c_dets) > 0 else feat_c_opt)
+        elif mode == ComputeMode.ASYMMETRIC:
+            feat_c_opt = jnp.empty((0, 2 * cfg.system.n_orbitals), dtype=jnp.float32)
+            feat_c_full = self._dets_to_features(space.c_dets)
+        else:  # PROXY
+            feat_c_full = self._dets_to_features(space.c_dets)
+            feat_c_opt = feat_c_full
+        
+        # Create evaluation closures
+        if mode in (ComputeMode.EFFECTIVE, ComputeMode.ASYMMETRIC):
             logpsi_s_fn = engine.evaluator.create_logpsi_fn(
                 model_fn=self.model.log_psi,
                 feat_s=feat_s,
-                feat_c=jnp.empty((0, feat_s.shape[1]), dtype=feat_s.dtype),
+                feat_c=feat_c_opt,
                 mode=mode,
                 normalize=cfg.normalize_wf,
                 eps=cfg.num_eps,
                 device_complex=cfg.precision.jax_complex
             )
+            
             logpsi_full_fn = engine.evaluator.create_logpsi_fn(
                 model_fn=self.model.log_psi,
                 feat_s=feat_s,
-                feat_c=feat_c,
+                feat_c=feat_c_full,
                 mode=mode,
                 normalize=cfg.normalize_wf,
                 eps=cfg.num_eps,
                 device_complex=cfg.precision.jax_complex
             )
+            
             logpsi_fn = (logpsi_s_fn, logpsi_full_fn)
         else:
             logpsi_fn = engine.evaluator.create_logpsi_fn(
                 model_fn=self.model.log_psi,
                 feat_s=feat_s,
-                feat_c=feat_c,
+                feat_c=feat_c_full,
                 mode=mode,
                 normalize=cfg.normalize_wf,
                 eps=cfg.num_eps,
@@ -258,7 +282,7 @@ class Driver:
         return engine.OuterCtx(
             space=space,
             feat_s=feat_s,
-            feat_c=feat_c,
+            feat_c=feat_c_full,
             ham_opt=ham_opt,
             ham_sc=ham_sc,
             logpsi_fn=logpsi_fn,
@@ -273,7 +297,11 @@ class Driver:
         s_dets: np.ndarray,
         psi_s_est: np.ndarray | None = None
     ):
-        """Build Hamiltonian blocks with screening from unified config."""
+        """
+        Build Hamiltonian blocks with configurable screening.
+        
+        Returns: (H_SS, H_SC, space_info)
+        """
         cfg = self.cfg
         kwargs = {
             "S_dets": s_dets,
@@ -292,35 +320,36 @@ class Driver:
                 )
             case ScreenMode.DYNAMIC:
                 if psi_s_est is None:
-                    raise ValueError("Dynamic mode requires psi_s_est")
+                    raise ValueError("Dynamic screening requires psi_s_est")
                 return engine.hamiltonian.get_ham_proxy(
                     **kwargs, mode="dynamic",
                     psi_S=psi_s_est, 
                     screen_eps=cfg.screening.screen_eps,
                     diag_shift=cfg.screening.diag_shift
                 )
-            case _:
-                raise ValueError(f"Unknown screening mode: {cfg.screening.mode}")
 
     def _assemble_effective_hamiltonian(self, ham_ss, ham_sc, h_cc_diag):
-        """Assemble H_eff = H_SS + H_SC·D^{-1}·H_CS."""
-        result = engine.hamiltonian.get_ham_eff(
+        """
+        Assemble effective Hamiltonian via Löwdin partitioning.
+        
+        Formula: H_eff = H_SS + H_SC · D^{-1} · H_CS
+        where D_jj = E_ref - H_CC[j,j]
+        """
+        return engine.hamiltonian.get_ham_eff(
             ham_ss=ham_ss,
             ham_sc=ham_sc,
             h_cc_diag=h_cc_diag,
             e_ref=self.e_ref,
             num_eps=1e-4
         )
-        return result
 
     def _create_psi_cache(self, ctx: engine.OuterCtx, params) -> PsiCache:
         """
-        Create wavefunction cache with minimal host transfer.
+        Compute and cache wavefunction amplitudes for S∪C space.
         
-        For EFFECTIVE mode, uses logpsi_full_fn to compute S∪C amplitudes.
+        Minimizes host transfer by computing norms on device.
         """
-        # Extract appropriate logpsi function
-        if ctx.mode == ComputeMode.EFFECTIVE:
+        if isinstance(ctx.logpsi_fn, tuple):
             _, logpsi_full_fn = ctx.logpsi_fn
             log_all = logpsi_full_fn(params)
         else:
@@ -328,7 +357,6 @@ class Driver:
         
         psi_all = jnp.exp(log_all)
         
-        # Compute norms on device, transfer only scalars
         psi_s_norm_sq = jnp.sum(jnp.abs(psi_all[:ctx.space.n_s])**2)
         psi_c_norm_sq = jnp.sum(jnp.abs(psi_all[ctx.space.n_s:])**2)
         norms = np.array([psi_s_norm_sq, psi_c_norm_sq])
@@ -343,7 +371,7 @@ class Driver:
         )
 
     def _dets_to_features(self, dets: np.ndarray) -> jnp.ndarray:
-        """Convert determinant masks to occupancy vectors."""
+        """Convert determinant bit masks to occupancy feature vectors."""
         if len(dets) == 0:
             n_orb = self.cfg.system.n_orbitals
             return jnp.empty((0, 2 * n_orb), dtype=jnp.float32)
@@ -352,7 +380,7 @@ class Driver:
         return masks_to_vecs(dets_dev, self.cfg.system.n_orbitals)
 
     def _create_spmv_closure(self, ham_opt, ham_sc, space, mode):
-        """Create SpMV closure with unified precision config."""
+        """Create sparse matrix-vector product closure with precision control."""
         if mode == ComputeMode.EFFECTIVE:
             return engine.evaluator.create_spmv_eff(
                 ham_eff_rows=ham_opt.rows,
@@ -381,20 +409,21 @@ class Driver:
         self,
         outer_ctx: engine.OuterCtx
     ) -> tuple[Any, list[float], PsiCache]:
-        """VMC optimization with minimal host transfers."""
+        """
+        VMC parameter optimization via gradient descent.
+        
+        Uses JAX autodiff with user-provided optimizer (e.g., Adam, SGD).
+        Returns: (optimized_params, energy_trajectory, wavefunction_cache)
+        """
         cfg = self.cfg.optimization
         
-        # Create optimizer
-        if cfg.weight_decay > 0:
-            optimizer = optax.adamw(
-                learning_rate=cfg.learning_rate,
-                weight_decay=cfg.weight_decay
-            )
-        else:
-            optimizer = optax.adam(learning_rate=cfg.learning_rate)
+        opt_state = self.optimizer.init(self.params)
         
-        opt_state = optimizer.init(self.params)
-        step_fn = engine.step.create_step_fn(outer_ctx, optimizer, self.cfg.num_eps)
+        step_fn = engine.step.create_step_fn(
+            outer_ctx,
+            self.optimizer,
+            self.cfg.num_eps
+        )
         step_fn_jit = jax.jit(step_fn, donate_argnums=(0,))
         
         state = engine.InnerState(params=self.params, opt_state=opt_state, step=0)
@@ -419,7 +448,11 @@ class Driver:
     # ==================== Diagnostics ====================
 
     def _evaluate_energies(self, cycle, ctx, hist, psi_cache):
-        """Post-optimization energy evaluations using cached amplitudes."""
+        """
+        Post-optimization diagnostics: CI and variational energies.
+        
+        Skips expensive T-space evaluations in EFFECTIVE mode.
+        """
         cfg = self.cfg
         suite = analysis.EvalSuite(self.int_ctx, cfg.system.n_orbitals, self.e_nuc)
         
@@ -428,19 +461,16 @@ class Driver:
         
         energies_dict = {}
         
-        # S-space CI energy
         if self._should_evaluate(cfg.evaluation.s_ci_energy_mode, is_final):
             e_s_ci = suite.diag_ham(ctx.ham_opt)
             hist["s_ci"].append(e_s_ci)
             energies_dict["E_CI(S)"] = e_s_ci
         
-        # Skip T-space for effective mode
         if cfg.compute_mode == ComputeMode.EFFECTIVE:
             if energies_dict:
                 self.logger.energy_table(energies_dict)
             return
         
-        # T-space evaluations
         eval_var = self._should_evaluate(cfg.evaluation.var_energy_mode, is_final)
         eval_t_ci = self._should_evaluate(cfg.evaluation.t_ci_energy_mode, is_final)
         
@@ -462,14 +492,14 @@ class Driver:
 
     @staticmethod
     def _should_evaluate(mode: EvalMode, is_final: bool) -> bool:
-        """Check if evaluation should run."""
+        """Check if diagnostic should run based on evaluation mode."""
         return mode is EvalMode.EVERY or (mode is EvalMode.FINAL and is_final)
 
     def _build_full_space_hamiltonian(
         self,
         ctx: engine.OuterCtx
     ) -> tuple[np.ndarray, engine.hamiltonian.COOMatrix]:
-        """Build H_TT over full determinant space T = S ∪ C."""
+        """Build H_TT over full space T = S ∪ C for diagnostics."""
         t_dets = np.concatenate([ctx.space.s_dets, ctx.space.c_dets])
         ham_tt, _ = engine.hamiltonian.get_ham_ss(
             S_dets=t_dets,
@@ -485,7 +515,7 @@ class Driver:
         outer_ctx: engine.OuterCtx,
         psi_cache: PsiCache
     ) -> np.ndarray:
-        """Evolve S-space using cached amplitudes (silent operation)."""
+        """Evolve S-space via strategy (e.g., top-k selection, importance sampling)."""
         return self.strategy.evolve(outer_ctx, psi_cache)
 
     # ==================== Utilities ====================
@@ -494,7 +524,7 @@ class Driver:
         self,
         s_dets: np.ndarray
     ) -> np.ndarray:
-        """Compute L2-normalized S-space amplitudes."""
+        """Compute L2-normalized S-space amplitudes for screening bootstrap."""
         feat_s = self._dets_to_features(s_dets)
         log_psi = self.model.log_psi(self.params, feat_s)
         psi = np.abs(np.array(jax.device_get(jnp.exp(log_psi))))
@@ -504,7 +534,7 @@ class Driver:
 
     @staticmethod
     def _update_history(hist: dict[str, list], energies: list[float]) -> None:
-        """Update energy history with new cycle results."""
+        """Append cycle energies to optimization history."""
         hist["full"].extend(energies)
         hist["bounds"].append(len(hist["full"]))
 
@@ -513,7 +543,7 @@ class Driver:
         hist: dict[str, list],
         total_time: float
     ) -> DriverResults:
-        """Package final results with timing info."""
+        """Package optimization results with timing statistics."""
         final_energy = hist["full"][-1] if hist["full"] else 0.0
         self.logger.final_summary(
             total_time,

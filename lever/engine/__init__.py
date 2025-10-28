@@ -46,6 +46,12 @@ from .evaluator import (
     create_spmv_proxy,
 )
 
+from .geometry import (
+    prepare_tape, 
+    qgt_matvec, 
+    qgt_dense
+)
+
 from .step import (
     ModeKernel,
     create_step_fn,
@@ -77,6 +83,8 @@ __all__ = [
     
     # Closure factories
     "create_logpsi_fn", "create_spmv_eff", "create_spmv_proxy",
+    
+    "prepare_tape", "qgt_matvec", "qgt_dense",
     
     # Optimization kernels
     "ModeKernel", "create_step_fn", "create_scan_fn",

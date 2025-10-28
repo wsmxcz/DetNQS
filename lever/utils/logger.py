@@ -7,7 +7,7 @@ Centralized logging for LEVER workflows.
 Provides structured, formatted output with color-coded severity levels
 for optimization progress tracking.
 
-File: lever/logger.py
+File: lever/utils/logger.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """

@@ -2,144 +2,251 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Base optimizer protocol and composable framework.
+Base protocols and state definitions for LEVER optimizers.
 
-File: lever/optimizers/base.py
+Defines functional interfaces following Optax conventions:
+  - DirectionProvider: gradient → search direction (g → δ)
+  - UpdateRule: direction → step size (δ → α)
+  - Optimizer: DirectionProvider + UpdateRule
+
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import flax.struct
-import jax
 
-from ..engine.geometry import GeometryTape
-from ..utils.dtypes import PyTree
+if TYPE_CHECKING:
+    from ..utils.dtypes import PyTree, GeometryTape
 
 
-class OptimizerState(Protocol):
-    """Optimizer state protocol (analogous to optax.OptState)."""
-    step: int
+# ============================================================================
+# State Definitions
+# ============================================================================
+
+@flax.struct.dataclass
+class DirectionState:
+    """
+    Base state for direction computation.
+    
+    Subclasses extend with algorithm-specific fields (e.g., CG history).
+    Empty base enables stateless providers (e.g., gradient descent).
+    """
+    pass
 
 
 @flax.struct.dataclass
-class BaseOptimizerState:
-    """Minimal optimizer state for stateless optimizers."""
+class RuleState:
+    """
+    Base state for update rules.
+    
+    Subclasses extend with algorithm-specific fields (e.g., line search).
+    Empty base enables stateless rules (e.g., constant learning rate).
+    """
+    pass
+
+
+@flax.struct.dataclass
+class OptimizerState:
+    """
+    Complete optimizer state: direction + rule components + step counter.
+    
+    Attributes:
+        direction_state: DirectionProvider state
+        rule_state: UpdateRule state
+        step: Global iteration counter
+    """
+    direction_state: DirectionState
+    rule_state: RuleState
     step: int = 0
 
 
-class Optimizer(Protocol):
+# ============================================================================
+# Provider Protocols
+# ============================================================================
+
+class DirectionProvider(Protocol):
     """
-    Optimizer protocol compatible with Optax interface.
+    Computes search direction δ from gradient g.
     
-    Key difference: `update` accepts optional `tape` and `energy` kwargs
-    for geometry-aware optimization (SR, LM).
+    Functional interface: stateless, thread-safe, JIT-compatible.
+    First-order: δ = -g (ignores tape)
+    Second-order: δ = -F⁻¹g where F is QGT (requires tape)
     """
+    
+    def __call__(
+        self,
+        grad: PyTree,
+        state: DirectionState,
+        *,
+        tape: GeometryTape | None = None
+    ) -> tuple[PyTree, DirectionState]:
+        """
+        Compute search direction from gradient.
+        
+        Args:
+            grad: Gradient ∇E (PyTree structure)
+            state: Algorithm state (e.g., CG history)
+            tape: Geometry tape for QGT computation (optional)
+            
+        Returns:
+            direction: Search direction δ
+            new_state: Updated algorithm state
+        """
+        ...
+
+
+class UpdateRule(Protocol):
+    """
+    Computes step size α from search direction δ.
+    
+    Functional interface: stateless, thread-safe, JIT-compatible.
+    Simple: α = const or α = f(step)
+    Adaptive: α = argmin E(θ - αδ) via line search
+    """
+    
+    def __call__(
+        self,
+        direction: PyTree,
+        state: RuleState,
+        energy: float
+    ) -> tuple[float, RuleState]:
+        """
+        Compute step size from search direction.
+        
+        Args:
+            direction: Search direction δ
+            state: Algorithm state (e.g., previous α)
+            energy: Current energy E(θ) for adaptive rules
+            
+        Returns:
+            step_size: Scalar α
+            new_state: Updated algorithm state
+        """
+        ...
+
+
+# ============================================================================
+# Optimizer Class
+# ============================================================================
+
+class Optimizer:
+    """
+    Optimizer = DirectionProvider ∘ UpdateRule.
+    
+    Follows Optax functional API:
+      - init(params) → state
+      - update(grad, state, **ctx) → (updates, new_state)
+    
+    Update formula: θ_{t+1} = θ_t - α_t δ_t
+      where δ_t = direction(∇E_t) and α_t = rule(δ_t, E_t)
+    
+    Example:
+        >>> opt = Optimizer(
+        ...     direction=SRDirection(backend="matvec"),
+        ...     rule=ConstantRule(lr=1e-3)
+        ... )
+        >>> state = opt.init(params)
+        >>> updates, state = opt.update(grad, state, params,
+        ...                              tape=tape, energy=E)
+        >>> params = optax.apply_updates(params, updates)
+    """
+    
+    def __init__(
+        self,
+        direction: DirectionProvider,
+        rule: UpdateRule
+    ) -> None:
+        """
+        Initialize optimizer with direction and rule strategies.
+        
+        Args:
+            direction: Search direction provider (Gradient/SR/LM)
+            rule: Step size controller (Constant/LineSearch)
+        """
+        self.direction = direction
+        self.rule = rule
     
     def init(self, params: PyTree) -> OptimizerState:
-        """Initialize optimizer state."""
-        ...
+        """
+        Initialize optimizer state (structure inference only).
+        
+        Args:
+            params: Initial parameters
+            
+        Returns:
+            Initial state with step=0
+        """
+        return OptimizerState(
+            direction_state=DirectionState(),
+            rule_state=RuleState(),
+            step=0
+        )
     
     def update(
         self,
         grad: PyTree,
         state: OptimizerState,
-        params: PyTree,
+        params: PyTree,  # API compatibility, unused
         *,
         tape: GeometryTape | None = None,
-        energy: float | None = None,
+        energy: float = 0.0
     ) -> tuple[PyTree, OptimizerState]:
         """
-        Compute parameter updates.
+        Compute parameter updates: Δθ = -α·δ.
+        
+        Two-stage process:
+          1. δ = direction(g, state_dir, tape)
+          2. α = rule(δ, state_rule, E)
+          3. Δθ = α·δ
         
         Args:
-            grad: Parameter gradient
-            state: Optimizer state
-            params: Current parameters
-            tape: Geometry tape (optional, for SR/LM)
-            energy: Current energy (optional, for line search)
+            grad: Gradient ∇E
+            state: Current optimizer state
+            params: Current parameters (unused)
+            tape: Geometry tape for QGT (optional)
+            energy: Current energy E(θ) (optional)
             
         Returns:
-            (updates, new_state): Updates to apply via optax.apply_updates
+            updates: Parameter updates Δθ
+            new_state: Updated optimizer state
         """
-        ...
-
-
-class ComposableOptimizer:
-    """
-    Base optimizer implementation via direction + rule composition.
-    
-    Workflow:
-      1. direction_provider(grad, tape) → δ
-      2. update_rule(δ, params, energy) → α
-      3. updates = α * δ
-    """
-    
-    def __init__(self, direction_provider, update_rule):
-        """
-        Args:
-            direction_provider: Callable (grad, tape) → direction
-            update_rule: Callable (direction, params, energy) → step_size
-        """
-        self.direction = direction_provider
-        self.rule = update_rule
-    
-    def init(self, params: PyTree) -> BaseOptimizerState:
-        """Initialize with zero step counter."""
-        return BaseOptimizerState(step=0)
-    
-    def update(
-        self,
-        grad: PyTree,
-        state: BaseOptimizerState,
-        params: PyTree,
-        *,
-        tape: GeometryTape | None = None,
-        energy: float | None = None,
-    ) -> tuple[PyTree, BaseOptimizerState]:
-        """Compute updates via direction × rule."""
-        # Compute search direction (may use tape for SR/LM)
-        direction = self.direction(grad, tape)
+        # Compute search direction δ
+        direction, new_dir_state = self.direction(
+            grad,
+            state.direction_state,
+            tape=tape
+        )
         
-        # Compute step size (may use energy for line search)
-        step_size = self.rule(direction, params, energy)
+        # Compute step size α
+        step_size, new_rule_state = self.rule(
+            direction,
+            state.rule_state,
+            energy
+        )
         
-        # Apply step size to direction
-        updates = jax.tree.map(lambda d: step_size * d, direction)
+        # Scale direction: Δθ = α·δ
+        from ..utils.pytree import tree_scale
+        updates = tree_scale(direction, step_size)
         
         # Update state
-        new_state = BaseOptimizerState(step=state.step + 1)
+        new_state = OptimizerState(
+            direction_state=new_dir_state,
+            rule_state=new_rule_state,
+            step=state.step + 1
+        )
         
         return updates, new_state
 
 
-def create_optimizer(direction_provider, update_rule) -> Optimizer:
-    """
-    Factory for composable optimizers.
-    
-    Example:
-        opt = create_optimizer(
-            GradientDirection(),
-            ConstantRule(learning_rate=1e-3)
-        )
-    
-    Args:
-        direction_provider: Direction computation strategy
-        update_rule: Step size computation strategy
-        
-    Returns:
-        Optimizer instance
-    """
-    return ComposableOptimizer(direction_provider, update_rule)
-
-
 __all__ = [
-    "Optimizer",
+    "DirectionProvider",
+    "DirectionState",
+    "UpdateRule",
+    "RuleState",
     "OptimizerState",
-    "BaseOptimizerState",
-    "ComposableOptimizer",
-    "create_optimizer",
+    "Optimizer",
 ]

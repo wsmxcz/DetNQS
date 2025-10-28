@@ -2,53 +2,86 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Update rules for step size control.
+Step size control rules for variational optimization.
 
-Phase 1: Constant learning rate
-Phase 4+: Line search, trust region
+Implements strategies for computing step size α along search direction:
+  - ConstantRule: α = lr (fixed learning rate)
+  - LineSearchRule: Armijo backtracking (Phase 5 placeholder)
+  - TrustRegionRule: Adaptive damping (Phase 5 placeholder)
 
-File: lever/optimizers/rule.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
 from __future__ import annotations
 
-from ..utils.dtypes import PyTree
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from .base import RuleState
+
+if TYPE_CHECKING:
+    from ..utils.dtypes import PyTree
 
 
+@dataclass
 class ConstantRule:
     """
-    Fixed learning rate: α = constant.
+    Fixed step size: α = lr.
     
-    Simplest update rule, compatible with all direction providers.
+    Simplest stateless rule, suitable for well-conditioned problems.
+    Update: θ_{k+1} = θ_k + α·d_k where d_k is search direction.
+    
+    Attributes:
+        learning_rate: Fixed step size α > 0
     """
-    
-    def __init__(self, learning_rate: float):
-        """
-        Args:
-            learning_rate: Fixed step size α
-        """
-        self.learning_rate = learning_rate
+    learning_rate: float = 1e-3
     
     def __call__(
         self,
         direction: PyTree,
-        params: PyTree,
-        energy: float | None = None
-    ) -> float:
+        state: RuleState,
+        energy: float
+    ) -> tuple[float, RuleState]:
         """
-        Return fixed learning rate.
+        Return constant step size.
         
         Args:
             direction: Search direction (unused)
-            params: Current parameters (unused)
+            state: Rule state (unchanged)
             energy: Current energy (unused)
             
         Returns:
-            Fixed learning rate
+            (α, state): Fixed learning rate and unmodified state
         """
-        return self.learning_rate
+        return self.learning_rate, state
 
 
-__all__ = ["ConstantRule"]
+@dataclass
+class LineSearchRule:
+    """
+    Backtracking line search with Armijo condition (Phase 5 placeholder).
+    
+    Will implement: α_k = β^m · α_0 where β ∈ (0,1) and m satisfies
+    f(θ + α_k·d) ≤ f(θ) + c·α_k·∇f^T·d with Armijo constant c ∈ (0,1).
+    
+    Currently delegates to fixed initial_step.
+    
+    Attributes:
+        initial_step: Starting trial step α_0
+        backtrack_factor: Reduction factor β ∈ (0,1)
+    """
+    initial_step: float = 1.0
+    backtrack_factor: float = 0.5
+    
+    def __call__(
+        self,
+        direction: PyTree,
+        state: RuleState,
+        energy: float
+    ) -> tuple[float, RuleState]:
+        """Placeholder: returns initial_step without backtracking."""
+        return self.initial_step, state
+
+
+__all__ = ["ConstantRule", "LineSearchRule"]

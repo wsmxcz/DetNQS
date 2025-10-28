@@ -11,6 +11,7 @@ Date: November, 2025
 
 import lever
 from lever import config, models, evolution, driver, analysis
+from lever.optimizers import adam, sr
 
 import jax
 import jax.numpy as jnp
@@ -24,8 +25,8 @@ jax.config.update("jax_log_compiles", False)
 def main():
     # System configuration
     sys_cfg = config.SystemConfig(
-        fcidump_path="../benchmark/FCIDUMP/CH4_sto3g.FCIDUMP",
-        n_orbitals=9, 
+        fcidump_path="../benchmark/FCIDUMP/H2O_sto3g.FCIDUMP",
+        n_orbitals=7, 
         n_alpha=5, 
         n_beta=5
     )
@@ -33,8 +34,7 @@ def main():
     # Optimization configuration
     opt_cfg = config.OptimizationConfig(
         seed=42,
-        learning_rate=5e-4,
-        s_space_size=400, 
+        s_space_size=50, 
         steps_per_cycle=200, 
         num_cycles=10,
         report_interval=50
@@ -65,16 +65,33 @@ def main():
     print(f"Mode: {lever_cfg.compute_mode.value}")
 
     # Model initialization
-    model = models.Backflow(
+    # model = models.Backflow(
+    #     n_orbitals=sys_cfg.n_orbitals, 
+    #     n_alpha=sys_cfg.n_alpha, 
+    #     n_beta=sys_cfg.n_beta,
+    #     seed=opt_cfg.seed, 
+    #     n_dets=1, 
+    #     generalized=True, 
+    #     restricted=False,
+    #     hidden_dims=(256,), 
+    #     param_dtype=jnp.complex64
+    # )
+    
+    model = models.RBM(
         n_orbitals=sys_cfg.n_orbitals, 
-        n_alpha=sys_cfg.n_alpha, 
-        n_beta=sys_cfg.n_beta,
-        seed=opt_cfg.seed, 
-        n_dets=1, 
-        generalized=True, 
-        restricted=False,
-        hidden_dims=(256,), 
-        param_dtype=jnp.complex64
+        seed=opt_cfg.seed,
+        alpha=1
+    )
+    
+    # optimizer = adam(
+    #     learning_rate=5e-4,
+    #     weight_decay=1e-4
+    # )
+    
+    optimizer = sr(
+        damping=1e-3,
+        backend="dense",
+        learning_rate=0.05,
     )
     
     # Evolution strategy
@@ -84,13 +101,13 @@ def main():
     )
 
     # Run LEVER
-    lever_driver = driver.Driver(lever_cfg, model, evo_strategy)
+    lever_driver = driver.Driver(lever_cfg, model, evo_strategy, optimizer)
     results = lever_driver.run()
 
     # Analysis
-    suite = analysis.AnalysisSuite(results, lever_driver.int_ctx)
-    suite.print_summary()
-    suite.plot_conv(sys_name="H2O_STO-3G")
+    # suite = analysis.AnalysisSuite(results, lever_driver.int_ctx)
+    # suite.print_summary()
+    # suite.plot_conv(sys_name="H2O_STO-3G")
 
 
 if __name__ == "__main__":

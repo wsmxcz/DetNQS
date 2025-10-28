@@ -5,8 +5,8 @@
 Numerical utility functions for LEVER engine.
 
 Contains pure numerical transformations without data structure definitions
-(see lever/types.py for data containers).
 
+File: lever/utils/features.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """

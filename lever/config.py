@@ -94,8 +94,6 @@ class SystemConfig:
 class OptimizationConfig:
     """VMC optimization parameters."""
     seed: int = 42
-    learning_rate: float = 5e-4
-    weight_decay: float = 1e-4
     num_cycles: int = 10
     s_space_size: int = 200
     steps_per_cycle: int = 500

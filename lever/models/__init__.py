@@ -192,7 +192,7 @@ def RBMModPhase(
     """
     from .rbm import RBMModPhase
 
-    ansatz = RBMModPhase(alpha=alpha, param_dtype=jnp.float64)
+    ansatz = RBMModPhase(alpha=alpha, param_dtype=jnp.float32)
     return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
 
 

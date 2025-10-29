@@ -245,13 +245,35 @@ class LeverLogger:
             )
   
     # ==================== Warnings & Performance ====================
-  
-    def recompilation_warning(self, old_shape: tuple, new_shape: tuple):
-        """Warn about JIT recompilation due to shape change."""
-        self.logger.warning(
-            f"  JIT recompilation triggered: shape {old_shape} -> {new_shape}"
+    
+    def inner_loop_converged(self, step: int, delta: float):
+        """Log inner loop (parameter optimization) convergence."""
+        status = self._colorize("CONVERGED", 'green')
+        self.logger.info(
+            f"    {status}  Inner optimization at step {step} "
+            f"(ΔE = {self._format_number(delta, 2)})"
         )
-  
+    
+    def outer_loop_converged(self, cycle: int, delta: float):
+        """Log outer loop (space evolution) convergence."""
+        status = self._colorize("CONVERGED", 'green')
+        self.logger.info("")
+        self.logger.info(
+            f"  {status}  Outer cycle at iteration {cycle} "
+            f"(ΔE_cycle = {self._format_number(delta, 2)})"
+        )
+    
+    def recompilation_warning(self, old_shape: tuple, new_shape: tuple):
+        """Warn about JIT recompilation trigger."""
+        self.logger.warning(
+            f"Space shape changed: {old_shape} → {new_shape}. "
+            f"JIT recompilation triggered."
+        )
+        
+    def diagnostic_energy(self, label: str, energy: float):
+        """Log computed diagnostic energy."""
+        self.logger.info(f"  {label:6s}: {energy:16.10f} Eh")
+        
     def performance_note(self, message: str):
         """Log performance hint as warning."""
         self.logger.warning(f"  Performance hint: {message}")

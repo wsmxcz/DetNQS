@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LEVER Engine: JIT-optimized variational Monte Carlo computational core.
+LEVER Engine: JIT-optimized computational core.
 
 Architecture:
   - OuterCycle: Immutable build artifacts (H, features, closures)
@@ -15,55 +15,18 @@ Key components:
   - Step kernels: create_step_fn, create_scan_fn (lax.scan compatible)
   - Hamiltonian builders: get_ham_{ss,proxy,full,eff}
 
+File: lever/engine/__init__.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
-from ..utils.dtypes import (
-    # Type aliases
-    PyTree,
-    SpMVFn,
-    LogPsiFn,
-    
-    # Data structures
-    HamOp,
-    SpaceRep,
-    PsiCache,
-    OuterCtx,
-    InnerState,
-    
-    # Result containers
-    Contractions,
-    StepResult,
-    GradResult,
-)
+from .operator import *
 
-from ..utils.features import masks_to_vecs
+from .geometry import *
 
-from .evaluator import (
-    create_logpsi_fn,
-    create_spmv_eff,
-    create_spmv_proxy,
-)
+from .step import *
 
-from .geometry import (
-    prepare_tape, 
-    qgt_matvec, 
-    qgt_dense
-)
-
-from .step import (
-    ModeKernel,
-    create_step_fn,
-    create_scan_fn,
-)
-
-from .hamiltonian import (
-    get_ham_ss,
-    get_ham_proxy,
-    get_ham_full,
-    get_ham_eff,
-)
+from .hamiltonian import *
 
 from . import kernels
 
@@ -71,15 +34,6 @@ from . import kernels
 # Public API
 # ============================================================================
 __all__ = [
-    # Types
-    "PyTree", "SpMVFn", "LogPsiFn",
-    
-    # Data structures
-    "HamOp", "SpaceRep", "PsiCache", "OuterCtx", "InnerState",
-    "Contractions", "StepResult", "GradResult",
-    
-    # Utilities
-    "masks_to_vecs",
     
     # Closure factories
     "create_logpsi_fn", "create_spmv_eff", "create_spmv_proxy",

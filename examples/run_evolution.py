@@ -2,112 +2,111 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LEVER optimization with EFFECTIVE mode.
+LEVER optimization example.
 
 File: examples/run_evolution.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
-import lever
-from lever import config, models, evolution, driver, analysis
-from lever.optimizers import adam, sr
-
 import jax
 import jax.numpy as jnp
 
-# JAX configuration
+from lever import analysis, config, driver, evolution, models
+from lever.optimizers import adam
+
+# JAX device configuration
 print("JAX devices:", jax.devices())
 jax.config.update("jax_platforms", "cuda")
 jax.config.update("jax_log_compiles", False)
 
 
 def main():
-    # System configuration
+    # ========== System Definition ==========
     sys_cfg = config.SystemConfig(
-        fcidump_path="../benchmark/FCIDUMP/H2O_sto3g.FCIDUMP",
-        n_orbitals=7, 
-        n_alpha=5, 
+        fcidump_path="../benchmark/FCIDUMP/H2O_631g.FCIDUMP",
+        n_orbitals=13,
+        n_alpha=5,
         n_beta=5
     )
     
-    # Optimization configuration
-    opt_cfg = config.OptimizationConfig(
-        seed=42,
-        s_space_size=50, 
-        steps_per_cycle=200, 
-        num_cycles=10,
-        report_interval=50
+    # ========== Hamiltonian Configuration ==========
+    ham_cfg = config.HamiltonianConfig(
+        screening_mode=config.ScreenMode.DYNAMIC,
+        screen_eps=1e-6,
+        diag_shift=0.5,
+        reg_eps=1e-4
     )
     
-    # Evaluation configuration
+    # ========== Loop Control ==========
+    loop_cfg = config.LoopConfig(
+        max_cycles=30,
+        max_steps=1000,
+    )
+    
+    # ========== Evaluation Configuration ==========
     eval_cfg = config.EvaluationConfig(
-        var_energy_mode=config.EvalMode.NEVER,
-        s_ci_energy_mode=config.EvalMode.NEVER,
+        var_energy_mode=config.EvalMode.FINAL,
+        s_ci_energy_mode=config.EvalMode.FINAL,
         t_ci_energy_mode=config.EvalMode.NEVER
     )
     
-    # Screening configuration
-    screen_cfg = config.ScreeningConfig(
-        mode=config.ScreenMode.DYNAMIC,
-        screen_eps=1e-6
-    )
-    
-    # LEVER configuration
+    # ========== LEVER Configuration ==========
     lever_cfg = config.LeverConfig(
-        system=sys_cfg, 
-        optimization=opt_cfg, 
+        system=sys_cfg,
+        hamiltonian=ham_cfg,
+        loop=loop_cfg,
         evaluation=eval_cfg,
-        screening=screen_cfg,
         compute_mode=config.ComputeMode.EFFECTIVE,
     )
-    
-    print(f"Mode: {lever_cfg.compute_mode.value}")
 
-    # Model initialization
-    # model = models.Backflow(
-    #     n_orbitals=sys_cfg.n_orbitals, 
-    #     n_alpha=sys_cfg.n_alpha, 
-    #     n_beta=sys_cfg.n_beta,
-    #     seed=opt_cfg.seed, 
-    #     n_dets=1, 
-    #     generalized=True, 
-    #     restricted=False,
-    #     hidden_dims=(256,), 
-    #     param_dtype=jnp.complex64
-    # )
-    
-    model = models.RBM(
-        n_orbitals=sys_cfg.n_orbitals, 
-        seed=opt_cfg.seed,
-        alpha=1
+    # ========== Wavefunction Model ==========
+    model = models.Backflow(
+        n_orbitals=sys_cfg.n_orbitals,
+        n_alpha=sys_cfg.n_alpha,
+        n_beta=sys_cfg.n_beta,
+        seed=42,
+        n_dets=1,
+        generalized=True,
+        restricted=False,
+        hidden_dims=(32,),
+        param_dtype=jnp.complex64 
     )
     
-    # optimizer = adam(
-    #     learning_rate=5e-4,
-    #     weight_decay=1e-4
+    # RBM:
+    # model = models.RBM(
+    #     n_orbitals=sys_cfg.n_orbitals,
+    #     seed=42,
+    #     alpha=2  # Hidden/visible ratio
     # )
     
-    optimizer = sr(
-        damping=1e-3,
-        backend="dense",
-        learning_rate=0.05,
+    # ========== Optimizer ==========
+    optimizer = adam(
+        learning_rate=5e-4,
+        weight_decay=1e-4    # L2 regularization
     )
     
-    # Evolution strategy
+    # Stochastic Reconfiguration
+    # optimizer = sr(
+    #     damping=1e-3,
+    #     backend="dense",     # or "cg" for conjugate gradient
+    #     learning_rate=0.05
+    # )
+    
+    # ========== Evolution Strategy ==========
     evo_strategy = evolution.BasicStrategy(
         scorer=evolution.scores.AmpScorer(),
-        selector=evolution.selectors.TopKSelector(k=opt_cfg.s_space_size)
+        selector=evolution.selectors.TopKSelector(k=3200)
     )
 
-    # Run LEVER
+    # ========== Run LEVER Workflow ==========
     lever_driver = driver.Driver(lever_cfg, model, evo_strategy, optimizer)
     results = lever_driver.run()
 
-    # Analysis
-    # suite = analysis.AnalysisSuite(results, lever_driver.int_ctx)
+    # ========== Post-Analysis ==========
+    # suite = analysis.AnalysisSuite(results, lever_driver.controller.int_ctx)
     # suite.print_summary()
-    # suite.plot_conv(sys_name="H2O_STO-3G")
+    # suite.plot_conv(sys_name="N2_STO-3G")
 
 
 if __name__ == "__main__":

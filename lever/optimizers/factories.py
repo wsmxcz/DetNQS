@@ -67,7 +67,7 @@ def sr(
     backend: Literal["matvec", "dense"] = "matvec",
     learning_rate: float = 1.0,
     cg_maxiter: int = 100,
-    cg_tol: float = 1e-5
+    cg_tol: float = 1e-4
 ):
     """
     Create stochastic reconfiguration / natural gradient optimizer.

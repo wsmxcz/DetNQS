@@ -20,7 +20,7 @@ import numpy as np
 
 from .. import core
 from ..utils.dtypes import HamOp, SpaceRep
-
+from ..utils.space import remove_overlaps
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -73,31 +73,6 @@ def _from_coo_dict(coo_dict: dict) -> HamOp:
     )
 
 
-def _remove_s_from_c(
-    S_dets: NDArray[np.uint64], 
-    C_dets: NDArray[np.uint64]
-) -> NDArray[np.uint64]:
-    """
-    Remove S-space overlaps from C-space determinants via set-based lookup.
-    
-    Complexity: O(|S| + |C|)
-    
-    Returns:
-        Filtered C-space determinants preserving original order
-    """
-    if len(C_dets) == 0:
-        return np.empty((0, 2), dtype=np.uint64)
-    
-    S_set = {(int(d[0]), int(d[1])) for d in S_dets}
-    C_filtered = [d for d in C_dets if (int(d[0]), int(d[1])) not in S_set]
-    
-    return (
-        np.array(C_filtered, dtype=np.uint64) 
-        if C_filtered 
-        else np.empty((0, 2), dtype=np.uint64)
-    )
-
-
 # ============================================================================
 # Main API: Proxy Hamiltonian Construction
 # ============================================================================
@@ -142,7 +117,7 @@ def get_ham_proxy(
     # Dispatch to screening backend
     if mode == "none":
         C_raw = core.gen_excited_dets(S, n_orbitals)
-        C = _remove_s_from_c(S, C_raw)
+        C = remove_overlaps(C_raw, S)
         result = core.get_ham_block(
             bra_dets=S, 
             ket_dets=C, 
@@ -349,7 +324,7 @@ def get_ham_eff(
     ham_sc: HamOp,
     h_cc_diag: NDArray[np.float64],
     e_ref: float,
-    reg_type: Literal["linear_shift", "sigma"] = "sigma",
+    reg_type: str = "sigma",
     num_eps: float = 1e-12,
     upper_only: bool = True,
 ) -> HamOp:

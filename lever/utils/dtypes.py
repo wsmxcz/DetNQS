@@ -2,21 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Unified data structures and type aliases for LEVER quantum engine.
+Unified data structures for LEVER quantum engine.
 
-Centralizes container types to avoid circular imports. Core structures:
-  - HamOp: Sparse Hamiltonian in COO format (CPU storage)
-  - SpaceRep: S/C-space determinants and diagonal H elements
-  - PsiCache: Optimized wavefunction amplitudes
-  - OuterCtx: Immutable cycle context (Hamiltonians + closures)
-  - InnerState: Mutable optimization state (params + optimizer)
+Defines immutable containers in layered architecture:
+- Physical: HamOp, SpaceRep, PsiCache (sparse operators, basis states)
+- Optimizer: OptState, GeometryTape (gradient computation context)
+- Results: Contractions, StepResult, GradResult (computational outputs)
+- Workflow: Workspace, FitResult, EvolutionState (high-level state)
 
+File: lever/utils/dtypes.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple
 
 import flax.struct
@@ -31,23 +32,23 @@ from ..config import ComputeMode
 # ============================================================================
 
 PyTree = Any
-SpMVFn = Callable[[jnp.ndarray, ...], tuple[jnp.ndarray, ...]]  # type: ignore # Sparse H·ψ product
-LogPsiFn = Callable[[PyTree], jnp.ndarray]                       # params → log|ψ⟩
-OptimizerState = Any                                             # Protocol-based
-JVPFn = Callable[[PyTree], jnp.ndarray]                          # Jacobian-vector product
-VJPFn = Callable[[jnp.ndarray], tuple[PyTree]]                   # Vector-Jacobian product
+SpMVFn = Callable[[jnp.ndarray, ...], tuple[jnp.ndarray, ...]]  # type: ignore
+LogPsiFn = Callable[[PyTree], jnp.ndarray]
+OptimizerState = Any
+JVPFn = Callable[[PyTree], jnp.ndarray]
+VJPFn = Callable[[jnp.ndarray], tuple[PyTree]]
 
 
 # ============================================================================
-# Sparse Matrix Storage (Host)
+# Physical Representation Layer
 # ============================================================================
 
 @flax.struct.dataclass
 class HamOp:
     """
-    Sparse Hamiltonian block in COO format (CPU storage).
-  
-    Storage: H[rows[k], cols[k]] = vals[k], k ∈ [0, nnz)
+    Sparse Hamiltonian in COO format.
+    
+    CPU-resident structure: (rows[i], cols[i], vals[i]) defines H_ij.
     """
     rows: NDArray[np.int32] = flax.struct.field(pytree_node=False)
     cols: NDArray[np.int32] = flax.struct.field(pytree_node=False)
@@ -56,18 +57,17 @@ class HamOp:
 
     @property
     def nnz(self) -> int:
-        """Number of stored elements."""
+        """Number of nonzero matrix elements."""
         return self.vals.size
 
 
 @flax.struct.dataclass
 class SpaceRep:
     """
-    Hilbert space representation (CPU storage).
-  
-    Stores determinant bitmasks and diagonal Hamiltonian elements:
-      - {s,c}_dets: (n_{s,c}, 2) uint64 arrays [α-string, β-string]
-      - h_diag_{s,c}: Diagonal elements ⟨det_i|H|det_i⟩
+    Hilbert space partition: S-space (search) ∪ C-space (complement).
+    
+    Stores determinants as uint64 pairs [α-string, β-string] and
+    precomputed diagonal Hamiltonian elements.
     """
     s_dets: NDArray[np.uint64] = flax.struct.field(pytree_node=False)
     c_dets: NDArray[np.uint64] = flax.struct.field(pytree_node=False)
@@ -85,97 +85,54 @@ class SpaceRep:
         return self.c_dets.shape[0]
 
 
-# ============================================================================
-# Wavefunction Cache
-# ============================================================================
-
 @flax.struct.dataclass
 class PsiCache:
     """
-    Cached wavefunction amplitudes after optimization.
-  
-    Computed once per outer cycle to avoid redundant forward passes.
-    Provides split views into S- and C-space components.
+    Wavefunction snapshot after optimization convergence.
+    
+    Stores log-amplitudes and normalized amplitudes for both spaces.
+    Partition: psi_all[:n_s] = S, psi_all[n_s:] = C.
     """
-    log_all: jnp.ndarray          # log(ψ) for full S ∪ C space
-    psi_all: jnp.ndarray          # ψ = exp(log_all)
+    log_all: jnp.ndarray
+    psi_all: jnp.ndarray
     n_s: int = flax.struct.field(pytree_node=False)
     n_c: int = flax.struct.field(pytree_node=False)
-  
+
     @property
     def psi_s(self) -> jnp.ndarray:
-        """S-space amplitudes ψ_S."""
+        """S-space amplitudes."""
         return self.psi_all[:self.n_s]
-  
+
     @property
     def psi_c(self) -> jnp.ndarray:
-        """C-space amplitudes ψ_C."""
+        """C-space amplitudes."""
         return self.psi_all[self.n_s:]
 
 
 # ============================================================================
-# Outer Cycle Context (Immutable)
+# Optimizer Layer
 # ============================================================================
 
 @flax.struct.dataclass
-class OuterCtx:
+class OptState:
     """
-    Immutable outer cycle context bundling Hamiltonians and closures.
-  
-    Closures (logpsi_fn, spmv_fn) are marked non-pytree to prevent
-    redundant JIT recompilation during optimization loops.
+    Mutable optimization trajectory state.
+    
+    Encapsulates neural parameters, optimizer internals (e.g., Adam moments),
+    and iteration counter.
     """
-    space: SpaceRep = flax.struct.field(pytree_node=False)
-    feat_s: jnp.ndarray
-    feat_c: jnp.ndarray
-  
-    ham_opt: HamOp = flax.struct.field(pytree_node=False)
-    ham_sc: HamOp = flax.struct.field(pytree_node=False)
-  
-    # Non-pytree closures for stable JIT caching
-    logpsi_fn: LogPsiFn = flax.struct.field(pytree_node=False)
-    spmv_fn: SpMVFn = flax.struct.field(pytree_node=False)
-  
-    e_ref: float = flax.struct.field(pytree_node=False)
-    e_nuc: float = flax.struct.field(pytree_node=False)
-    mode: ComputeMode = flax.struct.field(pytree_node=False)
+    params: PyTree
+    opt_state: PyTree
+    step: int = 0
 
-
-# ============================================================================
-# Inner Cycle State (Mutable)
-# ============================================================================
-
-@flax.struct.dataclass
-class InnerState:
-    """
-    Inner loop optimization state.
-  
-    Tracks neural parameters θ, optimizer state, and iteration counter.
-    """
-    params: PyTree                # Neural network parameters θ
-    opt_state: PyTree             # Optimizer internal state
-    step: int = 0                 # Iteration counter
-
-
-# ============================================================================
-# Geometry Information
-# ============================================================================
 
 @flax.struct.dataclass
 class GeometryTape:
     """
-    Linearization tape for QGT computation via implicit differentiation.
-  
-    Captures Jacobian structure at current parameters θ. Enables efficient
-    gradient and natural gradient computation without redundant forward passes.
-    All closures are pure JAX functions with stable compilation footprint.
-  
-    Attributes:
-        jvp_fn: Forward-mode product v → J @ v
-        vjp_fn: Reverse-mode product c → J^T @ c
-        log_psi: Wavefunction logarithm log ψ(θ)
-        weights: Normalized probability |ψ|²/||ψ||²
-        centered_mean: Parameter-wise mean ⟨∂_k log ψ⟩ for centering
+    Linearization context for quantum geometric tensor (QGT) computation.
+    
+    Records JVP/VJP functions from forward pass for efficient natural
+    gradient: (F + λI)^{-1} · ∇E, where F_ij = Re⟨∂_i ψ|∂_j ψ⟩.
     """
     jvp_fn: JVPFn = flax.struct.field(pytree_node=False)
     vjp_fn: VJPFn = flax.struct.field(pytree_node=False)
@@ -185,40 +142,97 @@ class GeometryTape:
 
 
 # ============================================================================
-# Computation Results
+# Computation Results Layer
 # ============================================================================
 
 @flax.struct.dataclass
 class Contractions:
     """
-    Hamiltonian-wavefunction products for energy/gradient evaluation.
-  
-    Block structure: n_ij = H_ij·ψ_j for i,j ∈ {S,C}
-    Optional blocks depend on ComputeMode setting.
+    Block-wise Hamiltonian-wavefunction products: n_ij = ∑_k H_ik · ψ_k.
+    
+    Notation: n_ss = H_SS·ψ_S, n_sc = H_SC·ψ_C, etc.
+    C-space blocks optional for S-only computations.
     """
-    n_ss: jnp.ndarray                        # H_SS·ψ_S (always present)
-    n_sc: jnp.ndarray | None = None          # H_SC·ψ_C (mode-dependent)
-    n_cs: jnp.ndarray | None = None          # H_CS·ψ_S
-    n_cc: jnp.ndarray | None = None          # H_CC·ψ_C
+    n_ss: jnp.ndarray
+    n_sc: jnp.ndarray | None = None
+    n_cs: jnp.ndarray | None = None
+    n_cc: jnp.ndarray | None = None
 
 
 class StepResult(NamedTuple):
-    """Single optimization step output."""
-    state: InnerState             # Updated state (params, opt_state, step+1)
-    energy: jnp.ndarray           # Scalar energy ⟨ψ|H|ψ⟩/⟨ψ|ψ⟩
+    """Single optimization step output: updated state and energy."""
+    state: OptState
+    energy: jnp.ndarray
 
 
 class GradResult(NamedTuple):
-    """Energy and parameter gradient pair."""
-    grad: PyTree                  # Parameter gradient ∇_θ E(θ)
-    energy: jnp.ndarray           # Energy E(θ)
+    """Energy functional gradient: (∇_θ E, E(θ))."""
+    grad: PyTree
+    energy: jnp.ndarray
 
 
 class ScoreResult(NamedTuple):
-    """Scored determinant container for importance sampling."""
-    scores: np.ndarray            # Importance scores per determinant
-    dets: np.ndarray              # Determinant bitmasks
-    meta: dict                    # Additional metadata
+    """Scored determinant batch for space evolution."""
+    scores: np.ndarray
+    dets: np.ndarray
+    meta: dict
+
+
+# ============================================================================
+# Workflow Layer
+# ============================================================================
+
+@flax.struct.dataclass
+class Workspace:
+    """
+    Immutable compilation artifact for fixed Hilbert space.
+    
+    Contains JIT-compiled closures (log_psi, spmv_fn) and precomputed
+    features/Hamiltonians. Compiled once per cycle; reused across steps
+    via functional transformations.
+    """
+    space: SpaceRep = flax.struct.field(pytree_node=False)
+    feat_s: jnp.ndarray
+    feat_c: jnp.ndarray
+    
+    ham_opt: HamOp = flax.struct.field(pytree_node=False)
+    ham_sc: HamOp = flax.struct.field(pytree_node=False)
+    
+    log_psi: Callable = flax.struct.field(pytree_node=False)
+    spmv_fn: Callable = flax.struct.field(pytree_node=False)
+    
+    e_ref: float = flax.struct.field(pytree_node=False)
+    e_nuc: float = flax.struct.field(pytree_node=False)
+    mode: ComputeMode = flax.struct.field(pytree_node=False)
+
+
+@dataclass(frozen=True)
+class FitResult:
+    """
+    Complete optimization cycle output.
+    
+    Records converged parameters, energy trajectory, final wavefunction,
+    and convergence diagnostics.
+    """
+    params: PyTree
+    energy_trace: list[float]
+    psi_cache: PsiCache
+    converged: bool
+    steps: int
+
+
+@dataclass(frozen=True)
+class EvolutionState:
+    """
+    Minimal persistent state for iterative space evolution.
+    
+    Pure data container; state transitions handled by Controller.
+    Tracks current S-space basis, optimized parameters, and cycle metadata.
+    """
+    s_dets: np.ndarray
+    params: PyTree
+    e_ref: float | None
+    cycle: int
 
 
 # ============================================================================
@@ -233,18 +247,24 @@ __all__ = [
     "JVPFn",
     "VJPFn",
     "OptimizerState",
-  
-    # Data structures
+    
+    # Physical
     "HamOp",
     "SpaceRep",
     "PsiCache",
-    "OuterCtx",
-    "InnerState",
+    
+    # Optimizer
+    "OptState",
     "GeometryTape",
-  
-    # Result containers
+    
+    # Results
     "Contractions",
     "StepResult",
     "GradResult",
     "ScoreResult",
+    
+    # Workflow
+    "Workspace",
+    "FitResult",
+    "EvolutionState",
 ]

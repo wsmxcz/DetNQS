@@ -7,7 +7,7 @@ Closure factory for batch log(ψ) and SpMV operations.
 Creates pure JAX callables with captured constants (COO matrices, shapes)
 for efficient JIT compilation and scan loops.
 
-File: lever/engine/evaluator.py
+File: lever/engine/operator.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """

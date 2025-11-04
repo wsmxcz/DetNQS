@@ -6,7 +6,7 @@ JIT-compiled VMC optimization step kernels.
 
 Implements mode-specific energy/gradient calculations:
   - EFFECTIVE:  E = ⟨ψ_S|H_eff|ψ_S⟩ / ‖ψ_S‖²
-  - PROXY:      E = ⟨ψ|H_proxy|ψ⟩ / ‖ψ‖²
+  - PROXY:      E = ⟨ψ|H_proxy|ψ⟩ / ‖ψ‖²  
   - ASYMMETRIC: E = ⟨ψ_S|H|ψ⟩ / ‖ψ_S‖²
 
 File: lever/engine/step.py
@@ -32,10 +32,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from ..utils.dtypes import Workspace, PyTree
 
-
-# ============================================================================
-# Mode-Specific Kernel Factory
-# ============================================================================
 
 class ModeKernel:
     """Factory for mode-specific energy/gradient computation kernels."""
@@ -68,18 +64,12 @@ class ModeKernel:
         return factory_fn(workspace, num_eps)
 
 
-# ============================================================================
-# EFFECTIVE Mode Kernel
-# ============================================================================
-
 def _make_eff_kernel(workspace: Workspace, num_eps: float) -> Callable:
     """
     S-space energy and gradient with effective Hamiltonian.
   
     Energy:   E = ⟨ψ_S|H_eff|ψ_S⟩ / ‖ψ_S‖²
     Gradient: ∇E = 2 Re[⟨O_k (E_loc - E)⟩]  (variance-reduced form)
-  
-    where O_k = ∂log(ψ)/∂θ_k is the log-derivative feature.
     """
     spmv_fn = workspace.spmv_fn
     e_nuc = workspace.e_nuc
@@ -115,18 +105,11 @@ def _make_eff_kernel(workspace: Workspace, num_eps: float) -> Callable:
     return energy_grad_fn
 
 
-# ============================================================================
-# PROXY Mode Kernel
-# ============================================================================
-
 def _make_proxy_kernel(workspace: Workspace, num_eps: float) -> Callable:
     """
     Full T-space energy and gradient with proxy Hamiltonian.
   
     Energy: E = (⟨ψ_S|N_S⟩ + ⟨ψ_C|N_C⟩) / (‖ψ_S‖² + ‖ψ_C‖²)
-  
-    Uses block structure: N = H_proxy @ ψ = [H_SS @ ψ_S + H_SC @ ψ_C]
-                                              [H_CS @ ψ_S + H_CC @ ψ_C]
     """
     n_s = workspace.space.n_s
     spmv_fn = workspace.spmv_fn
@@ -170,134 +153,115 @@ def _make_proxy_kernel(workspace: Workspace, num_eps: float) -> Callable:
     return energy_grad_fn
 
 
-# ============================================================================
-# ASYMMETRIC Mode Kernel
-# ============================================================================
-
 def _make_asym_kernel(workspace: Workspace, num_eps: float) -> Callable:
-    """
-    Asymmetric measure: S-space normalization with full T-space Hamiltonian.
-  
-    Energy: E = ⟨ψ_S|H|ψ⟩ / ‖ψ_S‖²
-  
-    Requires full wavefunction for SpMV but only S-space norm.
-    """
+    """Asymmetric kernel with external full-space evaluator"""
     n_s, n_c = workspace.space.n_s, workspace.space.n_c
     spmv_fn = workspace.spmv_fn
     e_nuc = workspace.e_nuc
-  
-    # Select full-space log(ψ) for SpMV
-    logpsi_full_fn = (workspace.log_psi[1] if isinstance(workspace.log_psi, tuple)
-                      else workspace.log_psi)
-  
-    def energy_grad_fn(params: PyTree, tape: GeometryTape) -> GradResult:
-        # Full wavefunction for Hamiltonian action
+    
+    def energy_grad_fn(
+        params: PyTree,
+        tape: GeometryTape,
+        logpsi_full_fn: Callable
+    ) -> GradResult:
+        # Full wavefunction for SpMV (S∪C normalization)
         log_psi_full = logpsi_full_fn(params)
         psi_all = jnp.exp(log_psi_full)
         psi_s, psi_c = psi_all[:n_s], psi_all[n_s:]
-      
+        
         # SpMV: N = H @ [ψ_S; ψ_C]
         N = spmv_fn(psi_s, psi_c)
-      
-        # Energy: E = ⟨ψ_S|N_S⟩ / ⟨ψ_S|ψ_S⟩
+        
+        # Energy: E = ⟨ψ_S|N_S⟩ / ⟨ψ_S|ψ_S⟩ (S-space normalization)
         numerator = jnp.vdot(psi_s, N.n_ss + N.n_sc)
         denominator = jnp.vdot(psi_s, psi_s)
         energy = (numerator / jnp.maximum(denominator, num_eps)).real
-      
-        # Local energy on S-space only
+        
+        # Local energy on S-space with tape from S-normalized logψ
         e_loc_s = jnp.where(
             jnp.abs(psi_s) >= num_eps,
             (N.n_ss + N.n_sc) / psi_s,
             0.0
         )
-      
-        # S-space cotangent with tape weights
+        
         cotangent = tape.weights * (e_loc_s - energy)
         cotangent = jnp.asarray(cotangent, dtype=tape.log_psi.dtype)
-      
+        
         (grad_conj,) = tape.vjp_fn(jnp.conj(cotangent))
         gradient = jax.tree.map(jnp.conj, grad_conj)
-      
+        
         return GradResult(grad=gradient, energy=energy + e_nuc)
-  
+    
     return energy_grad_fn
 
-
-# ============================================================================
-# Optimization Step Factory
-# ============================================================================
 
 def create_step_fn(
     workspace: Workspace,
     optimizer,
     num_eps: float
-) -> Callable[[OptState, None], tuple[OptState, jnp.ndarray]]:
+) -> Callable[[OptState, jnp.ndarray, jnp.ndarray], tuple[OptState, jnp.ndarray]]:
     """
-    Create single VMC optimization step.
-  
-    Workflow:
-      1. Build linearization tape (VJP + weights)
-      2. Compute energy and gradient
-      3. Update parameters with optimizer
-  
-    Args:
-        workspace: Precompiled operators
-        optimizer: Optax or LEVER optimizer
-        num_eps: Numerical stability threshold
-  
-    Returns:
-        Pure function: (state, _) → (new_state, energy)
+    Create JIT-compiled step with features as arguments.
+    
+    Signature: (state, feat_s, feat_c) → (new_state, energy)
+    Features are passed as JIT args to avoid constant folding.
     """
     is_lever_opt = isinstance(optimizer, LeverOptimizer)
     energy_grad_fn = ModeKernel.make(workspace, num_eps)
-  
-    # Select log(ψ) for tape construction based on mode
-    if workspace.mode in (ComputeMode.EFFECTIVE, ComputeMode.ASYMMETRIC):
-        tape_logpsi_fn = (workspace.log_psi[0] if isinstance(workspace.log_psi, tuple)
-                          else workspace.log_psi)
-    else:
-        tape_logpsi_fn = workspace.log_psi
-  
-    def _step(state: OptState, _unused) -> tuple[OptState, jnp.ndarray]:
-        # Phase 1: Linearization tape
+    logpsi_evals = workspace.log_psi
+    
+    def _step(
+        state: OptState,
+        feat_s: jnp.ndarray,
+        feat_c: jnp.ndarray
+    ) -> tuple[OptState, jnp.ndarray]:
+        # Bind features inside JIT (tracers, not Python constants)
+        if isinstance(logpsi_evals, tuple):
+            eval_s, eval_full = logpsi_evals
+            logpsi_opt = lambda p: eval_s(p, feat_s)
+            logpsi_full = lambda p: eval_full(p, feat_s, feat_c)
+        else:
+            eval_full = logpsi_evals
+            logpsi_full = lambda p: eval_full(p, feat_s, feat_c)
+            logpsi_opt = logpsi_full
+        
+        # Select logψ for tape construction
+        tape_logpsi_fn = (
+            logpsi_opt if workspace.mode in (ComputeMode.EFFECTIVE, ComputeMode.ASYMMETRIC)
+            else logpsi_full
+        )
+        
+        # Phase 1: Build geometry tape
         tape = prepare_tape(state.params, tape_logpsi_fn, num_eps)
-      
+        
         # Phase 2: Energy and gradient
-        result = energy_grad_fn(state.params, tape)
-      
+        if workspace.mode == ComputeMode.ASYMMETRIC:
+            result = energy_grad_fn(state.params, tape, logpsi_full)
+        else:
+            result = energy_grad_fn(state.params, tape)
+        
         # Phase 3: Parameter update
         if is_lever_opt:
-            # LEVER optimizers require tape for QGT construction
             updates, new_opt_state = optimizer.update(
-                result.grad,
-                state.opt_state,
-                state.params,
-                tape=tape,
-                energy=result.energy
+                result.grad, state.opt_state, state.params,
+                tape=tape, energy=result.energy
             )
         else:
-            # Standard Optax optimizer
             updates, new_opt_state = optimizer.update(
-                result.grad,
-                state.opt_state,
-                state.params
+                result.grad, state.opt_state, state.params
             )
-      
+        
         new_params = optax.apply_updates(state.params, updates)
         new_state = OptState(
             params=new_params,
             opt_state=new_opt_state,
             step=state.step + 1
         )
-      
+        
         return new_state, result.energy
-  
-    return _step
+    
+    return jax.jit(_step, donate_argnums=(0,))
 
-
-# ============================================================================
-# Multi-Step Scan Factory
-# ============================================================================
 
 def create_scan_fn(
     workspace: Workspace,
@@ -314,7 +278,6 @@ def create_scan_fn(
   
     Returns:
         Pure function: (state, n_steps) → (final_state, energies)
-        where energies has shape [n_steps]
     """
     step_fn = create_step_fn(workspace, optimizer, num_eps)
   
@@ -328,7 +291,6 @@ def create_scan_fn(
         )
         return final_state, energies
   
-    # JIT with static n_steps for optimal XLA compilation
     return jax.jit(_scan_wrapper, static_argnums=(1,))
 
 

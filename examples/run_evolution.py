@@ -40,8 +40,8 @@ def main():
     
     # ========== Loop Control ==========
     loop_cfg = config.LoopConfig(
-        max_cycles=30,
-        max_steps=1000,
+        max_cycles=10,
+        max_steps=500,
     )
     
     # ========== Evaluation Configuration ==========
@@ -69,7 +69,7 @@ def main():
         n_dets=1,
         generalized=True,
         restricted=False,
-        hidden_dims=(32,),
+        hidden_dims=(256,),
         param_dtype=jnp.complex64 
     )
     
@@ -96,7 +96,7 @@ def main():
     # ========== Evolution Strategy ==========
     evo_strategy = evolution.BasicStrategy(
         scorer=evolution.scores.AmpScorer(),
-        selector=evolution.selectors.TopKSelector(k=3200)
+        selector=evolution.selectors.TopKSelector(k=400)
     )
 
     # ========== Run LEVER Workflow ==========

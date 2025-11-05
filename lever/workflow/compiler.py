@@ -189,7 +189,8 @@ class Compiler:
             model_fn=self.model.log_psi,
             mode=mode,
             normalize=self.cfg.normalize_wf,
-            device_complex=self.cfg.precision.jax_complex
+            device_complex=self.cfg.precision.jax_complex,
+            chunk_size=self.cfg.loop.chunk_size
         )
     
     def _create_spmv_fn(self, ham_opt, ham_sc, space, mode):

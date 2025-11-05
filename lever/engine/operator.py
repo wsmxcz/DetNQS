@@ -5,7 +5,7 @@
 Closure factory for batch log(ψ) and SpMV operations.
 
 Creates pure JAX callables with captured constants for efficient JIT compilation.
-Optimized to avoid constant folding by passing features as function arguments.
+Supports memory-efficient chunked inference for large determinant spaces.
 
 File: lever/engine/operator.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Callable, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 import numpy as np
 
 from ..utils.dtypes import Contractions, LogPsiFn, SpMVFn
@@ -29,6 +30,43 @@ if TYPE_CHECKING:
 
 
 # ============================================================================
+# Chunked Inference Utilities
+# ============================================================================
+
+def _pad_to_fixed_chunks(
+    x: jnp.ndarray,
+    chunk_size: int
+) -> tuple[jnp.ndarray, jnp.ndarray, int]:
+    """
+    Pad array to multiple of chunk_size with static shape.
+    
+    Args:
+        x: Input features (n_samples, feat_dim)
+        chunk_size: Fixed chunk size for batching
+    
+    Returns:
+        batched: (n_chunks, chunk_size, feat_dim) - padded and reshaped
+        mask: (n_chunks, chunk_size) - 1 for real samples, 0 for padding
+        n_real: Original sample count before padding
+    """
+    n_real = x.shape[0]
+    remainder = n_real % chunk_size
+    n_pad = (chunk_size - remainder) if remainder else 0
+    
+    if n_pad > 0:
+        x = jnp.pad(x, ((0, n_pad), (0, 0)))
+    
+    n_chunks = x.shape[0] // chunk_size
+    x_batched = x.reshape(n_chunks, chunk_size, x.shape[1])
+    
+    # Build mask: 1 for valid samples, 0 for padding
+    mask = jnp.arange(n_chunks * chunk_size) < n_real
+    mask = mask.reshape(n_chunks, chunk_size)
+    
+    return x_batched, mask, n_real
+
+
+# ============================================================================
 # Log(ψ) Closure Factory
 # ============================================================================
 
@@ -36,26 +74,75 @@ def create_logpsi_evals(
     model_fn: Callable,
     mode: ComputeMode,
     normalize: bool,
-    device_complex: jnp.dtype
+    device_complex: jnp.dtype,
+    *,
+    chunk_size: int | None = None,
 ) -> Union[Tuple[LogPsiFn, LogPsiFn], LogPsiFn]:
     """
-    Create log(ψ) evaluators without capturing feature matrices.
+    Create log(ψ) evaluators with optional memory-efficient chunking.
     
-    Avoids constant folding during JIT compilation by taking features as arguments.
+    Supports two execution modes:
+      - Small batch: Direct evaluation via single vmap
+      - Large batch: Chunked evaluation via lax.scan (controlled memory)
     
     Args:
-        model_fn: Neural network forward pass
+        model_fn: Neural network forward pass (batch-aware)
         mode: Compute mode (EFFECTIVE/ASYMMETRIC/PROXY)
         normalize: Apply log-domain normalization
         device_complex: Output dtype (jnp.complex64/128)
+        chunk_size: If set, process features in fixed-size batches
     
     Returns:
         For EFFECTIVE/ASYMMETRIC: (eval_s, eval_full) tuple
         For PROXY: eval_full function
     """
     
+    def _batch_apply(params: PyTree, features: jnp.ndarray) -> jnp.ndarray:
+        """
+        Vectorized model application: (batch, feat_dim) → (batch,)
+        
+        Directly calls model_fn which already handles batching internally.
+        """
+        outputs = model_fn(params, features)
+        return jnp.asarray(outputs, dtype=device_complex)
+    
+    def _chunked_apply(params: PyTree, features: jnp.ndarray) -> jnp.ndarray:
+        """
+        Memory-efficient chunked inference (no normalization).
+        
+        Processes large batches in fixed-size chunks via lax.scan,
+        returning raw log(ψ) values. Normalization handled by caller.
+        
+        Returns:
+            Raw log(ψ) for all samples: (n_samples,)
+        """
+        n_samples = features.shape[0]
+        
+        # Fast path: small enough for single batch
+        if chunk_size is None or n_samples <= chunk_size:
+            return _batch_apply(params, features)
+        
+        # Prepare fixed-size chunks with padding mask
+        feat_batched, mask_batched, n_real = _pad_to_fixed_chunks(
+            features, chunk_size
+        )
+        
+        # Generate outputs chunk-by-chunk
+        def process_chunk(carry, inputs):
+            feat_chunk, _ = inputs
+            log_chunk = _batch_apply(params, feat_chunk)
+            return carry, log_chunk
+        
+        _, outputs_batched = lax.scan(
+            process_chunk,
+            None,
+            (feat_batched, mask_batched)
+        )
+        
+        return outputs_batched.reshape(-1)[:n_real]
+    
     def _norm_s(log_s: jnp.ndarray) -> jnp.ndarray:
-        """Normalize S-space: log(ψ) - 0.5 * log(‖ψ_S‖²)"""
+        """S-space normalization: log(ψ) - 0.5 * log(‖ψ_S‖²)"""
         if not normalize:
             return log_s
         log_norm_sq = jax.scipy.special.logsumexp(2.0 * jnp.real(log_s))
@@ -63,7 +150,7 @@ def create_logpsi_evals(
         return log_s - 0.5 * log_norm_sq
     
     def _norm_full(log_all: jnp.ndarray, n_s: int) -> jnp.ndarray:
-        """Normalize full T-space: log(ψ) - 0.5 * log(‖ψ_S‖² + ‖ψ_C‖²)"""
+        """Full T-space normalization: log(ψ) - 0.5 * log(‖ψ_S‖² + ‖ψ_C‖²)"""
         if not normalize:
             return log_all
         log_s = jax.scipy.special.logsumexp(2.0 * jnp.real(log_all[:n_s]))
@@ -73,17 +160,17 @@ def create_logpsi_evals(
         return log_all - 0.5 * log_norm_sq
     
     def eval_s(params: PyTree, feat_s: jnp.ndarray) -> jnp.ndarray:
-        """Evaluate S-space only with S-normalization."""
-        log_s = model_fn(params, feat_s)
+        """Evaluate S-space with optional chunking and S-normalization."""
+        log_s = _chunked_apply(params, feat_s)  # Raw outputs
         log_s = jnp.asarray(log_s, dtype=device_complex)
-        return _norm_s(log_s)
+        return _norm_s(log_s)  # Apply normalization once
     
     def eval_full(params: PyTree, feat_s: jnp.ndarray, feat_c: jnp.ndarray) -> jnp.ndarray:
-        """Evaluate full T-space with full normalization."""
+        """Evaluate full T-space with optional chunking and full normalization."""
         all_feat = jnp.concatenate([feat_s, feat_c], axis=0)
-        log_all = model_fn(params, all_feat)
+        log_all = _chunked_apply(params, all_feat)  # Raw outputs
         log_all = jnp.asarray(log_all, dtype=device_complex)
-        return _norm_full(log_all, feat_s.shape[0])
+        return _norm_full(log_all, feat_s.shape[0])  # Apply normalization once
     
     if mode in (ComputeMode.EFFECTIVE, ComputeMode.ASYMMETRIC):
         return (eval_s, eval_full)

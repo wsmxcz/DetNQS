@@ -147,6 +147,7 @@ class LoopConfig:
         step_tol: Energy convergence threshold for steps
         check_interval: Steps between convergence checks
         s_space_size: Target S-space dimension after evolution
+        chunk_size: Batch size for chunked inference (None = no chunking)
     """
     max_cycles: int = 10
     cycle_tol: float = 1e-5
@@ -155,6 +156,7 @@ class LoopConfig:
     step_tol: float = 1e-6
     check_interval: int = 50
     s_space_size: int = 200
+    chunk_size: int | None = None
 
 
 @dataclass(frozen=True)

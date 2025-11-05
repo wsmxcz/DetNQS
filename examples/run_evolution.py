@@ -24,10 +24,10 @@ jax.config.update("jax_log_compiles", False)
 def main():
     # ========== System Definition ==========
     sys_cfg = config.SystemConfig(
-        fcidump_path="../benchmark/FCIDUMP/H2O_631g.FCIDUMP",
-        n_orbitals=13,
-        n_alpha=5,
-        n_beta=5
+        fcidump_path="../benchmark/FCIDUMP/C3H8_sto3g.FCIDUMP",
+        n_orbitals=23,
+        n_alpha=13,
+        n_beta=13
     )
     
     # ========== Hamiltonian Configuration ==========
@@ -40,13 +40,14 @@ def main():
     
     # ========== Loop Control ==========
     loop_cfg = config.LoopConfig(
-        max_cycles=10,
-        max_steps=500,
+        max_cycles=20,
+        max_steps=1000,
+        chunk_size=8192
     )
     
     # ========== Evaluation Configuration ==========
     eval_cfg = config.EvaluationConfig(
-        var_energy_mode=config.EvalMode.FINAL,
+        var_energy_mode=config.EvalMode.NEVER,
         s_ci_energy_mode=config.EvalMode.FINAL,
         t_ci_energy_mode=config.EvalMode.NEVER
     )
@@ -96,7 +97,7 @@ def main():
     # ========== Evolution Strategy ==========
     evo_strategy = evolution.BasicStrategy(
         scorer=evolution.scores.AmpScorer(),
-        selector=evolution.selectors.TopKSelector(k=400)
+        selector=evolution.selectors.TopKSelector(k=3200)
     )
 
     # ========== Run LEVER Workflow ==========

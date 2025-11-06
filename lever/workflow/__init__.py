@@ -7,7 +7,6 @@ LEVER workflow orchestration.
 Provides three-layer architecture:
   - Compiler: Build Workspace from S-space
   - Fitter: Optimize parameters via gradient descent
-  - Controller: Orchestrate evolution cycles
 
 File: lever/workflow/__init__.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com

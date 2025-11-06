@@ -26,13 +26,6 @@ import numpy as np
 # Enumeration Types
 # ============================================================================
 
-class EvalMode(str, Enum):
-    """Energy evaluation timing: never, final cycle only, or every step."""
-    NEVER = "never"
-    FINAL = "final"
-    EVERY = "every"
-
-
 class ScreenMode(str, Enum):
     """C-space screening strategy: disabled, static threshold, or dynamic."""
     NONE = "none"
@@ -149,20 +142,6 @@ class LoopConfig:
     # Optional batch processing
     chunk_size: int | None = None     # Gradient accumulation chunk size
 
-@dataclass(frozen=True)
-class EvaluationConfig:
-    """
-    Energy diagnostic timing control.
-    
-    Attributes:
-        var_energy_mode: Variational energy E = ⟨ψ|H|ψ⟩ / ⟨ψ|ψ⟩
-        t_ci_energy_mode: Full T-space CI energy
-        s_ci_energy_mode: S-space CI energy
-    """
-    var_energy_mode: EvalMode = EvalMode.FINAL
-    t_ci_energy_mode: EvalMode = EvalMode.NEVER
-    s_ci_energy_mode: EvalMode = EvalMode.FINAL
-
 
 @dataclass(frozen=True)
 class LeverConfig:
@@ -173,7 +152,6 @@ class LeverConfig:
       - system: Physical problem specification
       - hamiltonian: Matrix construction rules
       - loop: Optimization iteration control
-      - evaluation: Energy diagnostic timing
     
     Attributes:
         compute_mode: Hamiltonian contraction algorithm
@@ -186,7 +164,6 @@ class LeverConfig:
     system: SystemConfig
     hamiltonian: HamiltonianConfig
     loop: LoopConfig
-    evaluation: EvaluationConfig
     
     compute_mode: ComputeMode = ComputeMode.PROXY
     seed: int = 42
@@ -202,13 +179,11 @@ class LeverConfig:
 
 
 __all__ = [
-    "EvalMode",
     "ScreenMode",
     "ComputeMode",
     "PrecisionConfig",
     "SystemConfig",
     "HamiltonianConfig",
     "LoopConfig",
-    "EvaluationConfig",
     "LeverConfig",
 ]

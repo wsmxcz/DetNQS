@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LEVER workflow driver with simplified outer loop convergence.
+LEVER workflow driver with sliding-window convergence detection.
+
+Convergence criterion: ∀i ∈ [k-p, k]: |E_i - E_{i-1}| < τ
+where p = patience, τ = tolerance, k = current cycle.
 
 File: lever/driver.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -18,7 +21,7 @@ import numpy as np
 
 from . import core
 from .analysis import EnergyEvaluator
-from .config import ComputeMode, EvalMode
+from .config import ComputeMode
 from .dtypes import LeverResult, OuterState
 from .engine import hamiltonian
 from .utils.logger import get_logger
@@ -33,11 +36,9 @@ if TYPE_CHECKING:
 
 class Driver:
     """
-    LEVER workflow orchestrator.
+    LEVER evolutionary workflow orchestrator.
     
-    Manages evolutionary cycles with sliding-window convergence detection:
-      - Compile → Fit (fixed steps) → Diagnose → Evolve
-      - Converge when: all recent outer_patience cycles have ΔE < outer_tol
+    Executes iterative cycles: Compile → Fit → Evolve until convergence.
     """
 
     def __init__(
@@ -47,7 +48,6 @@ class Driver:
         strategy: EvolutionStrategy,
         optimizer
     ):
-        """Initialize driver with workflow components."""
         self.cfg = config
         self.model = model
         self.strategy = strategy
@@ -61,7 +61,7 @@ class Driver:
         )
         self.int_ctx.hb_prepare(threshold=1e-15)
         
-        # Workflow components
+        # Build workflow components
         self.compiler = Compiler(
             config=self.cfg,
             model=self.model,
@@ -79,15 +79,62 @@ class Driver:
             n_orb=self.cfg.system.n_orbitals,
             e_nuc=self.int_ctx.get_e_nuc()
         )
-    
-    def run(self) -> LeverResult:
-        """
-        Execute LEVER workflow with outer-loop sliding window convergence.
+
+    def _print_cycle_header(self, cycle: int, max_cycles: int, comp_diag: dict):
+        print(self.logger._blue(f"Cycle {cycle}/{max_cycles}"))
         
-        Convergence criterion:
-          - Track last outer_patience+1 cycle energies
-          - Stop if all deltas < outer_tol for outer_patience consecutive cycles
+        if comp_diag['bootstrap_range'] is not None:
+            min_val, max_val = comp_diag['bootstrap_range']
+            print(f"Bootstrap: [{min_val:.6f}, {max_val:.6f}]")
+        
+        n_s, n_c = comp_diag['n_s'], comp_diag['n_c']
+        nnz_ss, nnz_sc = comp_diag['nnz_ss'], comp_diag['nnz_sc']
+        density = 100.0 * nnz_ss / (n_s * n_s) if n_s > 0 else 0.0
+        
+        ham_info = f"{comp_diag['ham_label']}: {nnz_ss} nnz ({density:.1f}%)"
+        if nnz_sc is not None:
+            ham_info += f", H_SC: {nnz_sc} nnz"
+        
+        print(f"Space: S={n_s}, C={n_c} | {ham_info}")
+        
+    def _print_cycle_summary(
+        self,
+        psi_s_norm_sq: float,
+        psi_c_norm_sq: float,
+        energy: float,
+        steps: int,
+        time_elapsed: float
+    ):
+        print(f"‖ψ_S‖²={psi_s_norm_sq:.4f}, ‖ψ_C‖²={psi_c_norm_sq:.4f}")
+        e_str = self.logger._blue(f"E = {energy:.10f}")
+        print(f"{e_str} | Steps = {steps:4d} | Time = {time_elapsed:.2f}s")
+
+    def _check_convergence(
+        self,
+        recent_energies: list[float],
+        patience: int,
+        tol: float
+    ) -> tuple[bool, float]:
         """
+        Sliding-window convergence test: max|ΔE| < τ over last p cycles.
+        
+        Returns:
+            (converged, max_delta)
+        """
+        if len(recent_energies) <= patience:
+            return False, float('inf')
+        
+        deltas = [
+            abs(recent_energies[i] - recent_energies[i-1])
+            for i in range(-patience, 0)
+        ]
+        
+        max_delta = max(deltas)
+        converged = max_delta < tol
+        
+        return converged, max_delta
+
+    def run(self) -> LeverResult:
         self._print_header()
         
         state = self._initialize_state()
@@ -98,64 +145,63 @@ class Driver:
         patience = self.cfg.loop.outer_patience
         tol = self.cfg.loop.outer_tol
         
-        # Sliding window of recent cycle energies
         recent_energies = []
         converged = False
         
         for cycle in range(max_outer):
             cycle_start = time.time()
             
-            # Compile → Fit
-            ctx = self.compiler.compile(state)
+            # Compile: generate S/C spaces and Hamiltonian
+            ctx, comp_diag = self.compiler.compile(state)
+            self._print_cycle_header(cycle + 1, max_outer, comp_diag)
+            
+            # Fit: inner-loop optimization
             result = self.fitter.fit(ctx, state.params, self.optimizer)
+            
+            # Compute wavefunction cache diagnostics
+            psi_s = result.psi_cache.psi_s
+            psi_c = result.psi_cache.psi_c
+            psi_s_norm_sq = float(np.sum(np.abs(psi_s)**2))
+            psi_c_norm_sq = float(np.sum(np.abs(psi_c)**2))
             
             final_energy = result.energy_trace[-1]
             inner_steps = len(result.energy_trace)
             cycle_time = time.time() - cycle_start
             
-            # Update history
+            self._print_cycle_summary(
+                psi_s_norm_sq, psi_c_norm_sq,
+                final_energy, inner_steps, cycle_time
+            )
+            
             history.append_energies(result.energy_trace)
             recent_energies.append(final_energy)
             
-            # Print cycle summary
-            print(
-                f"Cycle {cycle+1:3d}/{max_outer} | "
-                f"E = {final_energy:.10f} | "
-                f"Steps = {inner_steps:4d} | "
-                f"Time = {cycle_time:.2f}s"
+            # Check convergence
+            converged, max_delta = self._check_convergence(
+                recent_energies, patience, tol
             )
             
-            # Diagnose (if configured)
-            is_final = (cycle == max_outer - 1)
-            if self._should_diagnose(cycle, is_final):
-                self._evaluate_diagnostics(ctx, result, history)
+            if converged:
+                self.logger.converged(cycle + 1, max_delta)
+                state = self._update_state(state, result, ctx, evolve=False)
+                break
             
-            # Check convergence: need patience+1 energies to compute patience deltas
-            if len(recent_energies) > patience:
-                deltas = [
-                    abs(recent_energies[i] - recent_energies[i-1])
-                    for i in range(-patience, 0)
-                ]
-                
-                if all(d < tol for d in deltas):
-                    print(f"Outer loop converged at cycle {cycle+1}")
-                    converged = True
-                    state = self._update_state(state, result, ctx, evolve=False)
-                    break
-                
-                # Trim window to size patience+1
+            # Trim history window
+            if len(recent_energies) > patience + 1:
                 recent_energies = recent_energies[-(patience+1):]
             
-            # Evolve to next cycle
             state = self._update_state(state, result, ctx, evolve=True)
+            
+            if cycle < max_outer - 1:
+                self.logger.separator()
         
         if not converged:
-            print(f"Reached maximum outer cycles ({max_outer})")
+            self.logger.max_cycles_reached(max_outer)
         
         return self._finalize_results(state, history, time.time() - t0)
     
     def _initialize_state(self) -> OuterState:
-        """Create initial state from Hartree-Fock determinant."""
+        """Bootstrap from Hartree-Fock determinant."""
         sys = self.cfg.system
         hf_det = np.array([
             [(1 << sys.n_alpha) - 1, (1 << sys.n_beta) - 1]
@@ -168,61 +214,8 @@ class Driver:
             e_ref=None
         )
     
-    def _should_diagnose(self, cycle: int, is_final: bool) -> bool:
-        """Check if diagnostics needed: EVERY or FINAL mode."""
-        eval_cfg = self.cfg.evaluation
-        
-        modes = [
-            eval_cfg.var_energy_mode,
-            eval_cfg.s_ci_energy_mode,
-            eval_cfg.t_ci_energy_mode
-        ]
-        
-        return any(
-            mode == EvalMode.EVERY or (mode == EvalMode.FINAL and is_final)
-            for mode in modes
-        )
-    
-    def _evaluate_diagnostics(self, ctx, result, history):
-        """Compute VAR, S-CI, T-CI diagnostic energies."""
-        eval_cfg = self.cfg.evaluation
-        
-        # E_VAR: Full-space variational energy
-        if eval_cfg.var_energy_mode != EvalMode.NEVER:
-            t_dets = np.concatenate([ctx.space.s_dets, ctx.space.c_dets])
-            ham_full, _ = hamiltonian.get_ham_ss(
-                S_dets=t_dets,
-                int_ctx=self.int_ctx,
-                n_orbitals=self.cfg.system.n_orbitals
-            )
-            
-            e_var = self.evaluator.variational_energy_from_cache(
-                result.psi_cache, ham_full, t_dets
-            )
-            history.append_diagnostic("var", e_var)
-            self.logger.diagnostic_energy("VAR", e_var)
-        
-        # E_S-CI: Lowest eigenvalue of H_SS or H_eff
-        if eval_cfg.s_ci_energy_mode != EvalMode.NEVER:
-            e_s_ci = self.evaluator.diagonalize(ctx.ham_ss)
-            history.append_diagnostic("s_ci", e_s_ci)
-            self.logger.diagnostic_energy("S-CI", e_s_ci)
-        
-        # E_T-CI: Full-space CI energy
-        if eval_cfg.t_ci_energy_mode != EvalMode.NEVER:
-            t_dets = np.concatenate([ctx.space.s_dets, ctx.space.c_dets])
-            ham_full, _ = hamiltonian.get_ham_ss(
-                S_dets=t_dets,
-                int_ctx=self.int_ctx,
-                n_orbitals=self.cfg.system.n_orbitals
-            )
-            
-            e_t_ci = self.evaluator.diagonalize(ham_full)
-            history.append_diagnostic("t_ci", e_t_ci)
-            self.logger.diagnostic_energy("T-CI", e_t_ci)
-    
     def _update_state(self, state, result, ctx, evolve: bool) -> OuterState:
-        """Update state for next cycle."""
+        """Update parameters and optionally evolve S-space determinants."""
         new_e_ref = self._compute_e_ref(result, ctx)
         
         if not evolve:
@@ -243,26 +236,19 @@ class Driver:
         )
     
     def _compute_e_ref(self, result, ctx) -> float | None:
-        """Compute reference energy for H_eff construction."""
+        """Compute reference energy for effective Hamiltonian shift."""
         if self.cfg.compute_mode != ComputeMode.EFFECTIVE:
             return None
         return result.energy_trace[-1] - ctx.e_nuc
     
     def _print_header(self):
-        """Log workflow configuration."""
-        print(f"\n{'='*60}")
-        print(f"{'LEVER Initialization':^60}")
-        print(f"{'='*60}")
+        self.logger.header("LEVER Initialization")
         
-        config_items = {
-            "Compute mode": self.cfg.compute_mode.value.upper(),
-            "System": self.cfg.system.fcidump_path,
-            "Model": self.model.module.__class__.__name__,
-            "Screening": self.cfg.hamiltonian.screening_mode.value,
-        }
+        print(f"Compute mode        : {self.cfg.compute_mode.value.upper()}")
+        print(f"System              : {self.cfg.system.fcidump_path}")
+        print(f"Model               : {self.model.module.__class__.__name__}")
+        print(f"Screening           : {self.cfg.hamiltonian.screening_mode.value}")
         
-        for key, value in config_items.items():
-            print(f"{key:20s}: {value}")
         print(f"{'='*60}\n")
     
     def _finalize_results(
@@ -271,30 +257,23 @@ class Driver:
         history: _History,
         total_time: float
     ) -> LeverResult:
-        """Package results with full trajectories and timing."""
         final_energy = history.energies[-1] if history.energies else 0.0
         n_cycles = len(history.cycle_bounds) - 1
         
-        print(f"\n{'='*60}")
-        print(f"Final Energy: {final_energy:.10f}")
-        print(f"Total Cycles: {n_cycles}")
-        print(f"Total Time:   {total_time:.2f}s")
-        print(f"{'='*60}\n")
+        self.logger.final_summary(final_energy, n_cycles, total_time)
         
         return LeverResult(
             final_params=state.params,
             final_s_dets=state.s_dets,
             full_energy_history=history.energies,
             cycle_boundaries=history.cycle_bounds,
-            var_energy_history=history.diagnostics.get("var", []),
-            s_ci_energy_history=history.diagnostics.get("s_ci", []),
             total_time=total_time,
             config=self.cfg
         )
 
 
 class _History:
-    """Internal history tracker for energy trajectories."""
+    """Energy trajectory tracker for convergence analysis."""
     
     def __init__(self):
         self.energies: list[float] = []
@@ -302,15 +281,8 @@ class _History:
         self.diagnostics: dict[str, list[float]] = {}
     
     def append_energies(self, energy_trace: list[float]):
-        """Record inner loop trajectory and mark cycle boundary."""
         self.energies.extend(energy_trace)
         self.cycle_bounds.append(len(self.energies))
-    
-    def append_diagnostic(self, key: str, value: float):
-        """Add cycle-level diagnostic."""
-        if key not in self.diagnostics:
-            self.diagnostics[key] = []
-        self.diagnostics[key].append(value)
 
 
 __all__ = ["Driver"]

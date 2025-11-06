@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LEVER optimization example.
+LEVER variational optimization with post-analysis diagnostics.
+
+Demonstrates complete workflow: Hamiltonian screening → inner loop
+variational optimization → outer loop S-space refinement → energy
+diagnostics (E_LEVER, E_var, E_S-CI).
 
 File: examples/run_evolution.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -12,17 +16,21 @@ Date: November, 2025
 import jax
 import jax.numpy as jnp
 
-from lever import core, analysis, config, driver, evolution, models
+from lever import analysis, config, driver, evolution, models
 from lever.optimizers import adam
 
-# JAX device configuration
+# Device setup
 print("JAX devices:", jax.devices())
 jax.config.update("jax_platforms", "cuda")
 jax.config.update("jax_log_compiles", False)
 
+# Debug constant capture (optional)
+# jax.config.update('jax_captured_constants_warn_bytes', 64 * 1024**2)
+# jax.config.update('jax_captured_constants_report_frames', 5)
+
 
 def main():
-    # ========== System Definition ==========
+    # System
     sys_cfg = config.SystemConfig(
         fcidump_path="../benchmark/FCIDUMP/H2O_631g.FCIDUMP",
         n_orbitals=13,
@@ -30,7 +38,7 @@ def main():
         n_beta=5
     )
     
-    # ========== Hamiltonian Configuration ==========
+    # Hamiltonian
     ham_cfg = config.HamiltonianConfig(
         screening_mode=config.ScreenMode.DYNAMIC,
         screen_eps=1e-6,
@@ -38,33 +46,25 @@ def main():
         reg_eps=1e-4
     )
     
-    # ========== Loop Control ==========
+    # Convergence control
     loop_cfg = config.LoopConfig(
-        max_outer=10,
+        max_outer=20,
         outer_tol=1e-5,
         outer_patience=3,
         inner_steps=500,
-        chunk_size=8192
-    )
-
-    
-    # ========== Evaluation Configuration ==========
-    eval_cfg = config.EvaluationConfig(
-        var_energy_mode=config.EvalMode.NEVER,
-        s_ci_energy_mode=config.EvalMode.FINAL,
-        t_ci_energy_mode=config.EvalMode.NEVER
+        chunk_size=4096
     )
     
-    # ========== LEVER Configuration ==========
     lever_cfg = config.LeverConfig(
         system=sys_cfg,
         hamiltonian=ham_cfg,
         loop=loop_cfg,
-        evaluation=eval_cfg,
-        compute_mode=config.ComputeMode.PROXY,
+        compute_mode=config.ComputeMode.EFFECTIVE,
+        seed=42,
+        report_interval=50
     )
 
-    # ========== Wavefunction Model ==========
+    # Wavefunction Ansatz
     model = models.Backflow(
         n_orbitals=sys_cfg.n_orbitals,
         n_alpha=sys_cfg.n_alpha,
@@ -77,34 +77,46 @@ def main():
         param_dtype=jnp.complex64 
     )
     
-    # ========== Optimizer ==========
-    optimizer = adam(
-        learning_rate=5e-4,
-        weight_decay=1e-4
-    )
+    optimizer = adam(learning_rate=5e-4, weight_decay=1e-4)
     
-    # ========== Evolution Strategy ==========
+    # Evolution: amplitude-based top-K selection
     evo_strategy = evolution.BasicStrategy(
         scorer=evolution.scores.AmpScorer(),
-        selector=evolution.selectors.TopKSelector(k=400)
+        selector=evolution.selectors.TopKSelector(k=3200)
     )
-
-    # ========== Run LEVER Workflow ==========
+    
     lever_driver = driver.Driver(lever_cfg, model, evo_strategy, optimizer)
-    results = lever_driver.run()
+    result = lever_driver.run()
 
-    # ========== Post-Analysis ==========
-    e_fci = -76.12089
+    # Post Analysis
+    evaluator = analysis.EnergyEvaluator(
+        int_ctx=lever_driver.int_ctx,
+        n_orb=sys_cfg.n_orbitals,
+        e_nuc=lever_driver.int_ctx.get_e_nuc()
+    )
     
-    # Print summary with FCI comparison
-    analysis.print_summary(results, e_fci=e_fci, sys_name="H2O")
+    energies = evaluator.analyze_result(
+        result,
+        model=model,
+        compute_fci=False,  # Enable for FCI benchmark (expensive)
+        compute_var=True,
+        compute_s_ci=True
+    )
     
-    # Plot convergence trajectory
+    # Optional: inject FCI reference
+    energies['e_fci'] = -76.12089  # H2O/6-31G benchmark
+    
+    analysis.print_summary(
+        energies=energies,
+        total_time=result.total_time,
+        sys_name="H2O"
+    )
+    
     analysis.plot_convergence(
-        results, 
-        e_fci=e_fci,
+        result=result,
+        e_fci=energies.get('e_fci'),
         sys_name="H2O",
-        save_path="convergence.pdf"
+        save_path="h2o_convergence.pdf"
     )
 
 

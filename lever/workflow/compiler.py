@@ -4,9 +4,9 @@
 """
 Workspace compiler: OuterState → OuterCtx transformation.
 
-Five-phase compilation pipeline:
+Five-phase pipeline:
   1. Bootstrap: Amplitude estimation for dynamic screening
-  2. Build: Hamiltonian blocks (H_SS, H_SC) via sparse CI
+  2. Build: H_SS, H_SC blocks via sparse CI
   3. Features: Neural network input conversion
   4. Closures: JIT-compiled operators (log_psi, SpMV)
   5. Package: Assemble immutable OuterCtx
@@ -36,12 +36,7 @@ if TYPE_CHECKING:
 
 
 class Compiler:
-    """
-    Stateless compiler: OuterState → OuterCtx.
-    
-    Transforms abstract search space into concrete computational context
-    with pre-compiled JAX operators.
-    """
+    """Stateless compiler transforming search space into executable context."""
     
     def __init__(
         self,
@@ -49,48 +44,32 @@ class Compiler:
         model: WavefunctionModel,
         int_ctx: core.IntCtx
     ):
-        """
-        Initialize compiler with system configuration.
-        
-        Args:
-            config: LEVER configuration
-            model: Wavefunction neural network
-            int_ctx: Integral provider for Hamiltonian construction
-        """
         self.cfg = config
         self.model = model
         self.int_ctx = int_ctx
-        self.logger = get_logger()
         self._last_shape: tuple[int, int] | None = None
     
-    def compile(
-        self,
-        state: OuterState
-    ) -> OuterCtx:
+    def compile(self, state: OuterState) -> tuple[OuterCtx, dict]:
         """
-        Compile complete computational context from outer state.
-        
-        Args:
-            state: Current outer loop state with S-space and parameters
+        Execute compilation pipeline.
         
         Returns:
-            Immutable OuterCtx with compiled operators and metadata
+            ctx: Compiled context
+            diagnostics: Dictionary with compilation info for logging
         """
         mode = self.cfg.compute_mode
         
-        # Phase 1-3: Build Hamiltonian and features
-        psi_s_est = self._bootstrap_amplitudes(state)
+        # Phase 1-3: Hamiltonian construction and feature extraction
+        psi_s_est, bootstrap_range = self._bootstrap_amplitudes(state)
         ham_ss_raw, ham_sc, space = self._build_hamiltonian(state, psi_s_est)
         feat_s, feat_c = self._prepare_features(space)
         
-        # Phase 4: Compile JAX operators
-        log_psi_fn = self._compile_log_psi(feat_s, feat_c, mode)
+        # Phase 4: Operator compilation
+        log_psi_fn = self._compile_log_psi(mode)
         spmv_fn = self._compile_spmv(ham_ss_raw, ham_sc, space, mode)
         
-        # Phase 5: Package context
-        self._log_compilation_info(space, ham_ss_raw, ham_sc, mode)
-        
-        return OuterCtx(
+        # Phase 5: Package context and diagnostics
+        ctx = OuterCtx(
             space=space,
             ham_ss=ham_ss_raw,
             ham_sc=ham_sc,
@@ -101,16 +80,33 @@ class Compiler:
             spmv_fn=spmv_fn,
             compute_mode=mode
         )
+        
+        # Collect diagnostics for logging
+        diagnostics = {
+            'bootstrap_range': bootstrap_range,
+            'n_s': space.n_s,
+            'n_c': space.n_c,
+            'nnz_ss': ham_ss_raw.nnz,
+            'nnz_sc': ham_sc.nnz if mode != ComputeMode.EFFECTIVE else None,
+            'ham_label': 'H_eff' if mode == ComputeMode.EFFECTIVE else 'H_SS'
+        }
+        
+        return ctx, diagnostics
     
     def _bootstrap_amplitudes(
-        self,
+        self, 
         state: OuterState
-    ) -> np.ndarray | None:
-        """Compute normalized S-space amplitudes for dynamic screening."""
-        if self.cfg.hamiltonian.screening_mode != ScreenMode.DYNAMIC:
-            return None
+    ) -> tuple[np.ndarray | None, tuple[float, float] | None]:
+        """
+        Estimate normalized |ψ_S| for dynamic screening.
         
-        # Extract base log_psi (handle tuple format for EFFECTIVE mode)
+        Returns:
+            psi_s: Amplitude array (or None)
+            range: (min, max) tuple for logging (or None)
+        """
+        if self.cfg.hamiltonian.screening_mode != ScreenMode.DYNAMIC:
+            return None, None
+        
         logpsi_fn = (self.model.log_psi[0] if isinstance(self.model.log_psi, tuple)
                     else self.model.log_psi)
         
@@ -121,15 +117,17 @@ class Compiler:
             n_orb=self.cfg.system.n_orbitals
         )
         
-        self.logger.bootstrap_amplitudes(psi_s.min(), psi_s.max())
-        return psi_s
+        return psi_s, (float(psi_s.min()), float(psi_s.max()))
     
     def _build_hamiltonian(
         self,
         state: OuterState,
         psi_s_est: np.ndarray | None
     ) -> tuple[COOMatrix, COOMatrix, SpaceRep]:
-        """Build H_SS and H_SC blocks via sparse CI expansion."""
+        """
+        Construct H_SS and H_SC via sparse CI expansion.
+        Returns H_eff = H_SS + ΔE_PT2 for EFFECTIVE mode.
+        """
         ham_cfg = self.cfg.hamiltonian
         kwargs = {
             "S_dets": state.s_dets,
@@ -137,12 +135,12 @@ class Compiler:
             "n_orbitals": self.cfg.system.n_orbitals,
         }
         
+        # Screening mode dispatch
         match ham_cfg.screening_mode:
             case ScreenMode.NONE:
                 ham_ss, ham_sc, space = engine.hamiltonian.get_ham_proxy(
                     **kwargs, mode="none"
                 )
-            
             case ScreenMode.STATIC:
                 ham_ss, ham_sc, space = engine.hamiltonian.get_ham_proxy(
                     **kwargs,
@@ -150,10 +148,9 @@ class Compiler:
                     screen_eps=ham_cfg.screen_eps,
                     diag_shift=ham_cfg.diag_shift
                 )
-            
             case ScreenMode.DYNAMIC:
                 if psi_s_est is None:
-                    raise ValueError("Dynamic screening requires bootstrap")
+                    raise ValueError("Dynamic screening requires amplitude bootstrap")
                 ham_ss, ham_sc, space = engine.hamiltonian.get_ham_proxy(
                     **kwargs,
                     mode="dynamic",
@@ -162,7 +159,7 @@ class Compiler:
                     diag_shift=ham_cfg.diag_shift
                 )
         
-        # For EFFECTIVE mode, assemble H_eff from H_SS + perturbation
+        # Fold second-order correction into H_eff for EFFECTIVE mode
         if self.cfg.compute_mode == ComputeMode.EFFECTIVE and state.e_ref is not None:
             ham_eff = engine.hamiltonian.get_ham_eff(
                 ham_ss=ham_ss,
@@ -172,37 +169,24 @@ class Compiler:
                 reg_type="sigma",
                 num_eps=self.cfg.hamiltonian.reg_eps
             )
-            self.logger.hamiltonian_assembled("H_eff", ham_eff.nnz)
             return ham_eff, ham_sc, space
         
         return ham_ss, ham_sc, space
     
     def _prepare_features(self, space: SpaceRep) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Convert determinants to neural network features."""
+        """Convert determinants to neural network input features."""
         n_orb = self.cfg.system.n_orbitals
-        feat_s = dets_to_features(space.s_dets, n_orb)
-        feat_c = dets_to_features(space.c_dets, n_orb)
-        return feat_s, feat_c
+        return (
+            dets_to_features(space.s_dets, n_orb),
+            dets_to_features(space.c_dets, n_orb)
+        )
     
-    def _compile_log_psi(
-        self,
-        feat_s: jnp.ndarray,
-        feat_c: jnp.ndarray,
-        mode: ComputeMode
-    ) -> Callable:
-        """
-        Compile log(ψ) evaluator with feature binding.
-        
-        Returns closure or tuple of closures depending on mode.
-        For EFFECTIVE/ASYMMETRIC: returns (eval_s, eval_full)
-        For PROXY: returns eval_full
-        """
+    def _compile_log_psi(self, mode: ComputeMode) -> Callable:
+        """Compile batch log(ψ) evaluator with optional normalization."""
         from ..engine import operator
         
         return operator.create_logpsi_evals(
             model_fn=self.model.log_psi,
-            feat_s=feat_s,
-            feat_c=feat_c,
             mode=mode,
             normalize=self.cfg.normalize_wf,
             device_complex=self.cfg.precision.jax_complex,
@@ -216,11 +200,7 @@ class Compiler:
         space: SpaceRep,
         mode: ComputeMode
     ) -> Callable:
-        """
-        Compile sparse matrix-vector product H·ψ.
-        
-        Returns appropriate SpMV function based on compute mode.
-        """
+        """Compile sparse H·ψ operator for mode-specific contraction."""
         from ..engine import operator
         
         if mode == ComputeMode.EFFECTIVE:
@@ -231,19 +211,19 @@ class Compiler:
                 n_s=space.n_s,
                 precision_config=self.cfg.precision
             )
-        else:
-            return operator.create_spmv_proxy(
-                ham_ss_rows=ham_opt.rows,
-                ham_ss_cols=ham_opt.cols,
-                ham_ss_vals=ham_opt.vals,
-                ham_sc_rows=ham_sc.rows,
-                ham_sc_cols=ham_sc.cols,
-                ham_sc_vals=ham_sc.vals,
-                h_diag_c=space.h_diag_c,
-                n_s=space.n_s,
-                n_c=space.n_c,
-                precision_config=self.cfg.precision
-            )
+        
+        return operator.create_spmv_proxy(
+            ham_ss_rows=ham_opt.rows,
+            ham_ss_cols=ham_opt.cols,
+            ham_ss_vals=ham_opt.vals,
+            ham_sc_rows=ham_sc.rows,
+            ham_sc_cols=ham_sc.cols,
+            ham_sc_vals=ham_sc.vals,
+            h_diag_c=space.h_diag_c,
+            n_s=space.n_s,
+            n_c=space.n_c,
+            precision_config=self.cfg.precision
+        )
     
     def _log_compilation_info(
         self,
@@ -252,22 +232,24 @@ class Compiler:
         ham_sc: COOMatrix,
         mode: ComputeMode
     ) -> None:
-        """Emit compilation diagnostics and JIT recompilation warnings."""
+        """Emit compact compilation diagnostics."""
         n_s, n_c = space.n_s, space.n_c
-        current_shape = (n_s, n_c)
         
-        # Warn on shape change (triggers JIT recompilation)
-        if self._last_shape and self._last_shape != current_shape:
-            self.logger.recompilation_warning(self._last_shape, current_shape)
-        self._last_shape = current_shape
-        
-        self.logger.space_dimensions(n_s, n_c)
-        
+        # Compact summary: Space + Hamiltonian in one line
         if mode == ComputeMode.EFFECTIVE:
-            self.logger.hamiltonian_sparsity(n_s, ham_opt.nnz)
+            self.logger.compilation_summary(
+                n_s=n_s,
+                n_c=n_c,
+                nnz_ss=ham_opt.nnz,
+                nnz_sc=None,
+                ham_label="H_eff"
+            )
         else:
-            self.logger.hamiltonian_sparsity(n_s, ham_opt.nnz, ham_sc.nnz)
-
+            self.logger.compilation_summary(
+                n_s=n_s,
+                n_c=n_c,
+                nnz_ss=ham_opt.nnz,
+                nnz_sc=ham_sc.nnz
+            )
 
 __all__ = ["Compiler"]
-

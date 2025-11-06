@@ -24,63 +24,60 @@ if TYPE_CHECKING:
     from ..dtypes import LeverResult
 
 
+# ============================================================================
+# Summary Reporting
+# ============================================================================
+
 def print_summary(
-    result: LeverResult,
-    e_fci: float | None = None,
+    energies: dict[str, float],
+    total_time: float,
     sys_name: str | None = None
 ) -> None:
     """
     Print formatted energy summary with optional FCI comparison.
     
-    Args:
-        result: LEVER calculation result
-        e_fci: FCI reference energy (optional)
-        sys_name: System identifier (inferred from fcidump if None)
-    """
-    final_e = result.full_energy_history[-1]
+    Displays optimization, variational, and S-space CI energies with
+    deviations from FCI reference (if available).
     
-    # Infer system name from config
-    if sys_name is None:
-        sys_name = Path(result.config.system.fcidump_path).stem
+    Args:
+        energies: Energy dictionary from analyze_result()
+        total_time: Total computation time [s]
+        sys_name: System identifier
+    """
+    e_lever = energies['e_lever']
+    e_fci = energies.get('e_fci')
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print(f"LEVER Analysis Summary: {sys_name}")
-    print("="*50)
+    print("=" * 50)
     
     if e_fci is not None:
         print(f"\nFCI Reference: {e_fci:.8f} Ha")
         print("\nLEVER Energies:")
         
-        # Optimization energy
-        err_mha = (final_e - e_fci) * 1e3
-        print(f"  Optimization: {final_e:.8f} Ha  (Δ = {err_mha:+.4f} mHa)")
+        err_mha = (e_lever - e_fci) * 1e3
+        print(f"  Optimization: {e_lever:.8f} Ha  (Δ = {err_mha:+.4f} mHa)")
     else:
-        print(f"\nFinal Energy: {final_e:.8f} Ha")
+        print(f"\nFinal Energy: {e_lever:.8f} Ha")
 
-    # Variational energy (if available)
-    if result.var_energy_history:
-        e_var = result.var_energy_history[-1]
-        print(f"  Variational:  {e_var:.8f} Ha", end="")
-        if e_fci is not None:
-            err_var = (e_var - e_fci) * 1e3
-            print(f"  (Δ = {err_var:+.4f} mHa)")
-        else:
-            print()
+    # Optional energies with error tracking
+    for key, label in [('e_var', 'Variational'), ('e_s_ci', 'S-space CI')]:
+        if key in energies:
+            e_val = energies[key]
+            print(f"  {label:13s}: {e_val:.8f} Ha", end="")
+            if e_fci is not None:
+                err = (e_val - e_fci) * 1e3
+                print(f"  (Δ = {err:+.4f} mHa)")
+            else:
+                print()
     
-    # S-space CI energy (if available)
-    if result.s_ci_energy_history:
-        e_s = result.s_ci_energy_history[-1]
-        print(f"  S-space CI:   {e_s:.8f} Ha", end="")
-        if e_fci is not None:
-            err_s = (e_s - e_fci) * 1e3
-            print(f"  (Δ = {err_s:+.4f} mHa)")
-        else:
-            print()
-    
-    print(f"\nWall Time: {result.total_time:.2f} s")
-    print(f"Total Cycles: {len(result.cycle_boundaries)}")
-    print("="*50 + "\n")
+    print(f"\nWall Time: {total_time:.2f} s")
+    print("=" * 50 + "\n")
 
+
+# ============================================================================
+# Convergence Visualization
+# ============================================================================
 
 def plot_convergence(
     result: LeverResult,
@@ -100,7 +97,6 @@ def plot_convergence(
         sys_name: System identifier (inferred from fcidump if None)
         save_path: Output file path (displays if None)
     """
-    # Infer system name from config
     if sys_name is None:
         sys_name = Path(result.config.system.fcidump_path).stem
 
@@ -119,19 +115,13 @@ def plot_convergence(
     cycle_energies = energy[cycle_ends]
     cycles = np.arange(1, len(cycle_ends) + 1)
     
-    chem_accuracy = 1.6e-3  # Chemical accuracy: 1.6 mHa
+    chem_accuracy = 1.6e-3  # Ha
     
-    # Determine if we can plot error panel
-    has_fci = e_fci is not None
-    
-    if has_fci:
-        # Create dual-panel layout
+    # Create layout based on FCI availability
+    if e_fci is not None:
         fig, (ax_energy, ax_error) = plt.subplots(
-            2, 1,
-            figsize=(8, 6),
-            sharex=True,
-            height_ratios=[2, 1],
-            gridspec_kw={'hspace': 0.15}
+            2, 1, figsize=(8, 6), sharex=True,
+            height_ratios=[2, 1], gridspec_kw={'hspace': 0.15}
         )
         
         errors = np.abs(cycle_energies - e_fci)
@@ -139,7 +129,6 @@ def plot_convergence(
                           sys_name, e_fci, chem_accuracy)
         _plot_error_panel(ax_error, cycles, errors, chem_accuracy)
     else:
-        # Single energy panel without FCI reference
         fig, ax_energy = plt.subplots(figsize=(8, 4))
         _plot_energy_panel(ax_energy, cycles, cycle_energies, result, 
                           sys_name, None, chem_accuracy)
@@ -162,68 +151,32 @@ def _plot_energy_panel(
     e_fci: float | None,
     chem_acc: float
 ) -> None:
-    """Plot energy trajectory with optional FCI reference and accuracy band."""
+    """
+    Plot energy trajectory with optional FCI reference.
     
+    Displays chemical accuracy band (±1.6 mHa) when FCI is available.
+    """
     if e_fci is not None:
         # Chemical accuracy band
         ax.axhspan(
-            e_fci - chem_acc,
-            e_fci + chem_acc,
-            alpha=0.15,
-            color='green',
+            e_fci - chem_acc, e_fci + chem_acc,
+            alpha=0.15, color='green',
             label='Chem. Acc. (±1.6 mHa)'
         )
         
         # FCI reference line
         ax.axhline(
-            e_fci,
-            color='black',
-            linestyle='--',
-            linewidth=1.5,
+            e_fci, color='black', linestyle='--', linewidth=1.5,
             label=f'FCI: {e_fci:.6f} Ha'
         )
     
     # Optimization trajectory
     ax.plot(
-        cycles,
-        energies,
-        'o-',
-        color='steelblue',
-        markersize=8,
-        markeredgecolor='white',
-        markeredgewidth=1.5,
+        cycles, energies, 'o-',
+        color='steelblue', markersize=8,
+        markeredgecolor='white', markeredgewidth=1.5,
         label='LEVER (opt)'
     )
-
-    # Variational energies (if available)
-    if result.var_energy_history:
-        x_var = _align_to_cycles(result.var_energy_history, cycles)
-        if x_var:
-            ax.plot(
-                x_var,
-                result.var_energy_history,
-                's-',
-                color='orange',
-                markersize=6,
-                markeredgecolor='white',
-                markeredgewidth=1.0,
-                label='LEVER (var)'
-            )
-  
-    # S-space CI energies (if available)
-    if result.s_ci_energy_history:
-        x_s = _align_to_cycles(result.s_ci_energy_history, cycles)
-        if x_s:
-            ax.plot(
-                x_s,
-                result.s_ci_energy_history,
-                'D-',
-                color='purple',
-                markersize=5,
-                markeredgecolor='white',
-                markeredgewidth=1.0,
-                label='S-space CI'
-            )
 
     # Format panel
     if e_fci is not None:
@@ -242,25 +195,18 @@ def _plot_error_panel(
     errors: np.ndarray,
     chem_acc: float
 ) -> None:
-    """Plot logarithmic error evolution with accuracy threshold."""
+    """Plot logarithmic error evolution with chemical accuracy threshold."""
     ax.semilogy(
-        cycles,
-        errors,
-        's-',
-        color='crimson',
-        markersize=8,
-        markeredgecolor='white',
-        markeredgewidth=1.5,
+        cycles, errors, 's-',
+        color='crimson', markersize=8,
+        markeredgecolor='white', markeredgewidth=1.5,
         label='Absolute Error'
     )
     
     # Chemical accuracy threshold
     ax.axhline(
-        chem_acc,
-        color='green',
-        linestyle='--',
-        alpha=0.6,
-        label=f'Chem. Acc. ({chem_acc*1e3:.1f} mHa)'
+        chem_acc, color='green', linestyle='--', alpha=0.6,
+        label=f'Chem. Acc. ({chem_acc * 1e3:.1f} mHa)'
     )
     
     ax.set_xlabel('Evolution Cycle')
@@ -268,21 +214,6 @@ def _plot_error_panel(
     ax.legend(loc='upper right')
     ax.grid(True)
     ax.set_xticks(cycles)
-
-
-def _align_to_cycles(hist: list, cycles: np.ndarray) -> list:
-    """
-    Map data history to cycle x-coordinates.
-    
-    Handles: full history (1:1 mapping), single final value, or empty.
-    """
-    n = len(hist)
-    if n == len(cycles):
-        return cycles.tolist()
-    elif n == 1:
-        return [cycles[-1]]
-    else:
-        return []
 
 
 __all__ = ["plot_convergence", "print_summary"]

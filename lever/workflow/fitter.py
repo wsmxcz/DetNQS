@@ -75,7 +75,6 @@ class Fitter:
         Returns:
             InnerResult with optimized parameters and energy trace
         """
-        # Initialize optimizer state
         opt_state = optimizer.init(initial_params)
         state = InnerState(
             params=initial_params,
@@ -83,42 +82,41 @@ class Fitter:
             step=0
         )
         
-        # Compile single update step
         update_step = create_update_step(ctx, optimizer, self.num_eps)
-        
-        # Execute optimization loop
-        state, energies = self._run_optimization_loop(state, update_step)
-        
-        # Create wavefunction cache
+        state, energies = self._run_optimization_loop(state, update_step, ctx)
         psi_cache = self._create_cache(ctx, state.params)
         
         return InnerResult(
             final_params=state.params,
             energy_trace=energies.tolist(),
             psi_cache=psi_cache,
-            converged=False,  # No convergence check in fixed-step mode
+            converged=False,
             steps=len(energies)
         )
     
     def _run_optimization_loop(
         self,
         initial_state: InnerState,
-        update_step
+        update_step,
+        ctx: OuterCtx
     ) -> tuple[InnerState, jnp.ndarray]:
         """
         Execute fixed-step optimization via lax.scan with optional progress.
         
-        Returns final state and energy trajectory.
+        Returns:
+            Final state and energy trajectory
         """
         num_steps = self.cfg.inner_steps
         report_interval = self.report_interval
         should_print = report_interval > 0
         
+        feat_s = ctx.features_s
+        feat_c = ctx.features_c
+        
         def scan_fn(state, step_idx):
-            """Single optimization step with conditional printing."""
-            new_state, energy = update_step(state)
+            """Single optimization step."""
+            new_state, energy = update_step(state, feat_s, feat_c)
             
-            # Optional progress report
             if should_print:
                 is_report_step = (step_idx + 1) % report_interval == 0
                 lax.cond(
@@ -136,7 +134,6 @@ class Fitter:
             
             return new_state, energy
         
-        # Execute all steps
         step_indices = jnp.arange(num_steps)
         final_state, energies = lax.scan(scan_fn, initial_state, step_indices)
         
@@ -157,18 +154,13 @@ class Fitter:
         Returns:
             PsiCache with S/C space amplitudes
         """
-        # Handle tuple vs single evaluator (closures already capture features)
         if isinstance(ctx.log_psi_fn, tuple):
             _, logpsi_full = ctx.log_psi_fn
-            log_all = logpsi_full(params)
+            log_all = logpsi_full(params, ctx.features_s, ctx.features_c)
         else:
-            log_all = ctx.log_psi_fn(params)
+            log_all = ctx.log_psi_fn(params, ctx.features_s, ctx.features_c)
         
-        psi_cache = create_psi_cache(
-            log_all, ctx.space.n_s, ctx.space.n_c
-        )
-        
-        return psi_cache
+        return create_psi_cache(log_all, ctx.space.n_s, ctx.space.n_c)
 
 
 __all__ = ["Fitter"]

@@ -133,31 +133,21 @@ class HamiltonianConfig:
 @dataclass(frozen=True)
 class LoopConfig:
     """
-    Optimization loop control and convergence criteria.
+    Iteration and convergence control for LEVER loops.
     
-    Two-level iteration structure:
-      Outer: Macro-cycles with S-space evolution
-      Inner: Micro-steps with fixed Hamiltonian
-    
-    Attributes:
-        max_cycles: Maximum macro-cycles
-        cycle_tol: Energy convergence threshold for cycles
-        patience: Early stopping after non-improving cycles
-        max_steps: Maximum optimization steps per cycle
-        step_tol: Energy convergence threshold for steps
-        check_interval: Steps between convergence checks
-        s_space_size: Target S-space dimension after evolution
-        chunk_size: Batch size for chunked inference (None = no chunking)
+    Outer loop: Evolve determinant space
+    Inner loop: Optimize parameters in fixed space
     """
-    max_cycles: int = 10
-    cycle_tol: float = 1e-5
-    patience: int = 3
-    max_steps: int = 500
-    step_tol: float = 1e-6
-    check_interval: int = 50
-    s_space_size: int = 200
-    chunk_size: int | None = None
-
+    # Outer loop (cycle evolution)
+    max_outer: int = 10                # Maximum evolutionary cycles
+    outer_tol: float = 1e-5           # Convergence tolerance
+    outer_patience: int = 3           # Consecutive converged cycles needed
+    
+    # Inner loop (fixed-space optimization)
+    inner_steps: int = 500            # Fixed optimization steps per cycle
+    
+    # Optional batch processing
+    chunk_size: int | None = None     # Gradient accumulation chunk size
 
 @dataclass(frozen=True)
 class EvaluationConfig:

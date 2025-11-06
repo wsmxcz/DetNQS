@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Parameter optimization engine for fixed workspace.
+Parameter optimizer for fixed computational context.
 
-Implements gradient-based variational minimization:
+Executes inner loop via gradient descent on variational energy:
   E[θ] = ⟨Ψ(θ)|H|Ψ(θ)⟩ / ⟨Ψ(θ)|Ψ(θ)⟩
 
 File: lever/workflow/fitter.py
@@ -17,19 +17,25 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import jax
-import numpy as np
+import jax.numpy as jnp
+import jax.lax as lax
 
-from .. import engine
-from ..utils.dtypes import FitResult, OptState, PyTree, Workspace
+from ..dtypes import InnerResult, InnerState
+from ..engine.step import create_update_step
 from ..utils.features import create_psi_cache
 from ..utils.logger import get_logger
 
 if TYPE_CHECKING:
     from ..config import LoopConfig
+    from ..dtypes import OuterCtx, PyTree
 
 
 class Fitter:
-    """Gradient descent optimizer for variational energy minimization."""
+    """
+    Inner loop optimizer for variational energy minimization.
+    
+    Executes fixed number of gradient descent steps on static Hamiltonian.
+    """
     
     def __init__(
         self,
@@ -38,11 +44,11 @@ class Fitter:
         num_eps: float = 1e-12
     ) -> None:
         """
-        Initialize optimizer.
+        Initialize fitter with optimization parameters.
         
         Args:
-            loop_cfg: Iteration and convergence settings
-            report_interval: Logging frequency
+            loop_cfg: Iteration settings
+            report_interval: Progress logging frequency (0 to disable)
             num_eps: Numerical stability threshold
         """
         self.cfg = loop_cfg
@@ -52,113 +58,115 @@ class Fitter:
     
     def fit(
         self,
-        workspace: Workspace,
-        params: PyTree,
+        ctx: OuterCtx,
+        initial_params: PyTree,
         optimizer
-    ) -> FitResult:
+    ) -> InnerResult:
         """
-        Run optimization until convergence or max_steps.
+        Execute inner loop optimization for fixed number of steps.
         
-        Algorithm: θ ← optimizer.update(∇E[θ], θ)
+        Algorithm: θ ← optimizer.update(∇E[θ], θ) via lax.scan
         
         Args:
-            workspace: Compiled Hamiltonian + features
-            params: Initial network parameters
-            optimizer: Optax gradient transformer
+            ctx: Compiled computational context
+            initial_params: Initial network parameters
+            optimizer: Optax-compatible optimizer
             
         Returns:
-            Optimization result with energy trace and cached Ψ
+            InnerResult with optimized parameters and energy trace
         """
-        opt_state = optimizer.init(params)
-        state = OptState(params=params, opt_state=opt_state, step=0)
+        # Initialize optimizer state
+        opt_state = optimizer.init(initial_params)
+        state = InnerState(
+            params=initial_params,
+            opt_state=opt_state,
+            step=0
+        )
         
-        step_fn = engine.step.create_step_fn(workspace, optimizer, self.num_eps)
-        step_fn_jit = jax.jit(step_fn, donate_argnums=(0,))
+        # Compile single update step
+        update_step = create_update_step(ctx, optimizer, self.num_eps)
         
-        feat_s = workspace.feat_s
-        feat_c = workspace.feat_c
+        # Execute optimization loop
+        state, energies = self._run_optimization_loop(state, update_step)
         
-        energies: list[float] = []
-        self.logger.optimization_header()
+        # Create wavefunction cache
+        psi_cache = self._create_cache(ctx, state.params)
         
-        for step in range(self.cfg.max_steps):
-            state, energy = step_fn_jit(state, feat_s, feat_c)
-            energies.append(float(energy))
-            
-            if (step + 1) % self.report_interval == 0:
-                self.logger.optimization_step(
-                    step + 1, energies[-1], self.cfg.max_steps
-                )
-            
-            if self._check_convergence(energies, step):
-                converged = True
-                break
-        else:
-            converged = False
-        
-        psi_cache = self._create_cache(workspace, state.params)
-        
-        return FitResult(
-            params=state.params,
-            energy_trace=energies,
+        return InnerResult(
+            final_params=state.params,
+            energy_trace=energies.tolist(),
             psi_cache=psi_cache,
-            converged=converged,
+            converged=False,  # No convergence check in fixed-step mode
             steps=len(energies)
         )
     
-    def _check_convergence(self, energies: list[float], step: int) -> bool:
+    def _run_optimization_loop(
+        self,
+        initial_state: InnerState,
+        update_step
+    ) -> tuple[InnerState, jnp.ndarray]:
         """
-        Test convergence: |E[t] - E[t-w]| < tol.
+        Execute fixed-step optimization via lax.scan with optional progress.
         
-        Args:
-            energies: Energy history
-            step: Current iteration
+        Returns final state and energy trajectory.
+        """
+        num_steps = self.cfg.inner_steps
+        report_interval = self.report_interval
+        should_print = report_interval > 0
+        
+        def scan_fn(state, step_idx):
+            """Single optimization step with conditional printing."""
+            new_state, energy = update_step(state)
             
-        Returns:
-            True if converged within tolerance window
-        """
-        if step < self.cfg.check_interval:
-            return False
+            # Optional progress report
+            if should_print:
+                is_report_step = (step_idx + 1) % report_interval == 0
+                lax.cond(
+                    is_report_step,
+                    lambda e, s: jax.debug.print(
+                        "  Step {step:4d}/{total:4d} | E = {energy:.10f}",
+                        step=s + 1,
+                        total=num_steps,
+                        energy=e,
+                        ordered=True
+                    ),
+                    lambda e, s: None,
+                    energy, step_idx
+                )
+            
+            return new_state, energy
         
-        if (step + 1) % self.cfg.check_interval != 0:
-            return False
+        # Execute all steps
+        step_indices = jnp.arange(num_steps)
+        final_state, energies = lax.scan(scan_fn, initial_state, step_indices)
         
-        window = self.cfg.check_interval
-        e_recent = energies[-1]
-        e_previous = energies[-window] if len(energies) >= window else energies[0]
-        
-        delta = abs(e_recent - e_previous)
-        
-        if delta < self.cfg.step_tol:
-            self.logger.inner_loop_converged(step + 1, delta)
-            return True
-        
-        return False
+        return final_state, jax.device_get(energies)
     
-    def _create_cache(self, workspace: Workspace, params: PyTree):
+    def _create_cache(
+        self,
+        ctx: OuterCtx,
+        params: PyTree
+    ):
         """
         Evaluate and cache Ψ_S, Ψ_C amplitudes.
         
         Args:
-            workspace: Compiled workspace with basis
+            ctx: Compiled context with log_psi evaluator
             params: Optimized network parameters
             
         Returns:
-            Amplitude cache with S/C partitions
+            PsiCache with S/C space amplitudes
         """
-        if isinstance(workspace.log_psi, tuple):
-            _, logpsi_full = workspace.log_psi
-            log_all = logpsi_full(params, workspace.feat_s, workspace.feat_c)
+        # Handle tuple vs single evaluator (closures already capture features)
+        if isinstance(ctx.log_psi_fn, tuple):
+            _, logpsi_full = ctx.log_psi_fn
+            log_all = logpsi_full(params)
         else:
-            log_all = workspace.log_psi(params, workspace.feat_s, workspace.feat_c)
+            log_all = ctx.log_psi_fn(params)
         
         psi_cache = create_psi_cache(
-            log_all, workspace.space.n_s, workspace.space.n_c
+            log_all, ctx.space.n_s, ctx.space.n_c
         )
-        
-        norm_s = float(np.sum(np.abs(np.array(psi_cache.psi_s))**2))
-        norm_c = float(np.sum(np.abs(np.array(psi_cache.psi_c))**2))
-        self.logger.wavefunction_cache(norm_s, norm_c)
         
         return psi_cache
 

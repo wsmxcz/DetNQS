@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..utils.dtypes import ScoreResult
+from ..dtypes import ScoreResult
 
 
 class TopKSelector:

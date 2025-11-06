@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Evolution strategies with OuterCtx integration.
+Evolution strategies for determinant space selection.
 
-Provides single-stage, two-stage, and mass-locking determinant selection
-strategies for iterative CI space evolution.
+Provides single-stage, two-stage, and mass-locking strategies
+for iterative CI space evolution.
 
 File: lever/evolution/strategies.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -19,12 +19,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .base import EvolutionStrategy, Scorer, Selector
-from ..utils.dtypes import ScoreResult
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import OuterCtx, PsiCache
-
-__all__ = ["BasicStrategy", "TwoStageStrategy", "MassLockingStrategy"]
+    from ..dtypes import OuterCtx, PsiCache
 
 
 class BasicStrategy(EvolutionStrategy):
@@ -43,7 +40,7 @@ class BasicStrategy(EvolutionStrategy):
 class TwoStageStrategy(EvolutionStrategy):
     """
     Two-stage evolution: independent core and frontier selection.
-  
+    
     Enables hybrid criteria (e.g., amplitude-based core, PT2-based frontier).
     Final space: S_new = S_core ∪ S_frontier
     """
@@ -83,13 +80,13 @@ class TwoStageStrategy(EvolutionStrategy):
 class MassLockingStrategy(EvolutionStrategy):
     """
     ASCI-inspired mass-locking evolution.
-  
+    
     Algorithm:
       1. Lock S-space determinants with cumulative probability mass
          ∑|ψᵢ|² ≥ threshold (sorted by |ψᵢ|² descending)
       2. Expand frontier using scorer (typically PT2 energy contribution)
       3. Final space: S_new = S_locked ∪ S_frontier
-  
+    
     Parameters:
         mass_threshold: Cumulative probability threshold ∈ (0, 1)
         frontier_scorer: Scorer for frontier selection (e.g., E2Scorer)
@@ -106,7 +103,7 @@ class MassLockingStrategy(EvolutionStrategy):
             raise ValueError(
                 f"mass_threshold must be in (0, 1), got {mass_threshold}"
             )
-      
+        
         self.mass_threshold = mass_threshold
         self.frontier_scorer = frontier_scorer
         self.frontier_selector = frontier_selector
@@ -123,11 +120,11 @@ class MassLockingStrategy(EvolutionStrategy):
         """Lock determinants with cumulative |ψᵢ|² ≥ threshold."""
         psi_s = np.asarray(psi_cache.psi_s)
         current_s = ctx.space.s_dets
-      
+        
         probs = np.abs(psi_s) ** 2
         sorted_idx = np.argsort(probs)[::-1]
         cumsum = np.cumsum(probs[sorted_idx])
-      
+        
         cutoff = np.searchsorted(cumsum, self.mass_threshold, side="right")
         return current_s[sorted_idx[: cutoff + 1]]
 

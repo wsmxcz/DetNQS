@@ -15,12 +15,10 @@ Date: November, 2025
 """
 
 from .compiler import Compiler
-from .controller import Controller
 from .fitter import Fitter
 
 __all__ = [
     # Core components
     "Compiler",
     "Fitter",
-    "Controller",
 ]

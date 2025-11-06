@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 
 if TYPE_CHECKING:
-    from .dtypes import PyTree, PsiCache
+    from ..dtypes import PyTree, PsiCache
 
 
 def masks_to_vecs(dets: jnp.ndarray, n_orb: int) -> jnp.ndarray:
@@ -40,11 +40,6 @@ def masks_to_vecs(dets: jnp.ndarray, n_orb: int) -> jnp.ndarray:
     
     Returns:
         (..., 2M) occupancy vectors in [0,1]
-    
-    Example:
-        >>> dets = jnp.array([[0b1011, 0b0110]])  # 4 orbitals
-        >>> masks_to_vecs(dets, 4)
-        array([[1,1,0,1, 0,1,1,0]], dtype=float32)
     """
     if dets.shape[-1] != 2:
         raise ValueError(f"Expected dets.shape[-1]=2, got {dets.shape}")
@@ -124,9 +119,7 @@ def create_psi_cache(
     """
     Create wavefunction cache from log amplitudes.
     
-    Computes ψ = exp(log ψ) and precomputes S/C space norms:
-      ||ψₛ||² = Σᵢ₌₁ⁿˢ |ψᵢ|²
-      ||ψ_c||² = Σᵢ₌ₙₛ₊₁ⁿˢ⁺ⁿᶜ |ψᵢ|²
+    Computes ψ = exp(log ψ) and packages into PsiCache structure.
     
     Args:
         log_psi: Log wavefunction, shape (n_s + n_c,)
@@ -134,20 +127,16 @@ def create_psi_cache(
         n_c: C-space dimension
         
     Returns:
-        PsiCache with amplitudes and precomputed norms
+        PsiCache with amplitudes and space partitioning
     """
-    from .dtypes import PsiCache
+    from ..dtypes import PsiCache
     
     psi_all = jnp.exp(log_psi)
     
-    psi_s_norm_sq = jnp.sum(jnp.abs(psi_all[:n_s])**2)
-    psi_c_norm_sq = jnp.sum(jnp.abs(psi_all[n_s:])**2)
-    
     return PsiCache(
-        log_all=log_psi,
+        log_psi_all=log_psi,
         psi_all=psi_all,
-        n_s=n_s,
-        n_c=n_c
+        n_s=n_s
     )
 
 

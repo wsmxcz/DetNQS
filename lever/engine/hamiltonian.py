@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from .. import core
-from ..utils.dtypes import HamOp, SpaceRep
-from ..utils.space import remove_overlaps
+from ..dtypes import COOMatrix, SpaceRep
+from ..utils.space_utils import remove_overlaps
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 # Utility Functions
 # ============================================================================
 
-def _extract_diagonal(ham_op: HamOp) -> np.ndarray:
+def _extract_diagonal(ham_op: COOMatrix) -> np.ndarray:
     """
     Extract diagonal elements H_ii from sparse COO matrix.
     
@@ -53,7 +53,7 @@ def _extract_diagonal(ham_op: HamOp) -> np.ndarray:
     return H_diag
 
 
-def _to_coo_dict(ham_op: HamOp) -> dict[str, np.ndarray | tuple[int, int]]:
+def _to_coo_dict(ham_op: COOMatrix) -> dict[str, np.ndarray | tuple[int, int]]:
     """Convert HamOp to CooData dict for C++ backend."""
     return {
         "row": ham_op.rows,
@@ -63,9 +63,9 @@ def _to_coo_dict(ham_op: HamOp) -> dict[str, np.ndarray | tuple[int, int]]:
     }
 
 
-def _from_coo_dict(coo_dict: dict) -> HamOp:
+def _from_coo_dict(coo_dict: dict) -> COOMatrix:
     """Convert C++ CooData dict to HamOp."""
-    return HamOp(
+    return COOMatrix(
         rows=coo_dict["row"],
         cols=coo_dict["col"],
         vals=coo_dict["val"],
@@ -85,7 +85,7 @@ def get_ham_proxy(
     psi_S: NDArray[np.float64] | None = None,
     screen_eps: float = 1e-6,
     diag_shift: float = 0.5,
-) -> tuple[HamOp, HamOp, SpaceRep]:
+) -> tuple[COOMatrix, COOMatrix, SpaceRep]:
     """
     Build H_SS and H_SC with unified screening strategies.
     
@@ -153,13 +153,13 @@ def get_ham_proxy(
     C_dets = result["det_C"]
     size_C = result["size_C"]
 
-    ham_ss = HamOp(
+    ham_ss = COOMatrix(
         rows=coo_ss["row"],
         cols=coo_ss["col"],
         vals=coo_ss["val"],
         shape=(size_S, size_S),
     )
-    ham_sc = HamOp(
+    ham_sc = COOMatrix(
         rows=coo_sc["row"],
         cols=coo_sc["col"],
         vals=coo_sc["val"],
@@ -191,7 +191,7 @@ def get_ham_ss(
     S_dets: NDArray[np.uint64],
     int_ctx: core.IntCtx,
     n_orbitals: int,
-) -> tuple[HamOp, SpaceRep]:
+) -> tuple[COOMatrix, SpaceRep]:
     """
     Build H_SS block without C-space discovery.
     
@@ -215,7 +215,7 @@ def get_ham_ss(
         n_orbitals=n_orbitals,
     )
     
-    ham_ss = HamOp(
+    ham_ss = COOMatrix(
         rows=coo_ss["row"],
         cols=coo_ss["col"],
         vals=coo_ss["val"],
@@ -243,7 +243,7 @@ def get_ham_full(
     C_dets: NDArray[np.uint64],
     int_ctx: core.IntCtx,
     n_orbitals: int,
-) -> tuple[HamOp, HamOp, HamOp, SpaceRep]:
+) -> tuple[COOMatrix, COOMatrix, COOMatrix, SpaceRep]:
     """
     Build complete Hamiltonian blocks for exact S ∪ C subspace.
     
@@ -273,13 +273,13 @@ def get_ham_full(
     )
     
     coo_ss, coo_sc = result_S["H_SS"], result_S["H_SC"]
-    ham_ss = HamOp(
+    ham_ss = COOMatrix(
         rows=coo_ss["row"],
         cols=coo_ss["col"],
         vals=coo_ss["val"],
         shape=(size_S, size_S),
     )
-    ham_sc = HamOp(
+    ham_sc = COOMatrix(
         rows=coo_sc["row"],
         cols=coo_sc["col"],
         vals=coo_sc["val"],
@@ -295,7 +295,7 @@ def get_ham_full(
     )
     
     coo_cc = result_C["H_SS"]
-    ham_cc = HamOp(
+    ham_cc = COOMatrix(
         rows=coo_cc["row"],
         cols=coo_cc["col"],
         vals=coo_cc["val"],
@@ -320,14 +320,14 @@ def get_ham_full(
 # ============================================================================
 
 def get_ham_eff(
-    ham_ss: HamOp,
-    ham_sc: HamOp,
+    ham_ss: COOMatrix,
+    ham_sc: COOMatrix,
     h_cc_diag: NDArray[np.float64],
     e_ref: float,
     reg_type: str = "sigma",
     num_eps: float = 1e-12,
     upper_only: bool = True,
-) -> HamOp:
+) -> COOMatrix:
     """
     Assemble effective Hamiltonian via perturbative correction.
     

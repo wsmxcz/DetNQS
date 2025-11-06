@@ -2,75 +2,57 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LEVER utility module: core data structures and computational primitives.
+Utility functions for LEVER framework.
 
-Exports:
-  - Type aliases: PyTree, SpMVFn, LogPsiFn, optimizer states
-  - Physical types: HamOp, SpaceRep, PsiCache
-  - Result containers: Contractions, StepResult, GradResult, ScoreResult
-  - Workflow state: Workspace, FitResult, EvolutionState
-  - Helper functions: feature engineering, logging, PyTree ops, space ops
+Provides JAX operations, space manipulations, feature transformations,
+and logging infrastructure.
 
 File: lever/utils/__init__.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
-from .dtypes import *
-from .features import *
-from .logger import *
-from .pytree import *
-from .space import *
+from .features import (
+    compute_normalized_amplitudes,
+    create_psi_cache,
+    dets_to_features,
+    masks_to_vecs,
+)
+from .jax_utils import (
+    tree_add,
+    tree_dot,
+    tree_norm,
+    tree_scale,
+    tree_sub,
+)
+from .logger import Logger
+from .space_utils import (
+    count_overlaps,
+    get_space_overlap,
+    merge_spaces,
+    remove_overlaps,
+)
 
 __all__ = [
-    # ===== Type Aliases =====
-    "PyTree",
-    "SpMVFn",
-    "LogPsiFn",
-    "JVPFn",
-    "VJPFn",
-    "OptimizerState",
-  
-    # ===== Physical System =====
-    "HamOp",
-    "SpaceRep",
-    "PsiCache",
-  
-    # ===== Optimizer State =====
-    "OptState",
-    "GeometryTape",
-  
-    # ===== Result Containers =====
-    "Contractions",
-    "StepResult",
-    "GradResult",
-    "ScoreResult",
-  
-    # ===== Workflow State =====
-    "Workspace",
-    "FitResult",
-    "EvolutionState",
-  
-    # ===== Feature Engineering =====
+    # Features
     "masks_to_vecs",
     "dets_to_features",
     "compute_normalized_amplitudes",
     "create_psi_cache",
-  
-    # ===== Logging =====
-    "LeverLogger",
-    "get_logger",
-  
-    # ===== PyTree Operations =====
+    
+    # JAX utilities
     "tree_dot",
     "tree_scale",
     "tree_add",
     "tree_sub",
     "tree_norm",
-  
-    # ===== Space Manipulation =====
+    
+    # Space operations
     "remove_overlaps",
     "merge_spaces",
     "get_space_overlap",
     "count_overlaps",
+    
+    # Logging
+    "Logger",
 ]

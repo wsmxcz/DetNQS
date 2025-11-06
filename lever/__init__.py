@@ -19,13 +19,14 @@ from .core import (
 )
 
 from .engine.hamiltonian import (
-    HamOp,
+    COOMatrix,
     SpaceRep,
     get_ham_proxy,
 )
 
 from . import models
 from . import engine
+from . import analysis
 
 # It's also good practice to define a package version here.
 __version__ = "0.1.0"
@@ -39,7 +40,7 @@ __all__ = [
     "get_ham_conn",
     "get_ham_block",
     "get_ham_conn_amp",
-    "HamOp",
+    "COOMatrix",
     "SpaceRep",
     "get_ham_proxy",
 ]

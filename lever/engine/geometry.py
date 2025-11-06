@@ -26,11 +26,11 @@ from jax import vmap
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 
-from ..utils.pytree import tree_dot, tree_scale, tree_sub, tree_add
-from ..utils.dtypes import GeometryTape
+from ..utils.jax_utils import tree_dot, tree_scale, tree_sub, tree_add
+from ..dtypes import GeometryTape
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import PyTree, LogPsiFn
+    from ..dtypes import PyTree, LogPsiFn
 
 
 def prepare_tape(

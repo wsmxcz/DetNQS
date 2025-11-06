@@ -21,7 +21,7 @@ import jax.scipy.sparse.linalg
 from jax.flatten_util import ravel_pytree
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import PyTree
+    from ..dtypes import PyTree
 
 
 def solve_cg(

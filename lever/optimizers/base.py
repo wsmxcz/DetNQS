@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 import flax.struct
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import PyTree, GeometryTape
+    from ..dtypes import PyTree, GeometryTape
 
 
 # ============================================================================
@@ -229,7 +229,7 @@ class Optimizer:
         )
         
         # Scale direction: Δθ = α·δ
-        from ..utils.pytree import tree_scale
+        from ..utils.jax_utils import tree_scale
         updates = tree_scale(direction, step_size)
         
         # Update state

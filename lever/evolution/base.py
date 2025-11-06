@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Space evolution protocols with OuterCtx integration.
+Space evolution protocols for determinant selection.
 
 Defines interfaces for:
   - Scoring: Determinant importance evaluation
@@ -16,15 +16,14 @@ Date: November, 2025
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import Protocol, TYPE_CHECKING
 
 import numpy as np
-from ..utils.dtypes import ScoreResult
+from ..dtypes import ScoreResult
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import OuterCtx, PyTree, PsiCache
+    from ..dtypes import OuterCtx, PsiCache
 
-# --- Evolution Protocols ---
 
 class Scorer(Protocol):
     """
@@ -59,12 +58,12 @@ class Selector(Protocol):
     def select(self, result: ScoreResult) -> np.ndarray:
         """
         Select new S-space from scored determinants.
-      
+        
         Args:
             result: Scored determinants from Scorer
-      
+        
         Returns:
-            Selected determinants (N×M array)
+            Selected determinants (n, 2) array
         """
         ...
 
@@ -86,7 +85,7 @@ class EvolutionStrategy(Protocol):
             psi_cache: Cached wavefunction amplitudes
         
         Returns:
-            New S-space determinants (N×M array)
+            New S-space determinants (n, 2) array
         """
         ...
 

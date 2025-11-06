@@ -12,7 +12,7 @@ Date: November, 2025
 import jax
 import jax.numpy as jnp
 
-from lever import analysis, config, driver, evolution, models
+from lever import core, analysis, config, driver, evolution, models
 from lever.optimizers import adam
 
 # JAX device configuration
@@ -24,10 +24,10 @@ jax.config.update("jax_log_compiles", False)
 def main():
     # ========== System Definition ==========
     sys_cfg = config.SystemConfig(
-        fcidump_path="../benchmark/FCIDUMP/C3H8_sto3g.FCIDUMP",
-        n_orbitals=23,
-        n_alpha=13,
-        n_beta=13
+        fcidump_path="../benchmark/FCIDUMP/H2O_631g.FCIDUMP",
+        n_orbitals=13,
+        n_alpha=5,
+        n_beta=5
     )
     
     # ========== Hamiltonian Configuration ==========
@@ -40,10 +40,13 @@ def main():
     
     # ========== Loop Control ==========
     loop_cfg = config.LoopConfig(
-        max_cycles=20,
-        max_steps=1000,
+        max_outer=10,
+        outer_tol=1e-5,
+        outer_patience=3,
+        inner_steps=500,
         chunk_size=8192
     )
+
     
     # ========== Evaluation Configuration ==========
     eval_cfg = config.EvaluationConfig(
@@ -58,7 +61,7 @@ def main():
         hamiltonian=ham_cfg,
         loop=loop_cfg,
         evaluation=eval_cfg,
-        compute_mode=config.ComputeMode.EFFECTIVE,
+        compute_mode=config.ComputeMode.PROXY,
     )
 
     # ========== Wavefunction Model ==========
@@ -74,30 +77,16 @@ def main():
         param_dtype=jnp.complex64 
     )
     
-    # RBM:
-    # model = models.RBM(
-    #     n_orbitals=sys_cfg.n_orbitals,
-    #     seed=42,
-    #     alpha=2  # Hidden/visible ratio
-    # )
-    
     # ========== Optimizer ==========
     optimizer = adam(
         learning_rate=5e-4,
-        weight_decay=1e-4    # L2 regularization
+        weight_decay=1e-4
     )
-    
-    # Stochastic Reconfiguration
-    # optimizer = sr(
-    #     damping=1e-3,
-    #     backend="dense",     # or "cg" for conjugate gradient
-    #     learning_rate=0.05
-    # )
     
     # ========== Evolution Strategy ==========
     evo_strategy = evolution.BasicStrategy(
         scorer=evolution.scores.AmpScorer(),
-        selector=evolution.selectors.TopKSelector(k=3200)
+        selector=evolution.selectors.TopKSelector(k=400)
     )
 
     # ========== Run LEVER Workflow ==========
@@ -105,9 +94,18 @@ def main():
     results = lever_driver.run()
 
     # ========== Post-Analysis ==========
-    # suite = analysis.AnalysisSuite(results, lever_driver.controller.int_ctx)
-    # suite.print_summary()
-    # suite.plot_conv(sys_name="N2_STO-3G")
+    e_fci = -76.12089
+    
+    # Print summary with FCI comparison
+    analysis.print_summary(results, e_fci=e_fci, sys_name="H2O")
+    
+    # Plot convergence trajectory
+    analysis.plot_convergence(
+        results, 
+        e_fci=e_fci,
+        sys_name="H2O",
+        save_path="convergence.pdf"
+    )
 
 
 if __name__ == "__main__":

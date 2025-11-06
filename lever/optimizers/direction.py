@@ -26,7 +26,7 @@ from .base import DirectionState
 from .linalg import solve_cg, solve_cholesky
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import PyTree, GeometryTape
+    from ..dtypes import PyTree, GeometryTape
 
 
 # ============================================================================

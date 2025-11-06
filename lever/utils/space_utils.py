@@ -7,7 +7,7 @@ Determinant space manipulation utilities.
 Provides set operations on determinant collections represented as
 NumPy uint64 arrays with shape (n_dets, 2) encoding [α-string, β-string].
 
-File: lever/utils/space.py
+File: lever/utils/space_utils.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
@@ -33,13 +33,7 @@ def remove_overlaps(
         exclude: Determinants to remove, shape (m, 2)
         
     Returns:
-        Filtered determinants with exclude elements removed, shape (k≤n, 2)
-        
-    Example:
-        >>> target = np.array([[0b11, 0b10], [0b01, 0b11]], dtype=np.uint64)
-        >>> exclude = np.array([[0b11, 0b10]], dtype=np.uint64)
-        >>> remove_overlaps(target, exclude)
-        array([[1, 3]], dtype=uint64)
+        Filtered determinants, shape (k≤n, 2)
     """
     if len(target) == 0:
         return np.empty((0, 2), dtype=np.uint64)
@@ -76,12 +70,6 @@ def merge_spaces(
         
     Returns:
         Merged unique determinants, shape (n_unique, 2)
-        
-    Example:
-        >>> s1 = np.array([[0b11, 0b10]], dtype=np.uint64)
-        >>> s2 = np.array([[0b11, 0b10], [0b01, 0b11]], dtype=np.uint64)
-        >>> merge_spaces(s1, s2)
-        array([[3, 2], [1, 3]], dtype=uint64)
     """
     # Filter empty arrays
     non_empty = [s for s in spaces if len(s) > 0]

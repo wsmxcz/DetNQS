@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Determinant importance scoring with OuterCtx.
+Determinant importance scoring strategies.
+
+Provides amplitude-based and energy-based scoring functions
+for space evolution.
 
 File: lever/evolution/scores.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -13,16 +16,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import jax.numpy as jnp
 import numpy as np
-from ..utils.dtypes import ScoreResult
+from ..dtypes import ScoreResult
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import OuterCtx, PyTree, PsiCache
+    from ..dtypes import OuterCtx, PsiCache
 
 
 class AmpScorer:
-    """Scores by wavefunction amplitude |ψ_i|."""
+    """Scores determinants by wavefunction amplitude |ψ_i|."""
     
     def score(self, ctx: OuterCtx, psi_cache: PsiCache) -> ScoreResult:
         """

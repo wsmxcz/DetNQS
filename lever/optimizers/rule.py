@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from .base import RuleState
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import PyTree
+    from ..dtypes import PyTree
 
 
 @dataclass

@@ -21,12 +21,12 @@ import jax.numpy as jnp
 from jax import lax
 import numpy as np
 
-from ..utils.dtypes import Contractions, LogPsiFn, SpMVFn
+from ..dtypes import Contractions, LogPsiFn, SpMVFn
 from ..config import ComputeMode, PrecisionConfig
 from . import kernels
 
 if TYPE_CHECKING:
-    from ..utils.dtypes import PyTree
+    from ..dtypes import PyTree
 
 
 # ============================================================================
@@ -72,21 +72,24 @@ def _pad_to_fixed_chunks(
 
 def create_logpsi_evals(
     model_fn: Callable,
+    feat_s: jnp.ndarray,
+    feat_c: jnp.ndarray,
     mode: ComputeMode,
     normalize: bool,
     device_complex: jnp.dtype,
     *,
     chunk_size: int | None = None,
-) -> Union[Tuple[LogPsiFn, LogPsiFn], LogPsiFn]:
+) -> Union[Tuple[Callable, Callable], Callable]:
     """
-    Create log(ψ) evaluators with optional memory-efficient chunking.
+    Create log(ψ) evaluators with features bound as closure captures.
     
-    Supports two execution modes:
-      - Small batch: Direct evaluation via single vmap
-      - Large batch: Chunked evaluation via lax.scan (controlled memory)
+    Returns closures that only require params, avoiding JIT constant folding
+    of large feature arrays.
     
     Args:
         model_fn: Neural network forward pass (batch-aware)
+        feat_s: S-space features (n_s, feat_dim)
+        feat_c: C-space features (n_c, feat_dim)
         mode: Compute mode (EFFECTIVE/ASYMMETRIC/PROXY)
         normalize: Apply log-domain normalization
         device_complex: Output dtype (jnp.complex64/128)
@@ -95,27 +98,16 @@ def create_logpsi_evals(
     Returns:
         For EFFECTIVE/ASYMMETRIC: (eval_s, eval_full) tuple
         For PROXY: eval_full function
+        All returned functions have signature: params → log_psi
     """
     
     def _batch_apply(params: PyTree, features: jnp.ndarray) -> jnp.ndarray:
-        """
-        Vectorized model application: (batch, feat_dim) → (batch,)
-        
-        Directly calls model_fn which already handles batching internally.
-        """
+        """Vectorized model application: (batch, feat_dim) → (batch,)"""
         outputs = model_fn(params, features)
         return jnp.asarray(outputs, dtype=device_complex)
     
     def _chunked_apply(params: PyTree, features: jnp.ndarray) -> jnp.ndarray:
-        """
-        Memory-efficient chunked inference (no normalization).
-        
-        Processes large batches in fixed-size chunks via lax.scan,
-        returning raw log(ψ) values. Normalization handled by caller.
-        
-        Returns:
-            Raw log(ψ) for all samples: (n_samples,)
-        """
+        """Memory-efficient chunked inference."""
         n_samples = features.shape[0]
         
         # Fast path: small enough for single batch
@@ -159,23 +151,35 @@ def create_logpsi_evals(
         log_norm_sq = jax.lax.stop_gradient(log_norm_sq)
         return log_all - 0.5 * log_norm_sq
     
-    def eval_s(params: PyTree, feat_s: jnp.ndarray) -> jnp.ndarray:
+    # Build internal evaluators (these still take features)
+    def _eval_s_internal(params: PyTree, features: jnp.ndarray) -> jnp.ndarray:
         """Evaluate S-space with optional chunking and S-normalization."""
-        log_s = _chunked_apply(params, feat_s)  # Raw outputs
+        log_s = _chunked_apply(params, features)
         log_s = jnp.asarray(log_s, dtype=device_complex)
-        return _norm_s(log_s)  # Apply normalization once
+        return _norm_s(log_s)
     
-    def eval_full(params: PyTree, feat_s: jnp.ndarray, feat_c: jnp.ndarray) -> jnp.ndarray:
+    def _eval_full_internal(params: PyTree, fs: jnp.ndarray, fc: jnp.ndarray) -> jnp.ndarray:
         """Evaluate full T-space with optional chunking and full normalization."""
-        all_feat = jnp.concatenate([feat_s, feat_c], axis=0)
-        log_all = _chunked_apply(params, all_feat)  # Raw outputs
+        all_feat = jnp.concatenate([fs, fc], axis=0)
+        log_all = _chunked_apply(params, all_feat)
         log_all = jnp.asarray(log_all, dtype=device_complex)
-        return _norm_full(log_all, feat_s.shape[0])  # Apply normalization once
+        return _norm_full(log_all, fs.shape[0])
     
+    # Create closures with captured features (avoids JIT constant folding)
+    n_s = feat_s.shape[0]
+    
+    def eval_s_closure(params: PyTree) -> jnp.ndarray:
+        """S-space evaluator with captured features."""
+        return _eval_s_internal(params, feat_s)
+    
+    def eval_full_closure(params: PyTree) -> jnp.ndarray:
+        """Full T-space evaluator with captured features."""
+        return _eval_full_internal(params, feat_s, feat_c)
+    
+    # Return closures based on mode
     if mode in (ComputeMode.EFFECTIVE, ComputeMode.ASYMMETRIC):
-        return (eval_s, eval_full)
-    return eval_full
-
+        return (eval_s_closure, eval_full_closure)
+    return eval_full_closure
 
 # ============================================================================
 # SpMV Closure Factory

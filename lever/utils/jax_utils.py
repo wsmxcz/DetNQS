@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-PyTree arithmetic operations for parameter space manipulation.
+JAX PyTree arithmetic operations.
 
-Provides element-wise operations on PyTree structures, fully JIT-compatible
-with JAX's tree mapping infrastructure.
+Provides element-wise operations on nested parameter structures,
+fully compatible with JAX's tree mapping infrastructure.
 
-File: lever/utils/pytree.py
+File: lever/utils/jax_utils.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
@@ -20,14 +20,13 @@ import jax
 import jax.numpy as jnp
 
 if TYPE_CHECKING:
-    from .dtypes import PyTree
+    from ..dtypes import PyTree
 
 
 def tree_dot(a: PyTree, b: PyTree) -> jnp.ndarray:
     """
-    Compute inner product: ⟨a, b⟩ = Σᵢ conj(aᵢ)·bᵢ.
+    Compute conjugate-linear inner product: ⟨a, b⟩ = Σᵢ conj(aᵢ)·bᵢ.
     
-    Flattens both trees and computes conjugate-linear inner product.
     Handles complex parameters correctly via conjugation.
     
     Args:
@@ -36,11 +35,6 @@ def tree_dot(a: PyTree, b: PyTree) -> jnp.ndarray:
         
     Returns:
         Scalar product (complex if inputs are complex)
-        
-    Example:
-        >>> p = {'w': jnp.array([1+1j, 2]), 'b': jnp.array([3])}
-        >>> g = {'w': jnp.array([0.1, 0.2]), 'b': jnp.array([0.3])}
-        >>> tree_dot(g, p)  # 0.1·(1-1j) + 0.2·2 + 0.3·3
     """
     products = jax.tree.map(lambda x, y: jnp.sum(jnp.conj(x) * y), a, b)
     leaves = jax.tree.leaves(products)
@@ -48,7 +42,6 @@ def tree_dot(a: PyTree, b: PyTree) -> jnp.ndarray:
     if not leaves:
         return jnp.array(0.0)
     
-    # Stack and sum in single JAX op for better JIT efficiency
     return jnp.sum(jnp.stack(leaves))
 
 

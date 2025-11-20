@@ -17,8 +17,9 @@ import numpy.typing as npt
 
 DetArray = npt.NDArray[np.uint64]  # Shape (N, 2): determinant bitstrings
 F64Array = npt.NDArray[np.float64]  # Shape (N,): floating point values
+C128Array = npt.NDArray[np.complex128] # Shape (N,): complex values
 U32Array = npt.NDArray[np.uint32]   # Shape (N,): integer indices
-
+I32Array = npt.NDArray[np.int32]   # Shape (N,): integer indices
 
 class CooData(TypedDict):
     """Sparse matrix in COO format."""
@@ -43,6 +44,17 @@ class HamConnResult(TypedDict):
     det_C: DetArray     # Discovered C-space determinants
     size_C: int         # Number of C-space determinants
 
+class LocalConnRow(TypedDict):
+    """Local Hamiltonian row for a single determinant."""
+    dets: DetArray     # Connected ket determinants, shape (M, 2)
+    values: F64Array   # Matrix elements <bra|H|ket>, shape (M,)
+
+
+class LocalConnBatch(TypedDict):
+    """CSR-like local Hamiltonian connectivity for a batch of determinants."""
+    offsets: I32Array  # Row offsets, shape (N_samples + 1,)
+    dets: DetArray     # Concatenated kets, shape (M, 2)
+    values: F64Array   # Matrix elements, shape (M,)
 
 # --- Integral Context ---
 
@@ -259,14 +271,97 @@ def get_ham_eff(
     """
     ...
 
+def get_local_conn(
+    det: npt.NDArray[np.uint64],  # shape (2,)
+    int_ctx: IntCtx,
+    n_orbitals: int,
+    use_heatbath: bool = False,
+    eps1: float = 1e-6,
+) -> LocalConnRow:
+    """
+    Build local Hamiltonian row for a single determinant.
+
+    Args:
+        det: Single determinant bitstring [alpha_bits, beta_bits], shape (2,)
+        int_ctx: Integral context
+        n_orbitals: Number of spatial orbitals
+        use_heatbath: Enable Heat-Bath screening for excitations
+        eps1: Screening threshold
+
+    Returns:
+        Dict with:
+            'dets': connected determinants, shape (M, 2)
+            'values': H matrix elements, shape (M,)
+    """
+    ...
+
+
+def get_local_connections(
+    dets: DetArray,
+    int_ctx: IntCtx,
+    n_orbitals: int,
+    use_heatbath: bool = False,
+    eps1: float = 1e-6,
+) -> LocalConnBatch:
+    """
+    Build local Hamiltonian connectivity for a batch of determinants.
+
+    Uses the same screening policy as `get_local_conn`, but returns a
+    CSR-like structure suitable for batched local energy evaluation.
+
+    Args:
+        dets: Bra determinants, shape (N, 2)
+        int_ctx: Integral context
+        n_orbitals: Number of spatial orbitals
+        use_heatbath: Enable Heat-Bath screening
+        eps1: Screening threshold
+
+    Returns:
+        Dict with:
+            'offsets': int32[N+1] CSR row offsets
+            'dets': uint64[M, 2] concatenated ket determinants
+            'values': float64[M]  matrix elements per CSR entry
+    """
+    ...
+    
+def compute_variational_energy(
+    dets: DetArray,
+    coeffs: C128Array,
+    int_ctx: IntCtx,
+    n_orbitals: int,
+    use_heatbath: bool = False,
+    eps1: float = 1e-6,
+) -> tuple[float, float]:
+    """
+    Compute exact variational energy <Psi|H|Psi> and norm <Psi|Psi> on a fixed basis.
+    
+    Uses a streaming algorithm to evaluate H|Psi> without constructing the full matrix.
+    
+    Args:
+        dets: Determinants defining the subspace (S U C), shape (N, 2)
+        coeffs: Complex coefficients aligned with dets, shape (N,)
+        int_ctx: Integral context
+        n_orbitals: Number of spatial orbitals
+        use_heatbath: Enable heat-bath screening for doubles
+        eps1: Screening threshold for heat-bath/singles
+        
+    Returns:
+        (e_el, norm) tuple where:
+          e_el = <Psi|H|Psi> electronic energy (no E_nuc)
+          norm = <Psi|Psi> squared norm
+    """
+    ...
 
 __all__ = [
     "DetArray",
     "F64Array",
     "U32Array",
+    "I32Array",
     "CooData",
     "HamBlockResult",
     "HamConnResult",
+    "LocalConnRow",
+    "LocalConnBatch",
     "IntCtx",
     "gen_fci_dets",
     "gen_excited_dets",
@@ -275,4 +370,7 @@ __all__ = [
     "get_ham_conn",
     "get_ham_conn_amp",
     "get_ham_eff",
+    "get_local_conn",
+    "get_local_connections",
+    "compute_variational_energy",
 ]

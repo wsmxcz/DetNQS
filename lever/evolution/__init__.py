@@ -28,7 +28,7 @@ Date: October, 2025
 
 from . import scores, selectors, strategies
 from .base import EvolutionStrategy, Scorer, Selector
-from .strategies import BasicStrategy, MassLockingStrategy, TwoStageStrategy
+from .strategies import BasicStrategy, MassLockingStrategy, TwoStageStrategy, CumulativeMassStrategy
 
 __all__ = [
     # Core abstractions
@@ -38,6 +38,7 @@ __all__ = [
     # Concrete strategies
     "BasicStrategy",
     "MassLockingStrategy", 
+    "CumulativeMassStrategy",
     "TwoStageStrategy",
     # Submodules
     "scores",

@@ -2,20 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Post-processing and analysis tools for LEVER calculations.
+Analysis module for quantum states.
 
-Provides energy evaluation and convergence visualization.
-
-File: lever/analysis/__init__.py
-Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: November, 2025
+Submodules:
+- exact: Deterministic calculations (Diagonalization, FCI).
+- inference: VMC energy estimation (Placeholder).
+- sampling: MCMC sampling algorithms (Placeholder).
+- statistics: Error analysis and autocorrelation (Placeholder).
 """
 
-from .evaluator import EnergyEvaluator
-from .plotting import plot_convergence, print_summary
+from .exact import VariationalEvaluator
+from .mcmc import PostMCMC
 
-__all__ = [
-    "EnergyEvaluator",
-    "plot_convergence",
-    "print_summary",
-]
+__all__ = ["VariationalEvaluator", "PostMCMC"]

@@ -26,10 +26,12 @@
 #include <lever/hamiltonian/build_ham.hpp>
 #include <lever/hamiltonian/ham_eff.hpp>
 #include <lever/hamiltonian/ham_eval.hpp>
+#include <lever/hamiltonian/local_conn.hpp>
 #include <lever/integral/hb_table.hpp>
 #include <lever/integral/integral_mo.hpp>
 #include <lever/integral/integral_so.hpp>
 
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -49,11 +51,14 @@ using lever::u64;
 // ============================================================================
 // Type Aliases for NumPy Arrays
 // ============================================================================
-using DetArrayRO = nb::ndarray<const u64, nb::shape<-1, 2>, nb::c_contig, nb::device::cpu>;
-using F64VecRO   = nb::ndarray<const double, nb::shape<-1>, nb::c_contig, nb::device::cpu>;
-using DetArrayOut = nb::ndarray<u64, nb::numpy, nb::shape<-1, 2>>;
-using F64VecOut   = nb::ndarray<double, nb::numpy, nb::shape<-1>>;
-using U32VecOut   = nb::ndarray<u32, nb::numpy, nb::shape<-1>>;
+using DetArrayRO   = nb::ndarray<const u64, nb::shape<-1, 2>, nb::c_contig, nb::device::cpu>;
+using F64VecRO     = nb::ndarray<const double, nb::shape<-1>, nb::c_contig, nb::device::cpu>;
+using DetArrayOut  = nb::ndarray<u64, nb::numpy, nb::shape<-1, 2>>;
+using F64VecOut    = nb::ndarray<double, nb::numpy, nb::shape<-1>>;
+using U32VecOut    = nb::ndarray<u32, nb::numpy, nb::shape<-1>>;
+using I32VecOut    = nb::ndarray<int32_t, nb::numpy, nb::shape<-1>>;
+using C128VecRO = nb::ndarray<const std::complex<double>, nb::shape<-1>, nb::c_contig, nb::device::cpu>;
+using SingleDetRO  = nb::ndarray<const u64, nb::shape<2>, nb::c_contig, nb::device::cpu>;
 
 // ============================================================================
 // IntCtx: Integral Context with Optional Heat-Bath Cache
@@ -200,6 +205,24 @@ struct IntCtx {
     }
     
     return coo;
+}
+
+/**
+ * Convert std::vector<int> → NumPy 1D array (int32).
+ */
+[[nodiscard]] inline I32VecOut from_int_vector(const std::vector<int>& xs) {
+    const size_t N = xs.size();
+    auto* data = new int32_t[N];
+
+    for (size_t i = 0; i < N; ++i) {
+        data[i] = static_cast<int32_t>(xs[i]);
+    }
+
+    nb::capsule owner(data, [](void* p) noexcept {
+        delete[] static_cast<int32_t*>(p);
+    });
+
+    return I32VecOut(data, {N}, owner);
 }
 
 /**
@@ -452,4 +475,153 @@ NB_MODULE(_lever_cpp, m) {
           "epsilon"_a = 1e-12,
           "upper_only"_a = true,
           "Assemble effective Hamiltonian via downfolding: H_eff = H_SS + H_SC·D⁻¹·H_CS");
+
+    // ------------------------------------------------------------------------
+    // Local Hamiltonian connectivity for a single determinant
+    // ------------------------------------------------------------------------
+    m.def("get_local_conn",
+          [](SingleDetRO det,
+             const IntCtx* ctx,
+             int n_orb,
+             bool use_heatbath,
+             double eps1) -> nb::dict {
+              if (det.ndim() != 1 || det.shape(0) != 2) {
+                  throw std::invalid_argument(
+                      "get_local_conn: expected det with shape (2,)"
+                  );
+              }
+
+              Det bra{det.data()[0], det.data()[1]};
+
+              const HeatBathTable* hb = nullptr;
+              if (use_heatbath) {
+                  if (!ctx->hb) {
+                      throw std::invalid_argument(
+                          "get_local_conn: Heat-bath requested but IntCtx.hb is null "
+                          "(call IntCtx.hb_prepare() first)"
+                      );
+                  }
+                  hb = ctx->hb.get();
+              }
+
+              auto row = lever::get_local_conn(
+                  bra, ctx->ham, n_orb, hb, eps1, use_heatbath
+              );
+
+              nb::dict out;
+              out["dets"]   = from_det_vector(row.dets);
+              out["values"] = from_double_vector(row.values);
+              return out;
+          },
+          "det"_a,
+          "int_ctx"_a,
+          "n_orbitals"_a,
+          "use_heatbath"_a = false,
+          "eps1"_a = 1e-6,
+          "Build local Hamiltonian row for a single determinant.\n\n"
+          "Args:\n"
+          "  det         : uint64[2] = [alpha_bits, beta_bits]\n"
+          "  int_ctx     : integral context\n"
+          "  n_orbitals  : number of spatial orbitals\n"
+          "  use_heatbath: enable Heat-Bath screening for doubles and singles\n"
+          "  eps1        : Heat-Bath / single threshold\n\n"
+          "Returns:\n"
+          "  dict with 'dets' (N,2) and 'values' (N,) arrays.");
+
+    // ------------------------------------------------------------------------
+    // Local Hamiltonian connectivity for a batch of determinants (CSR-like)
+    // ------------------------------------------------------------------------
+    m.def("get_local_connections",
+          [](DetArrayRO dets,
+             const IntCtx* ctx,
+             int n_orb,
+             bool use_heatbath,
+             double eps1) -> nb::dict {
+              // Convert input determinants
+              auto samples_vec = to_det_vector(dets);
+
+              const HeatBathTable* hb = nullptr;
+              if (use_heatbath) {
+                  if (!ctx->hb) {
+                      throw std::invalid_argument(
+                          "get_local_connections: Heat-bath requested but IntCtx.hb is null "
+                          "(call IntCtx.hb_prepare() first)"
+                      );
+                  }
+                  hb = ctx->hb.get();
+              }
+
+              auto batch = lever::get_local_connections(
+                  std::span<const Det>(samples_vec.data(), samples_vec.size()),
+                  ctx->ham,
+                  n_orb,
+                  hb,
+                  eps1,
+                  use_heatbath
+              );
+
+              nb::dict out;
+              out["offsets"] = from_int_vector(batch.offsets);
+              out["dets"]    = from_det_vector(batch.dets);
+              out["values"]  = from_double_vector(batch.values);
+              return out;
+          },
+          "dets"_a,
+          "int_ctx"_a,
+          "n_orbitals"_a,
+          "use_heatbath"_a = false,
+          "eps1"_a = 1e-6,
+          "Build local Hamiltonian connections for a batch of determinants.\n\n"
+          "Args:\n"
+          "  dets        : uint64[N,2] determinant array\n"
+          "  int_ctx     : integral context\n"
+          "  n_orbitals  : number of spatial orbitals\n"
+          "  use_heatbath: enable Heat-Bath screening for doubles and singles\n"
+          "  eps1        : Heat-Bath / single threshold\n\n"
+          "Returns:\n"
+          "  dict with:\n"
+          "    'offsets' : int32[N+1] CSR row offsets\n"
+          "    'dets'    : uint64[M,2] concatenated ket determinants\n"
+          "    'values'  : float64[M]  ⟨bra_i|H|ket_j⟩ values in CSR order.");
+
+    // ------------------------------------------------------------------------
+    // Streaming variational energy: <Psi|H|Psi> on a fixed determinant basis
+    // ------------------------------------------------------------------------
+    m.def("compute_variational_energy",
+          [](DetArrayRO dets,
+             C128VecRO coeffs,
+             const IntCtx* ctx,
+             int n_orb,
+             bool use_heatbath,
+             double eps1) -> nb::tuple {
+              
+              auto basis_vec = to_det_vector(dets);
+              
+              if (coeffs.ndim() != 1) {
+                   throw std::invalid_argument("coeffs must be 1D");
+              }
+              if (static_cast<size_t>(coeffs.shape(0)) != basis_vec.size()) {
+                   throw std::invalid_argument("coeffs size mismatch");
+              }
+
+              // Zero-copy view of coefficients
+              std::span<const std::complex<double>> c_span(
+                  coeffs.data(), coeffs.shape(0)
+              );
+
+              auto res = lever::compute_variational_energy(
+                  std::span<const Det>(basis_vec),
+                  c_span,
+                  ctx->ham,
+                  n_orb,
+                  use_heatbath ? ctx->hb.get() : nullptr,
+                  eps1,
+                  use_heatbath
+              );
+
+              return nb::make_tuple(res.e_el, res.norm);
+          },
+          "dets"_a, "coeffs"_a, "int_ctx"_a, "n_orbitals"_a,
+          "use_heatbath"_a = false, "eps1"_a = 1e-6,
+          "Compute <Psi|H|Psi> and <Psi|Psi> on fixed basis (S U C).");
 }

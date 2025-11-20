@@ -168,6 +168,8 @@ class LeverResult:
     total_time: float
     config: Any
 
+    final_space: SpaceRep | None = None
+    final_psi_cache: "PsiCache | None" = None
 
 # ============================================================================
 # Engine Types (JAX Computations & Intermediate Results)

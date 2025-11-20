@@ -63,7 +63,7 @@ class Jastrow(nn.Module):
         V_eff = 0.5 * (V + V.T) - jnp.diag(jnp.diag(V))
         two_body = 0.5 * jnp.dot(x, jnp.dot(V_eff, x))
 
-        return one_body + two_body
+        return two_body
 
 
 __all__ = ["Jastrow"]

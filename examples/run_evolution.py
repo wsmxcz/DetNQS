@@ -16,8 +16,8 @@ Date: November, 2025
 import jax
 import jax.numpy as jnp
 
-from lever import analysis, config, driver, evolution, models
-from lever.optimizers import adam
+from lever import analysis, config, driver, evolution, models, plotting
+from lever.optimizers import adam, sr
 
 # Device setup
 print("JAX devices:", jax.devices())
@@ -42,26 +42,23 @@ def main():
     ham_cfg = config.HamiltonianConfig(
         screening_mode=config.ScreenMode.DYNAMIC,
         screen_eps=1e-6,
-        diag_shift=0.5,
-        reg_eps=1e-4
+        diag_shift=0.0,
     )
     
     # Convergence control
     loop_cfg = config.LoopConfig(
-        max_outer=20,
+        max_outer=10,
         outer_tol=1e-5,
         outer_patience=3,
         inner_steps=500,
-        chunk_size=4096
+        chunk_size=8192
     )
     
     lever_cfg = config.LeverConfig(
         system=sys_cfg,
         hamiltonian=ham_cfg,
         loop=loop_cfg,
-        compute_mode=config.ComputeMode.EFFECTIVE,
-        seed=42,
-        report_interval=50
+        compute_mode=config.ComputeMode.PROXY,
     )
 
     # Wavefunction Ansatz
@@ -79,17 +76,14 @@ def main():
     
     optimizer = adam(learning_rate=5e-4, weight_decay=1e-4)
     
-    # Evolution: amplitude-based top-K selection
-    evo_strategy = evolution.BasicStrategy(
-        scorer=evolution.scores.AmpScorer(),
-        selector=evolution.selectors.TopKSelector(k=3200)
-    )
+    # Evolution: amplitude-based top-Percentage selection
+    evo_strategy = evolution.CumulativeMassStrategy(mass_threshold=0.999)
     
     lever_driver = driver.Driver(lever_cfg, model, evo_strategy, optimizer)
     result = lever_driver.run()
 
     # Post Analysis
-    evaluator = analysis.EnergyEvaluator(
+    evaluator = analysis.VariationalEvaluator(
         int_ctx=lever_driver.int_ctx,
         n_orb=sys_cfg.n_orbitals,
         e_nuc=lever_driver.int_ctx.get_e_nuc()
@@ -99,26 +93,21 @@ def main():
         result,
         model=model,
         compute_fci=False,  # Enable for FCI benchmark (expensive)
-        compute_var=True,
-        compute_s_ci=True
+        compute_s_ci=True,
+        compute_sc_var=True
     )
     
     # Optional: inject FCI reference
-    energies['e_fci'] = -76.12089  # H2O/6-31G benchmark
-    
-    analysis.print_summary(
+    # energies['e_fci'] = -109.099941428023  # N2/6-31G benchmark
+    energies['e_fci'] = -76.12087435  # H2O/6-31G benchmark
+    # energies['e_fci'] = -151.146949995833  # C2H4O/STO-3G benchmark
+
+
+    plotting.print_summary(
         energies=energies,
         total_time=result.total_time,
-        sys_name="H2O"
+        sys_name="System"
     )
     
-    analysis.plot_convergence(
-        result=result,
-        e_fci=energies.get('e_fci'),
-        sys_name="H2O",
-        save_path="h2o_convergence.pdf"
-    )
-
-
 if __name__ == "__main__":
     main()

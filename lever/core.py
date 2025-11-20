@@ -44,6 +44,15 @@ get_ham_conn_amp = _lever_cpp.get_ham_conn_amp
 get_ham_eff = _lever_cpp.get_ham_eff
 """Assemble effective Hamiltonian via perturbative correction."""
 
+get_local_conn = _lever_cpp.get_local_conn
+"""Build local Hamiltonian row for a single determinant."""
+
+get_local_connections = _lever_cpp.get_local_connections
+"""Build local Hamiltonian connections for a batch of determinants (CSR-like)."""
+
+compute_variational_energy = _lever_cpp.compute_variational_energy
+"""Compute <Psi|H|Psi> and <Psi|Psi> on a fixed determinant basis."""
+
 __all__ = [
     "IntCtx",
     "gen_fci_dets",
@@ -54,4 +63,7 @@ __all__ = [
     "get_ham_conn",
     "get_ham_conn_amp",
     "get_ham_eff",
+    "get_local_conn",
+    "get_local_connections",
+    "compute_variational_energy",
 ]

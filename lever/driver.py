@@ -18,9 +18,10 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
+from jax import tree_util
 
 from . import core
-from .analysis import EnergyEvaluator
+from .analysis import VariationalEvaluator
 from .config import ComputeMode
 from .dtypes import LeverResult, OuterState
 from .engine import hamiltonian
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from .config import LeverConfig
     from .evolution import EvolutionStrategy
     from .models import WavefunctionModel
+    from .dtypes import OuterCtx, PsiCache, PyTree
 
 
 class Driver:
@@ -74,7 +76,7 @@ class Driver:
             num_eps=self.cfg.num_eps
         )
         
-        self.evaluator = EnergyEvaluator(
+        self.evaluator = VariationalEvaluator(
             int_ctx=self.int_ctx,
             n_orb=self.cfg.system.n_orbitals,
             e_nuc=self.int_ctx.get_e_nuc()
@@ -147,6 +149,10 @@ class Driver:
         
         recent_energies = []
         converged = False
+
+        # Variables to capture the final computational state
+        final_ctx: OuterCtx | None = None
+        final_psi_cache: PsiCache | None = None
         
         for cycle in range(max_outer):
             cycle_start = time.time()
@@ -158,6 +164,10 @@ class Driver:
             # Fit: inner-loop optimization
             result = self.fitter.fit(ctx, state.params, self.optimizer)
             
+            # Capture state for post-analysis
+            final_ctx = ctx
+            final_psi_cache = result.psi_cache
+
             # Compute wavefunction cache diagnostics
             psi_s = result.psi_cache.psi_s
             psi_c = result.psi_cache.psi_c
@@ -198,7 +208,10 @@ class Driver:
         if not converged:
             self.logger.max_cycles_reached(max_outer)
         
-        return self._finalize_results(state, history, time.time() - t0)
+        return self._finalize_results(
+            state, history, time.time() - t0, 
+            final_ctx, final_psi_cache
+        )
     
     def _initialize_state(self) -> OuterState:
         """Bootstrap from Hartree-Fock determinant."""
@@ -246,7 +259,10 @@ class Driver:
         
         print(f"Compute mode        : {self.cfg.compute_mode.value.upper()}")
         print(f"System              : {self.cfg.system.fcidump_path}")
-        print(f"Model               : {self.model.module.__class__.__name__}")
+        # print(f"Model               : {self.model.module.__class__.__name__}")
+        # params = self.model.variables['params'] # Assuming parameters are under 'params' key
+        # num_params = sum(x.size for x in tree_util.tree_leaves(params))
+        # print(f"Total Parameters    : {num_params:,}") # Use comma for thousands separator
         print(f"Screening           : {self.cfg.hamiltonian.screening_mode.value}")
         
         print(f"{'='*60}\n")
@@ -255,7 +271,9 @@ class Driver:
         self,
         state: OuterState,
         history: _History,
-        total_time: float
+        total_time: float,
+        final_ctx: OuterCtx | None,
+        final_psi_cache: PsiCache | None
     ) -> LeverResult:
         final_energy = history.energies[-1] if history.energies else 0.0
         n_cycles = len(history.cycle_bounds) - 1
@@ -268,7 +286,9 @@ class Driver:
             full_energy_history=history.energies,
             cycle_boundaries=history.cycle_bounds,
             total_time=total_time,
-            config=self.cfg
+            config=self.cfg,
+            final_space=final_ctx.space if final_ctx is not None else None,
+            final_psi_cache=final_psi_cache
         )
 
 

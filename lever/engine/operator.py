@@ -98,22 +98,33 @@ def create_logpsi_evals(
     """
   
     def _batch_apply(params: PyTree, features: jnp.ndarray) -> jnp.ndarray:
-        """Vectorized model: [batch, feat_dim] → [batch]"""
+        """
+        Vectorized model: [batch, feat_dim] → [batch].
+
+        Wrapped with jax.checkpoint so that intermediate activations
+        inside the network are rematerialized during the backward pass
+        instead of all being kept in memory at once.
+        """
         outputs = model_fn(params, features)
         return jnp.asarray(outputs, dtype=device_complex)
+
+    # Recompute _batch_apply during backward to reduce peak memory usage.
+    _batch_apply_checked = jax.checkpoint(_batch_apply)
   
     def _chunked_apply(params: PyTree, features: jnp.ndarray) -> jnp.ndarray:
         """Memory-efficient chunked inference."""
         n_samples = features.shape[0]
       
         if chunk_size is None or n_samples <= chunk_size:
-            return _batch_apply(params, features)
+            # For small batches, just use the checkpointed single call.
+            return _batch_apply_checked(params, features)
       
         feat_batched, mask_batched, n_real = _pad_to_chunks(features, chunk_size)
       
         def process_chunk(carry, inputs):
             feat_chunk, _ = inputs
-            log_chunk = _batch_apply(params, feat_chunk)
+            # Each chunk runs through the checkpointed apply function.
+            log_chunk = _batch_apply_checked(params, feat_chunk)
             return carry, log_chunk
       
         _, outputs_batched = lax.scan(

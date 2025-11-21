@@ -52,7 +52,11 @@ def prepare_tape(
     Returns:
         GeometryTape with linearization and statistics
     """
-    # Phase 1: Single linearization (key optimization)
+    # Phase 1: Single linearization (key optimization).
+    # Wrap logpsi_fn with jax.checkpoint so that the linearization does
+    # not keep all internal activations for all samples in memory at once.
+    # Instead, they are rematerialized during backward passes.
+    logpsi_fn = jax.checkpoint(logpsi_fn)
     log_psi, jvp_fn = jax.linearize(logpsi_fn, params)
     
     # Phase 2: Derive VJP via transpose

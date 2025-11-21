@@ -14,12 +14,14 @@ Date: November, 2025
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict, is_dataclass
+from pathlib import Path
+from typing import Any, Dict, Union
 from enum import Enum
-from typing import Any
-
 import jax
+
 import numpy as np
+import yaml
 
 
 # ============================================================================
@@ -133,14 +135,16 @@ class LoopConfig:
     """
     # Outer loop (cycle evolution)
     max_outer: int = 10                # Maximum evolutionary cycles
-    outer_tol: float = 1e-5           # Convergence tolerance
-    outer_patience: int = 3           # Consecutive converged cycles needed
+    outer_tol: float = 1e-5            # Convergence tolerance
+    outer_patience: int = 3            # Consecutive converged cycles needed
     
     # Inner loop (fixed-space optimization)
-    inner_steps: int = 500            # Fixed optimization steps per cycle
-    
+    max_inner: int = 500             # Maximum optimization steps per cycle
+    inner_tol: float = 1e-6             # |E_k - E_{k-1}| tolerance (<=0 disables)
+    inner_patience: int = 100            # Consecutive steps with small delta
+
     # Optional batch processing
-    chunk_size: int | None = None     # Gradient accumulation chunk size
+    chunk_size: int | None = None      # Gradient accumulation chunk size
 
 
 @dataclass(frozen=True)
@@ -167,7 +171,7 @@ class LeverConfig:
     
     compute_mode: ComputeMode = ComputeMode.PROXY
     seed: int = 42
-    report_interval: int = 50
+    report_interval: int = 10
     num_eps: float = 1e-12
     normalize_wf: bool = True
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
@@ -176,7 +180,6 @@ class LeverConfig:
         """Apply global precision policy during initialization."""
         if self.precision.enable_x64:
             jax.config.update("jax_enable_x64", True)
-
 
 __all__ = [
     "ScreenMode",

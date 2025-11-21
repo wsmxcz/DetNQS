@@ -4,9 +4,9 @@
 """
 Exact and deterministic energy evaluation.
 
-Handles calculations on fixed subspaces:
-1. Exact Diagonalization (FCI/CASCI via Davidson/Lanczos).
-2. Deterministic Variational Energy (Sum over fixed determinant list).
+Implements:
+1. Exact Diagonalization (FCI/CASCI via Davidson/Lanczos)
+2. Deterministic Variational Energy (sum over fixed determinant list)
 
 File: lever/analysis/exact.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -31,11 +31,10 @@ if TYPE_CHECKING:
 
 class VariationalEvaluator:
     """
-    Evaluator for fixed-basis computations.
+    Fixed-basis quantum chemistry evaluator.
     
-    Provides:
-      - Exact diagonalization (FCI / S-space CI).
-      - Deterministic variational energy on S∪C without building H explicitly.
+    Provides exact diagonalization and deterministic variational energy
+    computations without explicit Hamiltonian construction.
     """
     
     def __init__(self, int_ctx: core.IntCtx, n_orb: int, e_nuc: float):
@@ -45,9 +44,9 @@ class VariationalEvaluator:
 
     def diagonalize(self, ham: COOMatrix) -> float:
         """
-        Compute exact ground-state energy of Hamiltonian matrix.
+        Compute exact ground-state energy E₀ = min eig(H).
         
-        Uses dense solver for small/dense matrices, Davidson for large sparse ones.
+        Algorithm: Dense solver for small/dense matrices, Davidson for large sparse.
         """
         if ham.shape[0] == 0:
             return self.e_nuc
@@ -56,13 +55,13 @@ class VariationalEvaluator:
         
         n = ham.shape[0]
         
-        # Convert to CSR for efficient arithmetic
+        # Convert to CSR format for efficient linear algebra
         H_sparse = sp.coo_matrix(
             (ham.vals, (ham.rows, ham.cols)), shape=ham.shape
         ).tocsr()
         H_sparse.sum_duplicates()
         
-        # Heuristic: dense solver for small/dense matrices
+        # Heuristic selection: dense solver for small/dense matrices
         density = ham.nnz / (n * n) if n > 0 else 0
         use_dense = (n < 2000) or (density > 0.1)
         
@@ -75,7 +74,7 @@ class VariationalEvaluator:
         return self._run_davidson(H_sparse)
 
     def _run_davidson(self, H_sparse: sp.csr_matrix) -> float:
-        """Davidson diagonalization for sparse matrices."""
+        """Davidson diagonalization for sparse matrices with diagonal preconditioner."""
         n = H_sparse.shape[0]
         diag = H_sparse.diagonal()
         
@@ -118,18 +117,18 @@ class VariationalEvaluator:
         eps1: float = 1e-6
     ) -> float:
         """
-        Compute variational energy E = <Ψ|H|Ψ>/<Ψ|Ψ> on S∪C space.
+        Compute variational energy E = ⟨Ψ|H|Ψ⟩/⟨Ψ|Ψ⟩ on S∪C space.
         
         Uses C++ streaming kernel to evaluate expectation value without
         constructing full Hamiltonian matrix.
         
         Args:
-            result: LeverResult with final_space and final_psi_cache.
-            use_heatbath: Enable Heat-Bath screening for double excitations.
-            eps1: Threshold for screening matrix elements.
+            result: LeverResult with final_space and final_psi_cache
+            use_heatbath: Enable Heat-Bath screening for double excitations
+            eps1: Threshold for screening matrix elements
             
         Returns:
-            Total variational energy (including nuclear repulsion).
+            Total variational energy (including nuclear repulsion)
         """
         if result.final_space is None or result.final_psi_cache is None:
             raise ValueError(
@@ -146,7 +145,7 @@ class VariationalEvaluator:
         else:
             dets_T = np.concatenate([space.s_dets, space.c_dets], axis=0)
 
-        # Get coefficients (JAX → NumPy → complex128)
+        # Convert coefficients to NumPy complex128
         coeffs = np.array(cache.psi_all, dtype=np.complex128)
 
         if coeffs.shape[0] != dets_T.shape[0]:
@@ -154,7 +153,7 @@ class VariationalEvaluator:
                 f"Shape mismatch: coeffs {coeffs.shape} vs dets {dets_T.shape}"
             )
 
-        # Call C++ streaming kernel
+        # C++ streaming kernel for efficient energy evaluation
         e_el, norm = core.compute_variational_energy(
             dets_T,
             coeffs,

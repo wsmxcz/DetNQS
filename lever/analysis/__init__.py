@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Analysis module for quantum states.
+Analysis module for quantum state evaluation.
 
-Submodules:
-- exact: Deterministic calculations (Diagonalization, FCI).
-- inference: VMC energy estimation (Placeholder).
-- sampling: MCMC sampling algorithms (Placeholder).
-- statistics: Error analysis and autocorrelation (Placeholder).
+Provides deterministic (exact diagonalization) and stochastic (MCMC) methods
+for quantum state analysis and energy estimation.
+
+File: lever/analysis/__init__.py  
+Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+Date: November, 2025
 """
 
 from .exact import VariationalEvaluator

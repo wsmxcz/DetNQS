@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from typing import Protocol, TYPE_CHECKING
 
-import numpy as np
 from ..dtypes import ScoreResult
 
 if TYPE_CHECKING:
@@ -28,21 +27,21 @@ if TYPE_CHECKING:
 class Scorer(Protocol):
     """
     Determinant importance evaluator.
-    
-    Computes importance scores from converged wavefunction amplitudes
-    to guide space selection in next iteration.
+
+    Uses converged wavefunction amplitudes to compute scores that drive
+    space selection in the next iteration.
     """
-    
+
     def score(self, ctx: OuterCtx, psi_cache: PsiCache) -> ScoreResult:
         """
         Evaluate determinant importance from cached wavefunction.
-        
+
         Args:
             ctx: Outer cycle context (space/Hamiltonian info)
             psi_cache: Cached wavefunction amplitudes
-        
+
         Returns:
-            Scored determinants with metadata
+            ScoreResult with scores and candidate determinants
         """
         ...
 
@@ -50,20 +49,20 @@ class Scorer(Protocol):
 class Selector(Protocol):
     """
     Determinant subset selector.
-    
-    Chooses new core space from scored candidates based on
-    importance thresholds or size constraints.
+
+    Chooses a new core space from scored candidates based on
+    ranking, thresholds, or mass-based criteria.
     """
 
-    def select(self, result: ScoreResult) -> np.ndarray:
+    def select(self, result: ScoreResult) -> object:
         """
         Select new S-space from scored determinants.
-        
+
         Args:
             result: Scored determinants from Scorer
-        
+
         Returns:
-            Selected determinants (n, 2) array
+            Selected determinants as ndarray with shape (n, 2)
         """
         ...
 
@@ -71,19 +70,19 @@ class Selector(Protocol):
 class EvolutionStrategy(Protocol):
     """
     Complete evolution orchestrator.
-    
-    Combines scoring and selection into single evolution cycle,
-    potentially with custom logic (e.g., adaptive thresholds).
+
+    Combines scoring and selection into a single evolution cycle,
+    optionally with custom logic (e.g. hybrid criteria).
     """
-    
-    def evolve(self, ctx: OuterCtx, psi_cache: PsiCache) -> np.ndarray:
+
+    def evolve(self, ctx: OuterCtx, psi_cache: PsiCache) -> object:
         """
-        Execute single evolution cycle.
-        
+        Execute a single evolution cycle.
+
         Args:
             ctx: Converged outer context
             psi_cache: Cached wavefunction amplitudes
-        
+
         Returns:
             New S-space determinants (n, 2) array
         """

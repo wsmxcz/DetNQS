@@ -25,9 +25,10 @@ from .analysis import VariationalEvaluator
 from .config import ComputeMode
 from .dtypes import LeverResult, OuterState
 from .engine import hamiltonian
-from .utils.logger import get_logger
 from .workflow.compiler import Compiler
 from .workflow.fitter import Fitter
+from .monitor import get_logger, get_run
+from .monitor import storage as monitor_store
 
 if TYPE_CHECKING:
     from .config import LeverConfig
@@ -37,12 +38,8 @@ if TYPE_CHECKING:
 
 
 class Driver:
-    """
-    LEVER evolutionary workflow orchestrator.
+    """LEVER evolutionary workflow orchestrator."""
     
-    Executes iterative cycles: Compile → Fit → Evolve until convergence.
-    """
-
     def __init__(
         self,
         config: LeverConfig,
@@ -83,11 +80,12 @@ class Driver:
         )
 
     def _print_cycle_header(self, cycle: int, max_cycles: int, comp_diag: dict):
-        print(self.logger._blue(f"Cycle {cycle}/{max_cycles}"))
+        """Log compact header for outer iteration."""
+        self.logger.info(self.logger._blue(f"Cycle {cycle}/{max_cycles}"))
         
         if comp_diag['bootstrap_range'] is not None:
             min_val, max_val = comp_diag['bootstrap_range']
-            print(f"Bootstrap: [{min_val:.6f}, {max_val:.6f}]")
+            self.logger.info(f"Bootstrap: [{min_val:.6f}, {max_val:.6f}]")
         
         n_s, n_c = comp_diag['n_s'], comp_diag['n_c']
         nnz_ss, nnz_sc = comp_diag['nnz_ss'], comp_diag['nnz_sc']
@@ -97,7 +95,7 @@ class Driver:
         if nnz_sc is not None:
             ham_info += f", H_SC: {nnz_sc} nnz"
         
-        print(f"Space: S={n_s}, C={n_c} | {ham_info}")
+        self.logger.info(f"Space: S={n_s}, C={n_c} | {ham_info}")
         
     def _print_cycle_summary(
         self,
@@ -107,9 +105,14 @@ class Driver:
         steps: int,
         time_elapsed: float
     ):
-        print(f"‖ψ_S‖²={psi_s_norm_sq:.4f}, ‖ψ_C‖²={psi_c_norm_sq:.4f}")
+        """Log key diagnostics for outer iteration."""
+        self.logger.info(
+            f"‖ψ_S‖²={psi_s_norm_sq:.4f}, ‖ψ_C‖²={psi_c_norm_sq:.4f}"
+        )
         e_str = self.logger._blue(f"E = {energy:.10f}")
-        print(f"{e_str} | Steps = {steps:4d} | Time = {time_elapsed:.2f}s")
+        self.logger.info(
+            f"{e_str} | Steps = {steps:4d} | Time = {time_elapsed:.2f}s"
+        )
 
     def _check_convergence(
         self,
@@ -118,7 +121,7 @@ class Driver:
         tol: float
     ) -> tuple[bool, float]:
         """
-        Sliding-window convergence test: max|ΔE| < τ over last p cycles.
+        Sliding-window convergence test.
         
         Returns:
             (converged, max_delta)
@@ -132,11 +135,10 @@ class Driver:
         ]
         
         max_delta = max(deltas)
-        converged = max_delta < tol
-        
-        return converged, max_delta
+        return max_delta < tol, max_delta
 
     def run(self) -> LeverResult:
+        """Execute iterative cycles until convergence."""
         self._print_header()
         
         state = self._initialize_state()
@@ -150,7 +152,6 @@ class Driver:
         recent_energies = []
         converged = False
 
-        # Variables to capture the final computational state
         final_ctx: OuterCtx | None = None
         final_psi_cache: PsiCache | None = None
         
@@ -164,26 +165,25 @@ class Driver:
             # Fit: inner-loop optimization
             result = self.fitter.fit(ctx, state.params, self.optimizer)
             
-            # Capture state for post-analysis
             final_ctx = ctx
             final_psi_cache = result.psi_cache
 
-            # Compute wavefunction cache diagnostics
+            # Compute wavefunction diagnostics
             psi_s = result.psi_cache.psi_s
             psi_c = result.psi_cache.psi_c
             psi_s_norm_sq = float(np.sum(np.abs(psi_s)**2))
             psi_c_norm_sq = float(np.sum(np.abs(psi_c)**2))
             
             final_energy = result.energy_trace[-1]
-            inner_steps = len(result.energy_trace)
+            max_inner = len(result.energy_trace)
             cycle_time = time.time() - cycle_start
             
             self._print_cycle_summary(
                 psi_s_norm_sq, psi_c_norm_sq,
-                final_energy, inner_steps, cycle_time
+                final_energy, max_inner, cycle_time
             )
             
-            history.append_energies(result.energy_trace)
+            history.append_cycle(result.energy_trace)
             recent_energies.append(final_energy)
             
             # Check convergence
@@ -255,17 +255,20 @@ class Driver:
         return result.energy_trace[-1] - ctx.e_nuc
     
     def _print_header(self):
+        """Log run header with configuration details."""
         self.logger.header("LEVER Initialization")
         
-        print(f"Compute mode        : {self.cfg.compute_mode.value.upper()}")
-        print(f"System              : {self.cfg.system.fcidump_path}")
-        # print(f"Model               : {self.model.module.__class__.__name__}")
-        # params = self.model.variables['params'] # Assuming parameters are under 'params' key
-        # num_params = sum(x.size for x in tree_util.tree_leaves(params))
-        # print(f"Total Parameters    : {num_params:,}") # Use comma for thousands separator
-        print(f"Screening           : {self.cfg.hamiltonian.screening_mode.value}")
+        self.logger.info(
+            f"Compute mode        : {self.cfg.compute_mode.value.upper()}"
+        )
+        self.logger.info(
+            f"System              : {self.cfg.system.fcidump_path}"
+        )
+        self.logger.info(
+            f"Screening           : {self.cfg.hamiltonian.screening_mode.value}"
+        )
         
-        print(f"{'='*60}\n")
+        self.logger.info(f"{'='*60}")
     
     def _finalize_results(
         self,
@@ -275,15 +278,17 @@ class Driver:
         final_ctx: OuterCtx | None,
         final_psi_cache: PsiCache | None
     ) -> LeverResult:
-        final_energy = history.energies[-1] if history.energies else 0.0
+        """Build final result object and persist artifacts."""
+        inner = history.inner_energies
+        final_energy = inner[-1] if inner else 0.0
         n_cycles = len(history.cycle_bounds) - 1
-        
+
         self.logger.final_summary(final_energy, n_cycles, total_time)
-        
-        return LeverResult(
+
+        result = LeverResult(
             final_params=state.params,
             final_s_dets=state.s_dets,
-            full_energy_history=history.energies,
+            full_energy_history=inner,
             cycle_boundaries=history.cycle_bounds,
             total_time=total_time,
             config=self.cfg,
@@ -291,18 +296,45 @@ class Driver:
             final_psi_cache=final_psi_cache
         )
 
+        # Persist structured artifacts
+        run = get_run()
+        if run is not None:
+            try:
+                monitor_store.save_run_artifacts(
+                    run.root,
+                    result,
+                    outer_energies=history.outer_energies,
+                    outer_steps=history.outer_steps,
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to save run artifacts: {e}")
+
+        return result
+
 
 class _History:
     """Energy trajectory tracker for convergence analysis."""
-    
+
     def __init__(self):
-        self.energies: list[float] = []
+        self.inner_energies: list[float] = []
         self.cycle_bounds: list[int] = [0]
-        self.diagnostics: dict[str, list[float]] = {}
-    
-    def append_energies(self, energy_trace: list[float]):
-        self.energies.extend(energy_trace)
-        self.cycle_bounds.append(len(self.energies))
+        self.outer_energies: list[float] = []
+        self.outer_steps: list[int] = []
+
+    def append_cycle(self, energy_trace: list[float]):
+        """Append inner-loop energies for one outer cycle."""
+        if not energy_trace:
+            self.cycle_bounds.append(len(self.inner_energies))
+            self.outer_energies.append(
+                self.inner_energies[-1] if self.inner_energies else 0.0
+            )
+            self.outer_steps.append(0)
+            return
+
+        self.inner_energies.extend(energy_trace)
+        self.cycle_bounds.append(len(self.inner_energies))
+        self.outer_energies.append(float(energy_trace[-1]))
+        self.outer_steps.append(len(energy_trace))
 
 
 __all__ = ["Driver"]

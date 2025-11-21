@@ -23,7 +23,7 @@ import jax.lax as lax
 from ..dtypes import InnerResult, InnerState
 from ..engine.step import create_update_step
 from ..utils.features import create_psi_cache
-from ..utils.logger import get_logger
+from ..monitor import get_logger
 
 if TYPE_CHECKING:
     from ..config import LoopConfig
@@ -63,17 +63,7 @@ class Fitter:
         optimizer
     ) -> InnerResult:
         """
-        Execute inner loop optimization for fixed number of steps.
-        
-        Algorithm: θ ← optimizer.update(∇E[θ], θ) via lax.scan
-        
-        Args:
-            ctx: Compiled computational context
-            initial_params: Initial network parameters
-            optimizer: Optax-compatible optimizer
-            
-        Returns:
-            InnerResult with optimized parameters and energy trace
+        Run inner-loop optimization with optional early stopping.
         """
         opt_state = optimizer.init(initial_params)
         state = InnerState(
@@ -83,15 +73,25 @@ class Fitter:
         )
         
         update_step = create_update_step(ctx, optimizer, self.num_eps)
-        state, energies = self._run_optimization_loop(state, update_step, ctx)
+        # new: get state, energy trace, number of steps, and convergence flag
+        state, energies, steps, converged = self._run_optimization_loop(
+            state, update_step, ctx
+        )
+
+        # Move data to host and convert to Python types
+        energies_host = jax.device_get(energies)
+        steps_host = int(jax.device_get(steps))
+        converged_host = bool(jax.device_get(converged))
+
+        energies_list = [float(e) for e in energies_host[:steps_host]]
         psi_cache = self._create_cache(ctx, state.params)
         
         return InnerResult(
             final_params=state.params,
-            energy_trace=energies.tolist(),
+            energy_trace=energies_list,
             psi_cache=psi_cache,
-            converged=False,
-            steps=len(energies)
+            converged=converged_host,
+            steps=steps_host
         )
     
     def _run_optimization_loop(
@@ -99,45 +99,105 @@ class Fitter:
         initial_state: InnerState,
         update_step,
         ctx: OuterCtx
-    ) -> tuple[InnerState, jnp.ndarray]:
+    ) -> tuple[InnerState, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
-        Execute fixed-step optimization via lax.scan with optional progress.
+        Run optimization with optional early stopping based on energy plateaus.
         
         Returns:
-            Final state and energy trajectory
+            final_state: InnerState after last step
+            energies: jnp.ndarray[max_steps] with recorded energies
+            steps: scalar int32, number of executed steps
+            converged: scalar bool, True if stopped by early-stopping criterion
         """
-        num_steps = self.cfg.inner_steps
+        max_steps = self.cfg.max_inner
+        tol = getattr(self.cfg, "inner_tol", 0.0)
+        patience = getattr(self.cfg, "inner_patience", 0)
+
+        # Early stopping is enabled only if both tol and patience are positive.
+        use_early = (tol > 0.0) and (patience > 0)
+
         report_interval = self.report_interval
         should_print = report_interval > 0
-        
+
         feat_s = ctx.features_s
         feat_c = ctx.features_c
-        
-        def scan_fn(state, step_idx):
-            """Single optimization step."""
+
+        # Preallocate energy buffer on device
+        energies_init = jnp.empty((max_steps,), dtype=jnp.float64)
+
+        # carry = (state, energies, k, last_energy, streak, converged)
+        carry_init = (
+            initial_state,
+            energies_init,
+            jnp.array(0, dtype=jnp.int32),       # current step index
+            jnp.inf,                              # last energy (no previous value)
+            jnp.array(0, dtype=jnp.int32),       # streak of small |ΔE|
+            jnp.array(False)                     # early-stopping flag
+        )
+
+        def cond_fun(carry):
+            state, energies, k, last_energy, streak, converged = carry
+            # Stop if we hit max_steps or early-stopping is triggered.
+            not_done = jnp.logical_and(
+                k < max_steps,
+                jnp.logical_not(converged)
+            )
+            return not_done
+
+        def body_fun(carry):
+            state, energies, k, last_energy, streak, converged = carry
+
+            # One optimization step
             new_state, energy = update_step(state, feat_s, feat_c)
-            
+            energies = energies.at[k].set(energy)
+
+            # Compute energy difference to previous step
+            delta = jnp.abs(energy - last_energy)
+
+            # Update streak: consecutive steps with |ΔE| < tol
+            new_streak = jnp.where(delta < tol, streak + 1, 0)
+
+            # Trigger convergence once streak reaches patience
+            new_converged = jnp.logical_or(
+                converged,
+                jnp.logical_and(use_early, new_streak >= patience)
+            )
+
+            # Optional progress logging
             if should_print:
-                is_report_step = (step_idx + 1) % report_interval == 0
+                step_for_print = k + 1
+                is_report_step = (step_for_print % report_interval) == 0
                 lax.cond(
                     is_report_step,
                     lambda e, s: jax.debug.print(
                         "  Step {step:4d}/{total:4d} | E = {energy:.10f}",
-                        step=s + 1,
-                        total=num_steps,
+                        step=s,
+                        total=max_steps,
                         energy=e,
                         ordered=True
                     ),
                     lambda e, s: None,
-                    energy, step_idx
+                    energy,
+                    step_for_print
                 )
-            
-            return new_state, energy
-        
-        step_indices = jnp.arange(num_steps)
-        final_state, energies = lax.scan(scan_fn, initial_state, step_indices)
-        
-        return final_state, jax.device_get(energies)
+
+            return (
+                new_state,
+                energies,
+                k + 1,
+                energy,        # update last_energy
+                new_streak,
+                new_converged
+            )
+
+        final_state, energies, final_k, _, _, converged = lax.while_loop(
+            cond_fun,
+            body_fun,
+            carry_init
+        )
+
+        # final_k and converged remain on device; conversion is done in fit()
+        return final_state, energies, final_k, converged
     
     def _create_cache(
         self,

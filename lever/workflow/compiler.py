@@ -27,7 +27,7 @@ from .. import core, engine
 from ..config import ComputeMode, ScreenMode
 from ..dtypes import COOMatrix, OuterCtx, SpaceRep
 from ..utils.features import compute_normalized_amplitudes, dets_to_features
-from ..utils.logger import get_logger
+from ..monitor import get_logger
 
 if TYPE_CHECKING:
     from ..config import LeverConfig

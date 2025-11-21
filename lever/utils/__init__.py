@@ -25,7 +25,6 @@ from .jax_utils import (
     tree_scale,
     tree_sub,
 )
-from .logger import Logger
 from .space_utils import (
     count_overlaps,
     get_space_overlap,
@@ -53,6 +52,4 @@ __all__ = [
     "get_space_overlap",
     "count_overlaps",
     
-    # Logging
-    "Logger",
 ]

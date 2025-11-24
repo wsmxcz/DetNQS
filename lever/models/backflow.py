@@ -13,7 +13,7 @@ Two variants:
 
 File: lever/models/backflow.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: January, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class BackflowMLP(nn.Module):
         n_orbitals: Number of spatial orbitals
         n_alpha, n_beta: Spin-up/down electron counts
         n_dets: Number of determinants in expansion
-        generalized: Use unified spin-orbital matrix (no spin separation)
+        generalized: Use unified spin-orbital matrix
         restricted: Share spatial orbitals between spins
         use_log_coeffs: Learn determinant expansion coefficients
         hidden_dims: MLP hidden layer dimensions
@@ -87,7 +87,7 @@ class BackflowMLP(nn.Module):
                 name=f"{name}_dense_{li}",
             )(x)
 
-            # Match dimensions for skip connection
+            # Dimension-matching skip connection
             if residual.shape[-1] != h:
                 residual = nn.Dense(
                     h,
@@ -99,7 +99,7 @@ class BackflowMLP(nn.Module):
 
             x = x + residual
 
-        # Project to complex with small initial variance
+        # Project to complex with controlled variance
         x = nn.gelu(x)
         x = nn.Dense(
             2 * out_dim,
@@ -168,70 +168,98 @@ class BackflowMLP(nn.Module):
         is_multi: bool,
         s: jnp.ndarray,
     ) -> Callable[[jnp.ndarray], jnp.ndarray]:
-        """Build function: s → log det(M + ΔM(s))."""
+        """Build function: s -> log det(M + ΔM(s))."""
 
-        def eval_single(M_base, idx: int, s: jnp.ndarray) -> jnp.ndarray:
-            suffix = f"_det{idx}" if is_multi else ""
-
+        def _extract_indices(s: jnp.ndarray):
+            """Compute occupied row indices for configuration s."""
             if self.generalized:
-                out_dim = (2 * self.n_orbitals) * n_e
-                Δ = self._mlp(f"BF_gen{suffix}", out_dim, s).reshape(
-                    (2 * self.n_orbitals, n_e)
-                )
-                M_eff = M_base + Δ
                 rows = jnp.nonzero(s, size=n_e, fill_value=-1)[0]
-                return logdet_c(M_eff[rows, :])
+                return rows, None
 
-            # Extract spin occupancies
             α_occ = s[: self.n_orbitals]
-            β_occ = s[self.n_orbitals :]
+            β_occ = s[self.n_orbitals:]
             rows_α = jnp.nonzero(α_occ, size=self.n_alpha, fill_value=-1)[0]
             rows_β = jnp.nonzero(β_occ, size=self.n_beta, fill_value=-1)[0]
+            return rows_α, rows_β
+
+        if not is_multi:
+            def eval_single(s: jnp.ndarray) -> jnp.ndarray:
+                rows_α, rows_β = _extract_indices(s)
+
+                if self.generalized:
+                    out_dim = (2 * self.n_orbitals) * n_e
+                    Δ = self._mlp("BF_gen", out_dim, s).reshape(
+                        (2 * self.n_orbitals, n_e)
+                    )
+                    M_eff = orbitals + Δ
+                    rows = rows_α
+                    return logdet_c(M_eff[rows, :])
+
+                if self.restricted:
+                    k = max(self.n_alpha, self.n_beta)
+                    out_dim = self.n_orbitals * k
+                    Δ = self._mlp("BF_res", out_dim, s).reshape(
+                        (self.n_orbitals, k)
+                    )
+                    M_eff = orbitals + Δ
+                    A_α = M_eff[rows_α, : self.n_alpha]
+                    A_β = M_eff[rows_β, : self.n_beta]
+                    return logdet_c(A_α) + logdet_c(A_β)
+
+                # Unrestricted
+                M_α_base, M_β_base = orbitals
+                out_dim = self.n_orbitals * (self.n_alpha + self.n_beta)
+                Δ = self._mlp("BF_unres", out_dim, s).reshape(
+                    (self.n_orbitals, self.n_alpha + self.n_beta)
+                )
+                Δ_α = Δ[:, : self.n_alpha]
+                Δ_β = Δ[:, self.n_alpha :]
+                A_α = (M_α_base + Δ_α)[rows_α, :]
+                A_β = (M_β_base + Δ_β)[rows_β, :]
+                return logdet_c(A_α) + logdet_c(A_β)
+
+            return eval_single
+
+        # Multi-determinant case
+        def eval_multi(s: jnp.ndarray) -> jnp.ndarray:
+            rows_α, rows_β = _extract_indices(s)
+
+            if self.generalized:
+                out_dim_per_det = (2 * self.n_orbitals) * n_e
+                total_dim = self.n_dets * out_dim_per_det
+                Δ_flat = self._mlp("BF_gen", total_dim, s)
+                Δ = Δ_flat.reshape(self.n_dets, 2 * self.n_orbitals, n_e)
+                M_eff = orbitals + Δ
+                rows = rows_α
+                A = M_eff[:, rows, :]
+                return logdet_c(A)
 
             if self.restricted:
                 k = max(self.n_alpha, self.n_beta)
-                out_dim = self.n_orbitals * k
-                Δ = self._mlp(f"BF_res{suffix}", out_dim, s).reshape(
-                    (self.n_orbitals, k)
-                )
-                M_eff = M_base + Δ
-                A_α = M_eff[rows_α, : self.n_alpha]
-                A_β = M_eff[rows_β, : self.n_beta]
+                out_dim_per_det = self.n_orbitals * k
+                total_dim = self.n_dets * out_dim_per_det
+                Δ_flat = self._mlp("BF_res", total_dim, s)
+                Δ = Δ_flat.reshape(self.n_dets, self.n_orbitals, k)
+                M_eff = orbitals + Δ
+                A_α = M_eff[:, rows_α, : self.n_alpha]
+                A_β = M_eff[:, rows_β, : self.n_beta]
                 return logdet_c(A_α) + logdet_c(A_β)
 
-            # Unrestricted: independent α/β corrections
-            M_α_base, M_β_base = M_base
-            out_dim = self.n_orbitals * (self.n_alpha + self.n_beta)
-            Δ = self._mlp(f"BF_unres{suffix}", out_dim, s).reshape(
-                (self.n_orbitals, self.n_alpha + self.n_beta)
-            )
-
-            Δ_α = Δ[:, : self.n_alpha]
-            Δ_β = Δ[:, self.n_alpha :]
-
-            A_α = (M_α_base + Δ_α)[rows_α, :]
-            A_β = (M_β_base + Δ_β)[rows_β, :]
+            # Unrestricted multi-determinant
+            M_α_base, M_β_base = orbitals
+            out_dim_per_det = self.n_orbitals * (self.n_alpha + self.n_beta)
+            total_dim = self.n_dets * out_dim_per_det
+            Δ_flat = self._mlp("BF_unres", total_dim, s)
+            Δ = Δ_flat.reshape(self.n_dets, self.n_orbitals, self.n_alpha + self.n_beta)
+            Δ_α = Δ[:, :, : self.n_alpha]
+            Δ_β = Δ[:, :, self.n_alpha :]
+            A_α = (M_α_base + Δ_α)[:, rows_α, :]
+            A_β = (M_β_base + Δ_β)[:, rows_β, :]
             return logdet_c(A_α) + logdet_c(A_β)
 
-        if not is_multi:
-            return lambda s: eval_single(orbitals, 0, s)
+        return eval_multi
 
-        # Vectorize over determinant index
-        def eval_all(s: jnp.ndarray) -> jnp.ndarray:
-            if self.generalized or self.restricted:
-                return jax.vmap(lambda i, M: eval_single(M, i, s), in_axes=(0, 0))(
-                    jnp.arange(self.n_dets), orbitals
-                )
-            M_α, M_β = orbitals
-            return jax.vmap(
-                lambda i, Ma, Mb: eval_single((Ma, Mb), i, s), in_axes=(0, 0, 0)
-            )(jnp.arange(self.n_dets), M_α, M_β)
-
-        return eval_all
-
-    def _combine_dets(
-        self, eval_fn: Callable, s: jnp.ndarray
-    ) -> jnp.ndarray:
+    def _combine_dets(self, eval_fn: Callable, s: jnp.ndarray) -> jnp.ndarray:
         """Multi-determinant combination via log-sum-exp."""
         log_dets = eval_fn(s)
 
@@ -285,10 +313,8 @@ class ModReLU(nn.Module):
         
         b = self.param('b', initializers.zeros, (features,), z.real.dtype)
         
-        # Decompose: z = |z| * (z/|z|)
         amplitude = jnp.abs(z)
-        phase = z / (amplitude + eps)  # Stabilized phase
-        
+        phase = z / (amplitude + eps)
         gated_amplitude = jnp.maximum(amplitude + b, 0.0)
         
         return gated_amplitude * phase
@@ -310,7 +336,7 @@ class ComplexRMSNorm(nn.Module):
 
 
 class ComplexResidualMLP(nn.Module):
-    """Residual MLP with native complex arithmetic: [Norm → Activate → Dense + Skip]^L."""
+    """Residual MLP with native complex arithmetic."""
 
     hidden_dims: tuple[int, ...] = (256,)
     param_dtype: Any = jnp.complex64
@@ -377,7 +403,7 @@ class cBackflowMLP(nn.Module):
         hidden_dims: Complex MLP hidden dimensions
         param_dtype: Complex type for all parameters
         kernel_init, bias_init: Weight initializers
-        logdet_jitter: Optional diagonal regularization for stability
+        logdet_jitter: Diagonal regularization for stability
     """
 
     n_orbitals: int
@@ -403,7 +429,7 @@ class cBackflowMLP(nn.Module):
             name=f"{name}_cmlp",
         )(s)
         
-        # Output projection with He scaling for post-activation
+        # Output projection with He scaling
         z = ComplexDense(
             out_dim,
             param_dtype=self.param_dtype,
@@ -471,70 +497,98 @@ class cBackflowMLP(nn.Module):
         is_multi: bool,
         s: jnp.ndarray,
     ) -> Callable[[jnp.ndarray], jnp.ndarray]:
-        """Build function: s → log det(M + ΔM(s)) with complex arithmetic."""
+        """Build function: s -> log det(M + ΔM(s)) with complex arithmetic."""
 
-        def eval_single(M_base, idx: int, s: jnp.ndarray) -> jnp.ndarray:
-            suffix = f"_det{idx}" if is_multi else ""
-
+        def _extract_indices(s: jnp.ndarray):
+            """Compute occupied row indices for configuration s."""
             if self.generalized:
-                out_dim = (2 * self.n_orbitals) * n_e
-                Δ = self._mlp(f"BF_gen{suffix}", out_dim, s).reshape(
-                    (2 * self.n_orbitals, n_e)
-                )
-                M_eff = M_base + Δ
                 rows = jnp.nonzero(s, size=n_e, fill_value=0)[0]
-                return self._safe_logdet(M_eff[rows, :])
+                return rows, None
 
-            # Extract spin occupancies
             α_occ = s[: self.n_orbitals]
             β_occ = s[self.n_orbitals :]
             rows_α = jnp.nonzero(α_occ, size=self.n_alpha, fill_value=0)[0]
             rows_β = jnp.nonzero(β_occ, size=self.n_beta, fill_value=0)[0]
+            return rows_α, rows_β
+
+        if not is_multi:
+            def eval_single(s: jnp.ndarray) -> jnp.ndarray:
+                rows_α, rows_β = _extract_indices(s)
+
+                if self.generalized:
+                    out_dim = (2 * self.n_orbitals) * n_e
+                    Δ = self._mlp("BF_gen", out_dim, s).reshape(
+                        (2 * self.n_orbitals, n_e)
+                    )
+                    M_eff = orbitals + Δ
+                    rows = rows_α
+                    return self._safe_logdet(M_eff[rows, :])
+
+                if self.restricted:
+                    k = max(self.n_alpha, self.n_beta)
+                    out_dim = self.n_orbitals * k
+                    Δ = self._mlp("BF_res", out_dim, s).reshape(
+                        (self.n_orbitals, k)
+                    )
+                    M_eff = orbitals + Δ
+                    A_α = M_eff[rows_α, : self.n_alpha]
+                    A_β = M_eff[rows_β, : self.n_beta]
+                    return self._safe_logdet(A_α) + self._safe_logdet(A_β)
+
+                # Unrestricted
+                M_α_base, M_β_base = orbitals
+                out_dim = self.n_orbitals * (self.n_alpha + self.n_beta)
+                Δ = self._mlp("BF_unres", out_dim, s).reshape(
+                    (self.n_orbitals, self.n_alpha + self.n_beta)
+                )
+                Δ_α = Δ[:, : self.n_alpha]
+                Δ_β = Δ[:, self.n_alpha :]
+                A_α = (M_α_base + Δ_α)[rows_α, :]
+                A_β = (M_β_base + Δ_β)[rows_β, :]
+                return self._safe_logdet(A_α) + self._safe_logdet(A_β)
+
+            return eval_single
+
+        # Multi-determinant case
+        def eval_multi(s: jnp.ndarray) -> jnp.ndarray:
+            rows_α, rows_β = _extract_indices(s)
+
+            if self.generalized:
+                out_dim_per_det = (2 * self.n_orbitals) * n_e
+                total_dim = self.n_dets * out_dim_per_det
+                Δ_flat = self._mlp("BF_gen", total_dim, s)
+                Δ = Δ_flat.reshape(self.n_dets, 2 * self.n_orbitals, n_e)
+                M_eff = orbitals + Δ
+                rows = rows_α
+                A = M_eff[:, rows, :]
+                return self._safe_logdet(A)
 
             if self.restricted:
                 k = max(self.n_alpha, self.n_beta)
-                out_dim = self.n_orbitals * k
-                Δ = self._mlp(f"BF_res{suffix}", out_dim, s).reshape(
-                    (self.n_orbitals, k)
-                )
-                M_eff = M_base + Δ
-                A_α = M_eff[rows_α, : self.n_alpha]
-                A_β = M_eff[rows_β, : self.n_beta]
+                out_dim_per_det = self.n_orbitals * k
+                total_dim = self.n_dets * out_dim_per_det
+                Δ_flat = self._mlp("BF_res", total_dim, s)
+                Δ = Δ_flat.reshape(self.n_dets, self.n_orbitals, k)
+                M_eff = orbitals + Δ
+                A_α = M_eff[:, rows_α, : self.n_alpha]
+                A_β = M_eff[:, rows_β, : self.n_beta]
                 return self._safe_logdet(A_α) + self._safe_logdet(A_β)
 
-            # Unrestricted: independent α/β corrections
-            M_α_base, M_β_base = M_base
-            out_dim = self.n_orbitals * (self.n_alpha + self.n_beta)
-            Δ = self._mlp(f"BF_unres{suffix}", out_dim, s).reshape(
-                (self.n_orbitals, self.n_alpha + self.n_beta)
-            )
-
-            Δ_α = Δ[:, : self.n_alpha]
-            Δ_β = Δ[:, self.n_alpha :]
-
-            A_α = (M_α_base + Δ_α)[rows_α, :]
-            A_β = (M_β_base + Δ_β)[rows_β, :]
+            # Unrestricted multi-determinant
+            M_α_base, M_β_base = orbitals
+            out_dim_per_det = self.n_orbitals * (self.n_alpha + self.n_beta)
+            total_dim = self.n_dets * out_dim_per_det
+            Δ_flat = self._mlp("BF_unres", total_dim, s)
+            Δ = Δ_flat.reshape(self.n_dets, self.n_orbitals, self.n_alpha + self.n_beta)
+            Δ_α = Δ[:, :, : self.n_alpha]
+            Δ_β = Δ[:, :, self.n_alpha :]
+            A_α = (M_α_base + Δ_α)[:, rows_α, :]
+            A_β = (M_β_base + Δ_β)[:, rows_β, :]
             return self._safe_logdet(A_α) + self._safe_logdet(A_β)
 
-        if not is_multi:
-            return lambda s: eval_single(orbitals, 0, s)
+        return eval_multi
 
-        # Vectorize over determinant index
-        def eval_all(s: jnp.ndarray) -> jnp.ndarray:
-            if self.generalized or self.restricted:
-                return jax.vmap(lambda i, M: eval_single(M, i, s), in_axes=(0, 0))(
-                    jnp.arange(self.n_dets), orbitals
-                )
-            M_α, M_β = orbitals
-            return jax.vmap(
-                lambda i, Ma, Mb: eval_single((Ma, Mb), i, s), in_axes=(0, 0, 0)
-            )(jnp.arange(self.n_dets), M_α, M_β)
-
-        return eval_all
-
-    def _combine_dets(
-        self, eval_fn: Callable, s: jnp.ndarray
-    ) -> jnp.ndarray:
+    def _combine_dets(self, eval_fn: Callable, s: jnp.ndarray) -> jnp.ndarray:
         """Multi-determinant combination via log-sum-exp."""
         log_dets = eval_fn(s)
 

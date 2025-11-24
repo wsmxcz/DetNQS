@@ -9,7 +9,7 @@ nodal surfaces: log J(s) = Σᵢ uᵢsᵢ + ½ Σᵢⱼ sᵢVᵢⱼsⱼ
 
 File: lever/models/jastrow.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
@@ -28,13 +28,13 @@ class Jastrow(nn.Module):
     Reweights determinant amplitudes via diagonal correlation without
     modifying nodal structure. Operates in occupation number basis.
     
-    Attributes:
+    Args:
         n_orbitals: Number of spatial orbitals (input dimension: 2*n_orbitals)
         param_dtype: Parameter data type (typically real for positive-definite form)
     """
 
     n_orbitals: int
-    param_dtype: Any = jnp.float64
+    param_dtype: Any = jnp.float32
 
     # Real-valued correlation factor
     __lever_is_holomorphic__ = False
@@ -42,13 +42,15 @@ class Jastrow(nn.Module):
     @nn.compact
     def __call__(self, s: jnp.ndarray) -> jnp.ndarray:
         """
-        Compute log-Jastrow factor for occupation vector.
+        Compute log-Jastrow factor for occupation vector s.
+        
+        Mathematical form: log J(s) = Σᵢ uᵢsᵢ + ½ Σᵢⱼ sᵢVᵢⱼsⱼ
         
         Args:
-            s: Occupation vector of shape (2*n_orbitals,)
+            s: Occupation vector [2*n_orbitals]
             
         Returns:
-            Scalar log(J(s)) combining one-body and two-body terms
+            log-Jastrow factor (scalar)
         """
         n_vis = 2 * self.n_orbitals
         x = s.astype(self.param_dtype)
@@ -57,13 +59,11 @@ class Jastrow(nn.Module):
         u = self.param("u", initializers.zeros, (n_vis,), self.param_dtype)
         one_body = jnp.dot(u, x)
 
-        # Two-body density-density interactions: ½ Σᵢⱼ sᵢVᵢⱼsⱼ
+        # Two-body density-density interactions: ½ xᵀVx
         V = self.param("V", initializers.zeros, (n_vis, n_vis), self.param_dtype)
-        # Enforce symmetry and remove diagonal to prevent double counting
-        V_eff = 0.5 * (V + V.T) - jnp.diag(jnp.diag(V))
-        two_body = 0.5 * jnp.dot(x, jnp.dot(V_eff, x))
+        two_body = 0.5 * jnp.dot(x, jnp.dot(V, x))
 
-        return two_body
+        return one_body + two_body
 
 
 __all__ = ["Jastrow"]

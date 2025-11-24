@@ -20,11 +20,9 @@ from ..dtypes import ScoreResult
 
 
 class TopKSelector:
-    """
-    Select top-k determinants by score ranking.
-
-    Uses partial sort to extract k highest-scoring configurations,
-    automatically handling edge cases where k exceeds available candidates.
+    """Select top-k determinants by score using partial selection algorithm.
+    
+    Uses argpartition for O(n) average complexity instead of full O(n log n) sort.
     """
 
     def __init__(self, k: int) -> None:
@@ -33,12 +31,11 @@ class TopKSelector:
         self.k = k
 
     def select(self, score_result: ScoreResult) -> np.ndarray:
-        """
-        Extract k determinants with highest scores.
-
+        """Select k determinants with highest scores.
+        
         Args:
             score_result: Scored determinant collection
-
+            
         Returns:
             Selected determinants ordered by descending score
         """
@@ -48,18 +45,18 @@ class TopKSelector:
 
         n_select = min(self.k, len(scores))
 
-        # Use argsort on scores; for small k this is effectively O(n log k)
-        top_indices = np.argsort(scores)[-n_select:]
+        if n_select == len(scores):
+            top_indices = np.argsort(scores)[::-1]  # Full sort when k = n
+        else:
+            # Partial selection: partition then sort only top-k
+            partition_indices = np.argpartition(scores, -n_select)[-n_select:]
+            top_indices = partition_indices[np.argsort(scores[partition_indices])[::-1]]
+        
         return dets[top_indices]
 
 
 class ThresholdSelector:
-    """
-    Select determinants exceeding a score threshold with optional size cap.
-
-    Applies absolute score cutoff followed by top-k reduction if needed,
-    ensuring both quality and quantity constraints are satisfied.
-    """
+    """Select determinants exceeding score threshold with optional size cap."""
 
     def __init__(
         self,
@@ -70,12 +67,11 @@ class ThresholdSelector:
         self.max_size = max_size
 
     def select(self, score_result: ScoreResult) -> np.ndarray:
-        """
-        Filter determinants by threshold with optional size limiting.
-
+        """Filter determinants by threshold with size limiting.
+        
         Args:
             score_result: Scored determinant collection
-
+            
         Returns:
             Selected determinants meeting threshold criteria
         """
@@ -83,84 +79,82 @@ class ThresholdSelector:
         if dets.size == 0:
             return dets
 
-        # First pass: threshold filtering
         passing_mask = scores >= self.threshold
-        passing_indices = np.where(passing_mask)[0]
-
-        if passing_indices.size == 0:
+        
+        if not np.any(passing_mask):
             return np.empty((0, dets.shape[1]), dtype=dets.dtype)
 
-        # Second pass: enforce size constraint if needed
-        if self.max_size is not None and passing_indices.size > self.max_size:
-            passing_scores = scores[passing_indices]
-            top_k_local = np.argsort(passing_scores)[-self.max_size:]
-            passing_indices = passing_indices[top_k_local]
-
-        return dets[passing_indices]
+        if self.max_size is not None:
+            passing_indices = np.where(passing_mask)[0]
+            
+            if passing_indices.size > self.max_size:
+                # Apply top-k selection on threshold-passed candidates
+                passing_scores = scores[passing_indices]
+                local_top_k = np.argpartition(passing_scores, -self.max_size)[-self.max_size:]
+                sorted_local = local_top_k[np.argsort(passing_scores[local_top_k])[::-1]]
+                return dets[passing_indices[sorted_local]]
+        
+        return dets[passing_mask]
 
 
 class CumulativeMassSelector:
+    """Select determinants until cumulative mass threshold is reached.
+    
+    Assumes scores are non-negative weights. For amplitude-based scores,
+    commonly uses |ψ_i|². Selected set captures at least mass_threshold
+    of total weight: Σ_{selected} w_i ≥ threshold × Σ_{all} w_i.
     """
-    Select determinants until a cumulative mass threshold is reached.
 
-    The selector assumes scores are non-negative "weights". For amplitude-
-    based scores, a common choice is |ψ_i|². The selected set captures at
-    least `mass_threshold` of the total weight.
-    """
-
-    def __init__(self, mass_threshold: float = 0.999) -> None:
-        """
-        Args:
-            mass_threshold: Target cumulative mass in (0, 1]. For example,
-                            0.999 means the selected space captures 99.9%
-                            of the total score mass.
-        """
+    def __init__(
+        self, 
+        mass_threshold: float = 0.999,
+        max_size: int | None = None,
+    ) -> None:
         if not 0.0 < mass_threshold <= 1.0:
-            raise ValueError(
-                f"mass_threshold must be in (0, 1], got {mass_threshold}"
-            )
+            raise ValueError(f"mass_threshold must be in (0, 1], got {mass_threshold}")
+        if max_size is not None and max_size <= 0:
+            raise ValueError("max_size must be positive")
+        
         self.mass_threshold = mass_threshold
+        self.max_size = max_size
 
     def select(self, score_result: ScoreResult) -> np.ndarray:
-        """
-        Select determinants by descending mass until mass_threshold is met.
-
+        """Select determinants by descending mass until threshold met.
+        
         Args:
             score_result: Scored determinant collection
-
+            
         Returns:
-            New S-space determinants as ndarray (n, 2)
+            Selected determinants as ndarray (n, 2)
         """
         scores, dets = score_result.scores, score_result.dets
         if dets.size == 0:
             return dets
 
-        # Use absolute values to be robust to signed scores
         weights = np.abs(np.asarray(scores, dtype=float))
         total_mass = weights.sum()
 
-        # Degenerate case: no meaningful mass
         if total_mass <= 0.0:
             return np.empty((0, dets.shape[1]), dtype=dets.dtype)
 
-        # Normalize to probability-like weights
         probs = weights / total_mass
+        n = len(probs)
+        
+        if self.max_size is not None and self.max_size < n:
+            # Partial selection for large arrays
+            partition_idx = np.argpartition(probs, -self.max_size)[-self.max_size:]
+            sorted_indices = partition_idx[np.argsort(probs[partition_idx])[::-1]]
+            sorted_probs = probs[sorted_indices]
+        else:
+            # Full sort for smaller arrays
+            sorted_indices = np.argsort(probs)[::-1]
+            sorted_probs = probs[sorted_indices]
 
-        # Sort determinants by decreasing probability
-        sorted_indices = np.argsort(probs)[::-1]
-        sorted_probs = probs[sorted_indices]
-
-        # Prefix sum to get cumulative mass
         cumulative_mass = np.cumsum(sorted_probs)
+        cutoff_idx = np.searchsorted(cumulative_mass, self.mass_threshold, side="right")
 
-        # Find the first index where cumulative mass exceeds the threshold
-        cutoff_idx = np.searchsorted(
-            cumulative_mass, self.mass_threshold, side="right"
-        )
-
-        # Ensure at least one determinant is selected when possible
         if cutoff_idx == 0 and len(sorted_indices) > 0:
-            cutoff_idx = 1
+            cutoff_idx = 1  # Ensure at least one selection
 
         return dets[sorted_indices[:cutoff_idx]]
 

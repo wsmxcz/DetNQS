@@ -65,7 +65,7 @@ class Compiler:
         feat_s, feat_c = self._prepare_features(space)
         
         # Phase 4: Operator compilation
-        log_psi_fn = self._compile_log_psi(mode)
+        log_psi_fn = self._compile_log_psi(mode, feat_s, feat_c)
         spmv_fn = self._compile_spmv(ham_ss_raw, ham_sc, space, mode)
         
         # Phase 5: Package context and diagnostics
@@ -181,8 +181,19 @@ class Compiler:
             dets_to_features(space.c_dets, n_orb)
         )
     
-    def _compile_log_psi(self, mode: ComputeMode) -> Callable:
-        """Compile batch log(ψ) evaluator with optional normalization."""
+    def _compile_log_psi(
+        self,
+        mode: ComputeMode,
+        feat_s: jnp.ndarray,
+        feat_c: jnp.ndarray
+    ) -> Callable:
+        """
+        Compile batch log(ψ) evaluator with optional normalization.
+
+        If spin_flip_symmetry is enabled, use a Z2-reduced evaluator that
+        only runs the network on spin-flip orbits' representatives and
+        broadcasts the results back to S/C space.
+        """
         from ..engine import operator
         
         return operator.create_logpsi_evals(
@@ -190,7 +201,10 @@ class Compiler:
             mode=mode,
             normalize=self.cfg.normalize_wf,
             device_complex=self.cfg.precision.jax_complex,
-            chunk_size=self.cfg.loop.chunk_size
+            chunk_size=self.cfg.loop.chunk_size,
+            spin_flip_symmetry=self.cfg.spin_flip_symmetry,
+            feat_s=feat_s,
+            feat_c=feat_c
         )
     
     def _compile_spmv(

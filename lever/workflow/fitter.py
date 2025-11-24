@@ -123,7 +123,7 @@ class Fitter:
         feat_c = ctx.features_c
 
         # Preallocate energy buffer on device
-        energies_init = jnp.empty((max_steps,), dtype=jnp.float64)
+        energies_init = jnp.empty((max_steps,))
 
         # carry = (state, energies, k, last_energy, streak, converged)
         carry_init = (

@@ -9,7 +9,7 @@ Supports generalized (spin-orbital) and spatial (restricted/unrestricted) formul
 
 File: lever/models/slater.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
@@ -37,16 +37,6 @@ class Slater(nn.Module):
       - Generalized: Single matrix for all electrons (spin-orbital basis)
       - Restricted: Shared spatial orbitals for α/β (RHF-like)
       - Unrestricted: Separate α/β orbital matrices (UHF-like)
-    
-    Attributes:
-        n_orbitals: Number of spatial orbitals
-        n_alpha, n_beta: Electron counts per spin
-        n_dets: Number of determinants in expansion (1 = single Slater)
-        generalized: Use spin-orbital formulation
-        restricted: Share α/β orbitals (ignored if generalized=True)
-        use_log_coeffs: Learn expansion coefficients (n_dets > 1 only)
-        param_dtype: Orbital matrix dtype (complex recommended)
-        kernel_init: Weight initialization strategy
     """
     n_orbitals: int
     n_alpha: int
@@ -72,18 +62,10 @@ class Slater(nn.Module):
         n_elec = self.n_alpha + self.n_beta
         is_multi = self.n_dets > 1
 
-        # Initialize orbital parameters based on formulation
         orbital_params = self._init_orbital_params(is_multi)
-        
-        # Build determinant evaluator
         eval_det = self._build_det_evaluator(n_elec, orbital_params, is_multi)
         
-        # Compute log-amplitude
-        if not is_multi:
-            return eval_det(s)
-        
-        # Multi-determinant: combine with coefficients
-        return self._combine_multi_dets(eval_det, s)
+        return eval_det(s) if not is_multi else self._combine_multi_dets(eval_det, s)
 
     def _init_orbital_params(self, is_multi: bool) -> tuple | jnp.ndarray:
         """Initialize learnable orbital matrices."""
@@ -114,55 +96,72 @@ class Slater(nn.Module):
         params: tuple | jnp.ndarray,
         is_multi: bool
     ) -> Callable[[jnp.ndarray], jnp.ndarray]:
-        """
-        Construct determinant evaluation function.
+        """Construct determinant evaluation function with precomputed indices."""
         
-        Returns function: s -> log(det(M[s,:]))
-        """
-        def eval_single(M_params, s: jnp.ndarray) -> jnp.ndarray:
-            """Evaluate single determinant from occupation vector."""
+        def _extract_indices(s: jnp.ndarray):
+            """Compute occupied row indices for configuration s."""
             if self.generalized:
-                # Extract rows for occupied spin-orbitals
                 rows = jnp.nonzero(s, size=n_elec, fill_value=-1)[0]
-                A = M_params[rows, :]
-                return utils.logdet_c(A)
-            
-            # Split α/β channels
+                return rows, None
+
             α_occ = s[:self.n_orbitals]
             β_occ = s[self.n_orbitals:]
             rows_α = jnp.nonzero(α_occ, size=self.n_alpha, fill_value=-1)[0]
             rows_β = jnp.nonzero(β_occ, size=self.n_beta, fill_value=-1)[0]
+            return rows_α, rows_β
+
+        def _single_det_log(M_params, rows_α, rows_β, s: jnp.ndarray) -> jnp.ndarray:
+            """Evaluate log det for single determinant using precomputed indices."""
+            if self.generalized:
+                rows, _ = rows_α, rows_β
+                A = M_params[rows, :]
+                return utils.logdet_c(A)
 
             if self.restricted:
-                # Shared spatial orbitals: log|det_α| + log|det_β|
+                # Shared spatial orbitals: log det_α + log det_β
                 A_α = M_params[rows_α, :self.n_alpha]
                 A_β = M_params[rows_β, :self.n_beta]
                 return utils.logdet_c(A_α) + utils.logdet_c(A_β)
-            
-            # Unrestricted: separate α/β determinants
+
+            # Unrestricted: separate α/β matrices
             M_α, M_β = M_params
             A_α = M_α[rows_α, :]
             A_β = M_β[rows_β, :]
             return utils.logdet_c(A_α) + utils.logdet_c(A_β)
 
         if not is_multi:
-            return lambda s: eval_single(params, s)
-        
-        # Multi-determinant: vmap over determinant axis
-        if self.generalized or self.restricted:
-            return lambda s: jax.vmap(lambda M: eval_single(M, s))(params)
-        
+            def eval_det(s: jnp.ndarray) -> jnp.ndarray:
+                rows_α, rows_β = _extract_indices(s)
+                return _single_det_log(params, rows_α, rows_β, s)
+            return eval_det
+
+        # Multi-determinant: batched logdet computation
+        if self.generalized:
+            def eval_det(s: jnp.ndarray) -> jnp.ndarray:
+                rows_α, _ = _extract_indices(s)
+                A = params[:, rows_α, :]  # (n_dets, n_elec, n_elec)
+                return utils.logdet_c(A)
+            return eval_det
+
+        if self.restricted:
+            def eval_det(s: jnp.ndarray) -> jnp.ndarray:
+                rows_α, rows_β = _extract_indices(s)
+                M = params  # (n_dets, n_orb, k)
+                A_α = M[:, rows_α, :self.n_alpha]
+                A_β = M[:, rows_β, :self.n_beta]
+                return utils.logdet_c(A_α) + utils.logdet_c(A_β)
+            return eval_det
+
         # Unrestricted multi-determinant
         M_α, M_β = params
-        return lambda s: jax.vmap(
-            lambda Ma, Mb: eval_single((Ma, Mb), s)
-        )(M_α, M_β)
+        def eval_det(s: jnp.ndarray) -> jnp.ndarray:
+            rows_α, rows_β = _extract_indices(s)
+            A_α = M_α[:, rows_α, :]
+            A_β = M_β[:, rows_β, :]
+            return utils.logdet_c(A_α) + utils.logdet_c(A_β)
+        return eval_det
 
-    def _combine_multi_dets(
-        self, 
-        eval_det: Callable, 
-        s: jnp.ndarray
-    ) -> jnp.ndarray:
+    def _combine_multi_dets(self, eval_det: Callable, s: jnp.ndarray) -> jnp.ndarray:
         """
         Combine multiple determinants with learned coefficients.
         

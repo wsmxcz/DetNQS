@@ -28,18 +28,11 @@ if TYPE_CHECKING:
 
 def masks_to_vecs(dets: jnp.ndarray, n_orb: int) -> jnp.ndarray:
     """
-    Convert determinant bitmasks to occupancy vectors.
+    Convert determinant bitmasks to occupancy vectors (JAX version).
     
-    Maps bit representations to neural network features:
-      |det⟩ = |i₁...iₐ⟩⊗|j₁...jᵦ⟩ → [n₁ᵅ,...,nₘᵅ, n₁ᵝ,...,nₘᵝ]
-    where nₖᵠ ∈ {0,1} denotes spin-σ occupation of orbital k.
-    
-    Args:
-        dets: (..., 2) uint64 bitmasks [α-string, β-string]
-        n_orb: Number of spatial orbitals M
-    
-    Returns:
-        (..., 2M) occupancy vectors in [0,1]
+    This version operates on JAX arrays and is suitable for use inside
+    JIT-compiled code. For host-side preprocessing, prefer the NumPy
+    implementation `masks_to_vecs_numpy` to avoid extra JIT compilations.
     """
     if dets.shape[-1] != 2:
         raise ValueError(f"Expected dets.shape[-1]=2, got {dets.shape}")
@@ -55,6 +48,36 @@ def masks_to_vecs(dets: jnp.ndarray, n_orb: int) -> jnp.ndarray:
     return jnp.concatenate([alpha_occ, beta_occ], axis=-1)
 
 
+def masks_to_vecs_numpy(dets: np.ndarray, n_orb: int) -> np.ndarray:
+    """
+    Host-side determinant → feature conversion using NumPy only.
+    
+    This avoids XLA compilation for bit operations and is used in the
+    compilation pipeline where shapes change across outer cycles.
+    
+    Args:
+        dets: (..., 2) uint64 bitmasks [α-string, β-string]
+        n_orb: Number of spatial orbitals M
+    
+    Returns:
+        (..., 2M) occupancy vectors in [0,1] as float32 NumPy array
+    """
+    if dets.shape[-1] != 2:
+        raise ValueError(f"Expected dets.shape[-1]=2, got {dets.shape}")
+
+    dets = dets.astype(np.uint64, copy=False)
+    alpha = dets[..., 0]
+    beta = dets[..., 1]
+
+    orb_idx = np.arange(n_orb, dtype=np.uint64)  # [M]
+
+    # (..., 1) >> [M] → (..., M)
+    alpha_occ = ((alpha[..., None] >> orb_idx) & 1).astype(np.float32)
+    beta_occ = ((beta[..., None] >> orb_idx) & 1).astype(np.float32)
+
+    return np.concatenate([alpha_occ, beta_occ], axis=-1)
+
+
 def dets_to_features(
     dets: np.ndarray,
     n_orb: int
@@ -62,7 +85,8 @@ def dets_to_features(
     """
     Convert CPU determinants to device feature tensor.
     
-    Wrapper around masks_to_vecs with device transfer.
+    Host-side bit operations (NumPy) are used to avoid JAX compiling
+    the bit-manipulation kernels for every new (S, C) shape.
     
     Args:
         dets: NumPy determinants, shape (n, 2)
@@ -74,8 +98,9 @@ def dets_to_features(
     if len(dets) == 0:
         return jnp.empty((0, 2 * n_orb), dtype=jnp.float32)
     
-    dets_dev = jax.device_put(dets)
-    return masks_to_vecs(dets_dev, n_orb)
+    # Compute features on CPU, then transfer a dense float32 tensor once
+    feats_np = masks_to_vecs_numpy(dets, n_orb)
+    return jax.device_put(feats_np)
 
 
 def compute_normalized_amplitudes(
@@ -142,6 +167,7 @@ def create_psi_cache(
 
 __all__ = [
     "masks_to_vecs",
+    "masks_to_vecs_numpy",
     "dets_to_features",
     "compute_normalized_amplitudes",
     "create_psi_cache",

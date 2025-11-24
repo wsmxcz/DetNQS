@@ -15,10 +15,11 @@ Date: November, 2025
 from __future__ import annotations
 
 import time
+import gc
 from typing import TYPE_CHECKING
 
 import numpy as np
-from jax import tree_util
+import jax
 
 from . import core
 from .analysis import VariationalEvaluator
@@ -48,6 +49,7 @@ class Driver:
         optimizer
     ):
         self.cfg = config
+        self.cfg.precision.apply()
         self.model = model
         self.strategy = strategy
         self.optimizer = optimizer
@@ -123,6 +125,11 @@ class Driver:
         """
         Sliding-window convergence test.
         
+        Args:
+            recent_energies: Energy history
+            patience: Window size for convergence check
+            tol: Energy tolerance threshold
+            
         Returns:
             (converged, max_delta)
         """
@@ -143,50 +150,52 @@ class Driver:
         
         state = self._initialize_state()
         history = _History()
-        t0 = time.time()
+
+        t0 = time.perf_counter()
         
         max_outer = self.cfg.loop.max_outer
         patience = self.cfg.loop.outer_patience
         tol = self.cfg.loop.outer_tol
         
-        recent_energies = []
+        recent_energies: list[float] = []
         converged = False
+
+        ctx: OuterCtx | None = None
+        result = None
+        psi_s = None
+        psi_c = None
 
         final_ctx: OuterCtx | None = None
         final_psi_cache: PsiCache | None = None
         
         for cycle in range(max_outer):
-            cycle_start = time.time()
+            gc.collect()
             
-            # Compile: generate S/C spaces and Hamiltonian
+            cycle_start = time.perf_counter()
+            
+            # Phase 1: Compile context for current outer state
             ctx, comp_diag = self.compiler.compile(state)
             self._print_cycle_header(cycle + 1, max_outer, comp_diag)
             
-            # Fit: inner-loop optimization
+            # Phase 2: Inner-loop optimization
             result = self.fitter.fit(ctx, state.params, self.optimizer)
-            
-            final_ctx = ctx
-            final_psi_cache = result.psi_cache
 
-            # Compute wavefunction diagnostics
             psi_s = result.psi_cache.psi_s
             psi_c = result.psi_cache.psi_c
-            psi_s_norm_sq = float(np.sum(np.abs(psi_s)**2))
-            psi_c_norm_sq = float(np.sum(np.abs(psi_c)**2))
+
+            psi_s_norm_sq = float(np.sum(np.abs(np.asarray(psi_s)) ** 2))
+            psi_c_norm_sq = float(np.sum(np.abs(np.asarray(psi_c)) ** 2))
             
             final_energy = result.energy_trace[-1]
-            max_inner = len(result.energy_trace)
-            cycle_time = time.time() - cycle_start
-            
-            self._print_cycle_summary(
-                psi_s_norm_sq, psi_c_norm_sq,
-                final_energy, max_inner, cycle_time
-            )
+            steps = result.steps
             
             history.append_cycle(result.energy_trace)
             recent_energies.append(final_energy)
+
+            final_ctx = ctx
+            final_psi_cache = result.psi_cache
             
-            # Check convergence
+            # Phase 3: Check outer convergence
             converged, max_delta = self._check_convergence(
                 recent_energies, patience, tol
             )
@@ -194,22 +203,58 @@ class Driver:
             if converged:
                 self.logger.converged(cycle + 1, max_delta)
                 state = self._update_state(state, result, ctx, evolve=False)
+            else:
+                if len(recent_energies) > patience + 1:
+                    recent_energies = recent_energies[-(patience + 1):]
+                
+                # Phase 4: Evolve S-space
+                state = self._update_state(state, result, ctx, evolve=True)
+
+            try:
+                jax.block_until_ready(state.params)
+            except Exception:
+                pass
+
+            cycle_time = time.perf_counter() - cycle_start
+            
+            self._print_cycle_summary(
+                psi_s_norm_sq, psi_c_norm_sq,
+                final_energy, steps, cycle_time
+            )
+            
+            if converged:
                 break
-            
-            # Trim history window
-            if len(recent_energies) > patience + 1:
-                recent_energies = recent_energies[-(patience+1):]
-            
-            state = self._update_state(state, result, ctx, evolve=True)
             
             if cycle < max_outer - 1:
                 self.logger.separator()
+
+            del ctx, result, psi_s, psi_c
+            ctx = result = psi_s = psi_c = None
         
         if not converged:
             self.logger.max_cycles_reached(max_outer)
-        
+
+        if self.cfg.compute_mode == ComputeMode.EFFECTIVE:
+            final_ctx, _ = self.compiler.compile(state)
+            final_psi_cache = self.fitter._create_cache(final_ctx, state.params)
+
+        if final_psi_cache is not None:
+            try:
+                jax.block_until_ready(final_psi_cache.psi_s)
+                jax.block_until_ready(final_psi_cache.psi_c)
+            except Exception:
+                pass
+
+        try:
+            jax.block_until_ready(state.params)
+        except Exception:
+            pass
+
+        total_time = time.perf_counter() - t0
+        gc.collect()
+
         return self._finalize_results(
-            state, history, time.time() - t0, 
+            state, history, total_time, 
             final_ctx, final_psi_cache
         )
     
@@ -255,19 +300,30 @@ class Driver:
         return result.energy_trace[-1] - ctx.e_nuc
     
     def _print_header(self):
-        """Log run header with configuration details."""
+        """Log run header with configuration and model details."""
         self.logger.header("LEVER Initialization")
         
-        self.logger.info(
-            f"Compute mode        : {self.cfg.compute_mode.value.upper()}"
-        )
-        self.logger.info(
-            f"System              : {self.cfg.system.fcidump_path}"
-        )
-        self.logger.info(
-            f"Screening           : {self.cfg.hamiltonian.screening_mode.value}"
-        )
+        self.logger.info(f"Compute mode        : {self.cfg.compute_mode.value.upper()}")
+        self.logger.info(f"System              : {self.cfg.system.fcidump_path}")
+        self.logger.info(f"Screening           : {self.cfg.hamiltonian.screening_mode.value}")
         
+        summary = self.model.summary
+
+        self.logger.info("-" * 30)
+        self.logger.info(f"Model Architecture  : {summary['name']}")
+        self.logger.info(f"Holomorphic         : {summary['is_holomorphic']}")
+        
+        if summary['status'] == "Initialized":
+            n_params = summary['n_params']
+            size_mb = summary['param_bytes'] / (1024 * 1024)
+            dtypes_str = ", ".join(summary['dtypes'])
+            
+            self.logger.info(f"Total Parameters    : {n_params:,}")
+            self.logger.info(f"Model Size          : {size_mb:.2f} MB")
+            self.logger.info(f"Parameter Dtypes    : {dtypes_str}")
+        else:
+            self.logger.warning("Model Parameters    : Uninitialized")
+
         self.logger.info(f"{'='*60}")
     
     def _finalize_results(
@@ -296,7 +352,6 @@ class Driver:
             final_psi_cache=final_psi_cache
         )
 
-        # Persist structured artifacts
         run = get_run()
         if run is not None:
             try:

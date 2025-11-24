@@ -11,6 +11,7 @@ Date: November, 2025
 
 import jax
 import jax.numpy as jnp
+import optax
 
 from lever import analysis, config, driver, evolution, models
 from lever.optimizers import adam
@@ -20,7 +21,12 @@ from lever.monitor.plotting import plot_outer_convergence, plot_inner_convergenc
 
 def main() -> None:
     """Execute complete LEVER variational optimization workflow."""
+    
+    precision_cfg = config.PrecisionConfig(enable_x64=False)
+    precision_cfg.apply()
+    print("x64 enabled:", jax.config.read("jax_enable_x64"))
     print("JAX devices:", jax.devices())
+    jax.config.update("jax_disable_jit", False) 
     jax.config.update("jax_platforms", "cuda")
     jax.config.update("jax_log_compiles", False)
 
@@ -39,16 +45,18 @@ def main() -> None:
     )
 
     loop_cfg = config.LoopConfig(
-        max_outer=20,
-        max_inner=500,
-        chunk_size=8192
+        max_outer=50,
+        max_inner=1000,
+        chunk_size=None
     )
-
+    
     lever_cfg = config.LeverConfig(
         system=sys_cfg,
         hamiltonian=ham_cfg,
         loop=loop_cfg,
         compute_mode=config.ComputeMode.PROXY,
+        spin_flip_symmetry=False,
+        precision=precision_cfg
     )
 
     model = models.Backflow(
@@ -59,18 +67,22 @@ def main() -> None:
         n_dets=1,
         generalized=True,
         restricted=False,
-        hidden_dims=(256,),
-        param_dtype=jnp.complex64
+        hidden_dims=(64, 64),
+        precision=precision_cfg
     )
 
-    # Initialize run: System name "N2_sto3g" automatically inferred from FCIDUMP
     run = init_run(cfg=lever_cfg, root_dir="runs")
     run.save_config(lever_cfg, model=model)
-
-    optimizer = adam(learning_rate=5e-4, weight_decay=1e-4)
+    
+    lr_schedule = optax.cosine_decay_schedule(
+        init_value=1e-4,
+        decay_steps=500,
+        alpha=1e-5 / 1e-4,
+    )
+    optimizer = adam(learning_rate=lr_schedule, weight_decay=1e-4)
 
     amp_scorer = evolution.scores.AmplitudeScorer()
-    mass_selector = evolution.CumulativeMassSelector(mass_threshold=0.9999)
+    mass_selector = evolution.CumulativeMassSelector(mass_threshold=0.9999, max_size=8192)
     evo_strategy = evolution.BasicStrategy(
         scorer=amp_scorer,
         selector=mass_selector,

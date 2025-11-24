@@ -112,7 +112,8 @@ class UpdateRule(Protocol):
         self,
         direction: PyTree,
         state: RuleState,
-        energy: float
+        energy: float,
+        step: int,
     ) -> tuple[float, RuleState]:
         """
         Compute step size from search direction.
@@ -121,6 +122,7 @@ class UpdateRule(Protocol):
             direction: Search direction δ
             state: Algorithm state (e.g., previous α)
             energy: Current energy E(θ) for adaptive rules
+            step: Global iteration counter (0-based)
             
         Returns:
             step_size: Scalar α
@@ -225,7 +227,8 @@ class Optimizer:
         step_size, new_rule_state = self.rule(
             direction,
             state.rule_state,
-            energy
+            energy,
+            state.step,
         )
         
         # Scale direction: Δθ = α·δ

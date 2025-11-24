@@ -21,6 +21,7 @@ import jax.numpy as jnp
 
 from .base import WavefunctionModel, make_model
 from .product import ProductModel
+from ..config import PrecisionConfig
 
 
 # --- Model Factories ---
@@ -36,7 +37,8 @@ def Slater(
     generalized: bool = False,
     restricted: bool = True,
     use_log_coeffs: bool = True,
-    param_dtype: Any = jnp.complex64,
+    precision: PrecisionConfig | None = None,
+    param_dtype: Any | None = None,
     kernel_init: Callable | None = None,
 ) -> WavefunctionModel:
     """
@@ -56,18 +58,27 @@ def Slater(
         generalized: Use spin-orbital formulation
         restricted: Share α/β spatial orbitals (ignored if generalized)
         use_log_coeffs: Learn expansion coefficients (only for n_dets > 1)
-        param_dtype: Orbital matrix dtype (complex recommended)
+        precision: Global precision policy (controls default param dtype)
+        param_dtype: Optional override for parameter dtype
         kernel_init: Weight initializer (default: orthogonal)
       
     Returns:
         Initialized WavefunctionModel
     """
     from flax.linen import initializers
-    from .slater import Slater
+    from .slater import Slater as SlaterModule
+
+    # Resolve parameter dtype from global precision if not explicitly given.
+    if param_dtype is None:
+        if precision is not None:
+            # Device-side complex precision (complex64 by default).
+            param_dtype = precision.jax_complex
+        else:
+            param_dtype = jnp.complex64
 
     kernel_init = kernel_init or initializers.orthogonal()
 
-    ansatz = Slater(
+    ansatz = SlaterModule(
         n_orbitals=n_orbitals,
         n_alpha=n_alpha,
         n_beta=n_beta,
@@ -79,61 +90,12 @@ def Slater(
         kernel_init=kernel_init,
     )
 
-    return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
-
-
-def Pfaffian(
-    n_orbitals: int,
-    n_alpha: int,
-    n_beta: int,
-    *,
-    seed: int,
-    n_terms: int = 1,
-    singlet_only: bool = True,
-    use_log_coeffs: bool = True,
-    param_dtype: Any = jnp.complex64,
-    kernel_init: Callable | None = None,
-) -> WavefunctionModel:
-    """
-    Pfaffian/AGP ansatz for systems with pairing correlations.
-
-    Two operational modes:
-      - singlet_only=True: AGP form, ψ ∝ det(P) where P_{ij} pairs
-        α-spin i with β-spin j
-      - singlet_only=False: Full Pfaffian including triplet pairing
-  
-    Generalizes Slater determinants to capture stronger correlations.
-
-    Args:
-        n_orbitals: Spatial orbital count
-        n_alpha, n_beta: Electron counts per spin
-        seed: Parameter initialization seed
-        n_terms: Expansion terms for multi-Pfaffian ansatz
-        singlet_only: Use AGP (determinant) form
-        use_log_coeffs: Learn expansion coefficients (n_terms > 1)
-        param_dtype: Parameter dtype (complex recommended)
-        kernel_init: Weight initializer (default: lecun_normal)
-
-    Returns:
-        Initialized WavefunctionModel
-    """
-    from flax.linen import initializers
-    from .pfaffian import Pfaffian as PfaffianModule
-
-    kernel_init = kernel_init or initializers.lecun_normal()
-
-    ansatz = PfaffianModule(
+    return make_model(
+        module=ansatz,
+        seed=seed,
         n_orbitals=n_orbitals,
-        n_alpha=n_alpha,
-        n_beta=n_beta,
-        n_terms=n_terms,
-        singlet_only=singlet_only,
-        use_log_coeffs=use_log_coeffs,
-        param_dtype=param_dtype,
-        kernel_init=kernel_init,
+        precision_config=precision,
     )
-
-    return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
 
 
 def RBM(
@@ -142,6 +104,8 @@ def RBM(
     seed: int,
     alpha: float = 1.0,
     use_visible_bias: bool = True,
+    precision: PrecisionConfig | None = None,
+    param_dtype: Any | None = None,
 ) -> WavefunctionModel:
     """
     Complex-valued restricted Boltzmann machine.
@@ -155,19 +119,32 @@ def RBM(
         seed: Parameter initialization seed
         alpha: Hidden/visible unit ratio
         use_visible_bias: Enable visible bias terms
+        precision: Global precision policy
+        param_dtype: Optional override for parameter dtype
       
     Returns:
         Initialized WavefunctionModel
     """
-    from .rbm import RBM
+    from .rbm import RBM as RBMModule
 
-    ansatz = RBM(
+    if param_dtype is None:
+        if precision is not None:
+            param_dtype = precision.jax_complex
+        else:
+            param_dtype = jnp.complex64
+
+    ansatz = RBMModule(
         alpha=alpha,
         use_visible_bias=use_visible_bias,
-        param_dtype=jnp.complex64,
+        param_dtype=param_dtype,
     )
 
-    return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
+    return make_model(
+        module=ansatz,
+        seed=seed,
+        n_orbitals=n_orbitals,
+        precision_config=precision,
+    )
 
 
 def RBMModPhase(
@@ -175,6 +152,8 @@ def RBMModPhase(
     *,
     seed: int,
     alpha: float = 1.0,
+    precision: PrecisionConfig | None = None,
+    param_dtype: Any | None = None,
 ) -> WavefunctionModel:
     """
     Dual-RBM model with separate modulus and phase networks.
@@ -186,14 +165,29 @@ def RBMModPhase(
         n_orbitals: Spatial orbital count
         seed: Parameter initialization seed
         alpha: Hidden/visible ratio per RBM
-      
+        precision: Global precision policy (controls default real dtype)
+
     Returns:
         Initialized WavefunctionModel
     """
-    from .rbm import RBMModPhase
+    from .rbm import RBMModPhase as RBMModPhaseModule
 
-    ansatz = RBMModPhase(alpha=alpha, param_dtype=jnp.float32)
-    return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
+    # Default to device float precision (float32 by default).
+    default_real = precision.jax_float if precision is not None else jnp.float32
+    if param_dtype is None:
+        param_dtype = default_real
+
+    ansatz = RBMModPhaseModule(
+        alpha=alpha,
+        param_dtype=param_dtype,
+    )
+
+    return make_model(
+        module=ansatz,
+        seed=seed,
+        n_orbitals=n_orbitals,
+        precision_config=precision,
+    )
 
 
 def Backflow(
@@ -206,7 +200,8 @@ def Backflow(
     generalized: bool = False,
     restricted: bool = True,
     hidden_dims: Tuple[int, ...] = (256,),
-    param_dtype: Any = jnp.complex64,
+    precision: PrecisionConfig | None = None,
+    param_dtype: Any | None = None,
 ) -> WavefunctionModel:
     """
     Hilbert-space backflow with configuration-dependent orbitals.
@@ -222,12 +217,18 @@ def Backflow(
         generalized: Use spin-orbital formulation
         restricted: Share α/β spatial orbitals
         hidden_dims: MLP architecture (layer sizes)
-        param_dtype: Parameter dtype (complex recommended)
-
+        precision: Global precision policy
+        param_dtype: Optional override for parameter dtype (complex)
     Returns:
         Initialized WavefunctionModel
     """
-    from .backflow import BackflowMLP, cBackflowMLP
+    from .backflow import BackflowMLP
+
+    if param_dtype is None:
+        if precision is not None:
+            param_dtype = precision.jax_complex
+        else:
+            param_dtype = jnp.complex64
 
     ansatz = BackflowMLP(
         n_orbitals=n_orbitals,
@@ -240,14 +241,20 @@ def Backflow(
         param_dtype=param_dtype,
     )
   
-    return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
+    return make_model(
+        module=ansatz,
+        seed=seed,
+        n_orbitals=n_orbitals,
+        precision_config=precision,
+    )
 
 
 def Jastrow(
     n_orbitals: int,
     *,
     seed: int,
-    param_dtype: Any = jnp.float64,
+    precision: PrecisionConfig | None = None,
+    param_dtype: Any | None = None,
 ) -> WavefunctionModel:
     """
     Symmetric Jastrow correlation factor in occupation basis.
@@ -258,15 +265,32 @@ def Jastrow(
     Args:
         n_orbitals: Spatial orbital count
         seed: Parameter initialization seed
-        param_dtype: Parameter dtype (typically real)
+        precision: Global precision policy (controls default real dtype)
+        param_dtype: Optional override for parameter dtype (real)
       
     Returns:
         Initialized WavefunctionModel
     """
-    from .jastrow import Jastrow
+    from .jastrow import Jastrow as JastrowModule
 
-    ansatz = Jastrow(n_orbitals=n_orbitals, param_dtype=param_dtype)
-    return make_model(module=ansatz, seed=seed, n_orbitals=n_orbitals)
+    if param_dtype is None:
+        if precision is not None:
+            param_dtype = precision.jax_float
+        else:
+            # Default to float32 on device; CPU-side Hamiltonian remains float64.
+            param_dtype = jnp.float32
+
+    ansatz = JastrowModule(
+        n_orbitals=n_orbitals,
+        param_dtype=param_dtype,
+    )
+
+    return make_model(
+        module=ansatz,
+        seed=seed,
+        n_orbitals=n_orbitals,
+        precision_config=precision,
+    )
 
 
 def Product(*models: WavefunctionModel) -> ProductModel:
@@ -294,7 +318,6 @@ __all__ = [
     "WavefunctionModel",
     "make_model",
     "Slater",
-    "Pfaffian",
     "RBM",
     "RBMModPhase",
     "Backflow",

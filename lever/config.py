@@ -53,38 +53,52 @@ class ComputeMode(str, Enum):
 
 @dataclass(frozen=True)
 class PrecisionConfig:
-    """
-    Numerical precision policy with automatic JAX/NumPy dtype resolution.
-    
-    Attributes:
-        enable_x64: Enable float64/complex128 globally
-        override_device_complex: Force specific complex dtype (None for auto)
-        override_device_float: Force specific float dtype (None for auto)
+    """Global precision policy.
+
+    Default: single precision on device (float32/complex64),
+    with an option to enable full double precision.
     """
     enable_x64: bool = False
-    override_device_complex: type | None = None
-    override_device_float: type | None = None
-    
+    override_device_complex: Any | None = None
+    override_device_float: Any | None = None
+
+    def apply(self) -> None:
+        """Apply global JAX precision settings.
+
+        Must be called once at startup, before creating JAX arrays.
+        """
+        jax.config.update("jax_enable_x64", self.enable_x64)
+
     @property
-    def jax_float(self) -> Any:
-        """Device float dtype (float32/64 based on x64 setting)."""
+    def jax_float(self):
+        """Device-side real dtype (float32 or float64)."""
         from jax import dtypes
-        return self.override_device_float or dtypes.canonicalize_dtype(float)
-    
+        if self.override_device_float is not None:
+            return self.override_device_float
+        return dtypes.canonicalize_dtype(float)
+
     @property
-    def jax_complex(self) -> Any:
-        """Device complex dtype (complex64/128 based on x64 setting)."""
+    def jax_complex(self):
+        """Device-side complex dtype (complex64 or complex128)."""
         from jax import dtypes
-        return self.override_device_complex or dtypes.canonicalize_dtype(complex)
-    
+        if self.override_device_complex is not None:
+            return self.override_device_complex
+        return dtypes.canonicalize_dtype(complex)
+
     @property
-    def numpy_float(self) -> type:
-        """NumPy float dtype matching device precision."""
+    def numpy_float(self):
+        """Host real dtype for arrays going through callbacks.
+
+        Note: heavy CPU kernels (Numba) still compute in float64 internally.
+        """
         return np.dtype(self.jax_float).type
-    
+
     @property
-    def numpy_complex(self) -> type:
-        """NumPy complex dtype matching device precision."""
+    def numpy_complex(self):
+        """Host complex dtype for arrays going through callbacks.
+
+        Note: heavy CPU kernels (Numba) still compute in complex128 internally.
+        """
         return np.dtype(self.jax_complex).type
 
 
@@ -134,13 +148,13 @@ class LoopConfig:
     Inner loop: Optimize parameters in fixed space
     """
     # Outer loop (cycle evolution)
-    max_outer: int = 10                # Maximum evolutionary cycles
-    outer_tol: float = 1e-5            # Convergence tolerance
+    max_outer: int = 20                # Maximum evolutionary cycles
+    outer_tol: float = 1e-6            # Convergence tolerance
     outer_patience: int = 3            # Consecutive converged cycles needed
     
     # Inner loop (fixed-space optimization)
-    max_inner: int = 500             # Maximum optimization steps per cycle
-    inner_tol: float = 1e-6             # |E_k - E_{k-1}| tolerance (<=0 disables)
+    max_inner: int = 400             # Maximum optimization steps per cycle
+    inner_tol: float = 1e-8             # |E_k - E_{k-1}| tolerance (<=0 disables)
     inner_patience: int = 100            # Consecutive steps with small delta
 
     # Optional batch processing
@@ -170,6 +184,7 @@ class LeverConfig:
     loop: LoopConfig
     
     compute_mode: ComputeMode = ComputeMode.PROXY
+    spin_flip_symmetry: bool = False
     seed: int = 42
     report_interval: int = 10
     num_eps: float = 1e-12

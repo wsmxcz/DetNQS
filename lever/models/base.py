@@ -11,7 +11,7 @@ Core design:
 
 File: lever/models/base.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: October, 2025
+Date: November, 2025
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ from flax import serialization as flax_ser
 from flax.core.frozen_dict import FrozenDict
 from jax import tree_util
 
+from ..config import PrecisionConfig
+
 if TYPE_CHECKING:
     from typing_extensions import Self
 
@@ -36,10 +38,10 @@ PyTree = Any
 Features = jnp.ndarray  # (batch, n_features)
 LogPsi = jnp.ndarray    # (batch,) complex-valued
 Variables = PyTree      # Flax variable tree
+
+# FeatureFn takes (dets, n_orbitals) -> features
 FeatureFn = Callable[[jnp.ndarray, int], jnp.ndarray]
 
-
-# --- Core Model Wrapper ---
 
 @dataclass
 class WavefunctionModel:
@@ -59,7 +61,7 @@ class WavefunctionModel:
     module: nn.Module
     force_holomorphic: Optional[bool] = None
     
-    # Internal state (populated by init/create)
+    # Internal state
     variables: Optional[Variables] = field(default=None, init=False, repr=False)
     
     # Compilation cache
@@ -67,20 +69,18 @@ class WavefunctionModel:
     _ders_jit: Optional[Callable] = field(default=None, init=False, repr=False)
     _is_holo: Optional[bool] = field(default=None, init=False, repr=False)
     
-    # --- Initialization ---
-    
     def init(self, rng: jax.Array, dummy_input: jnp.ndarray) -> Variables:
         """
         Initialize parameters and compile executors.
         
         Args:
             rng: PRNG key
-            dummy_input: Single sample for shape inference (1D)
+            dummy_input: Single sample for shape inference (1D or [1, D])
         
         Returns:
             Initialized variable tree
         """
-        # Normalize input shape
+        # Normalize input shape for Flax init
         if dummy_input.ndim == 2 and dummy_input.shape[0] == 1:
             dummy_input = dummy_input[0]
         
@@ -94,33 +94,31 @@ class WavefunctionModel:
         """Compile JIT executors for batched inference and gradients."""
         module = self.module
         is_holo = self._is_holo
-        
-        def _single_apply(v: Variables, x: jnp.ndarray) -> jnp.ndarray:
-            """Apply model to single sample, ensuring complex scalar output."""
+
+        def _single_apply(v, x):
+            """Apply module and reduce to scalar log-psi."""
             y = module.apply(v, x)
             y_scalar = y if y.ndim == 0 else jnp.sum(y)
-            return jnp.asarray(y_scalar, dtype=jnp.complex128)
-        
+            return jnp.asarray(y_scalar)
+
         def _single_val_and_ders(v: Variables, x: jnp.ndarray) -> Tuple[jnp.ndarray, PyTree]:
             """Compute value and complex derivatives for single sample."""
             f = lambda p: _single_apply(p, x)
-            
+
             if is_holo:
                 # Wirtinger derivative for holomorphic parameters
                 return jax.value_and_grad(f, holomorphic=True)(v)
-            
+
             # Non-holomorphic: separate real/imag gradients
             val = f(v)
             ders_re = jax.grad(lambda p: jnp.real(f(p)))(v)
             ders_im = jax.grad(lambda p: jnp.imag(f(p)))(v)
             ders = tree_util.tree_map(lambda a, b: a + 1j * b, ders_re, ders_im)
             return val, ders
-        
-        # Batch and compile
+
+        # Batch over samples then JIT-compile
         self._apply_jit = jax.jit(jax.vmap(_single_apply, in_axes=(None, 0)))
         self._ders_jit = jax.jit(jax.vmap(_single_val_and_ders, in_axes=(None, 0)))
-    
-    # --- Inference API ---
     
     def log_psi(self, variables: Variables, inputs: Features) -> LogPsi:
         """Stateless batched inference with explicit parameters."""
@@ -154,8 +152,6 @@ class WavefunctionModel:
         """Alias for __call__ (Flax convention)."""
         return self(inputs)
     
-    # --- Properties ---
-    
     @property
     def is_holo(self) -> bool:
         """Whether model uses holomorphic (complex) parameters."""
@@ -180,7 +176,34 @@ class WavefunctionModel:
         leaves = tree_util.tree_leaves(params)
         return bool(leaves) and all(jnp.iscomplexobj(x) for x in leaves)
     
-    # --- Factory Methods ---
+    @property
+    def summary(self) -> dict[str, Any]:
+        """Generate model metadata, parameter count, and dtype info."""
+        info = {
+            "name": self.module.__class__.__name__,
+            "is_holomorphic": False,
+            "n_params": 0,
+            "param_bytes": 0,
+            "dtypes": set(),
+        }
+
+        if self.variables is None:
+            info["status"] = "Uninitialized"
+            return info
+        
+        info["status"] = "Initialized"
+        info["is_holomorphic"] = self.is_holo
+
+        leaves = jax.tree_util.tree_leaves(self.variables)
+        
+        for leaf in leaves:
+            size = leaf.size
+            info["n_params"] += size
+            info["param_bytes"] += size * leaf.itemsize
+            info["dtypes"].add(str(leaf.dtype))
+            
+        info["dtypes"] = sorted(list(info["dtypes"]))
+        return info
     
     @classmethod
     def create(
@@ -200,8 +223,6 @@ class WavefunctionModel:
         model.variables = variables
         return model
 
-
-# --- Factory Functions ---
 
 def _infer_dummy_input(
     dummy_input: Optional[jnp.ndarray],
@@ -235,38 +256,25 @@ def make_model(
     module: nn.Module,
     *,
     seed: int,
-    dummy_input: Optional[jnp.ndarray] = None,
-    n_orbitals: Optional[int] = None,
-    feature_fn_for_dummy: Optional[FeatureFn] = None,
-    force_holomorphic: Optional[bool] = None,
-    precision_config: Optional[Any] = None,  # Add parameter
-) -> WavefunctionModel:
+    dummy_input: jnp.ndarray | None = None,
+    n_orbitals: int | None = None,
+    feature_fn_for_dummy: FeatureFn | None = None,
+    force_holomorphic: bool | None = None,
+    precision_config: PrecisionConfig | None = None,
+) -> "WavefunctionModel":
     """
-    Create and initialize stateful wavefunction model with precision control.
-    
-    Args:
-        module: Flax Linen module
-        seed: Random seed for initialization
-        dummy_input: Explicit single-sample input, OR
-        n_orbitals: Number of orbitals (auto-generates dummy input)
-        feature_fn_for_dummy: Optional feature function for dummy generation
-        force_holomorphic: Override automatic holomorphic detection
-        precision_config: PrecisionConfig for dtype control (optional)
-    
-    Returns:
-        Initialized model ready for stateful calls
+    Create and initialize a WavefunctionModel.
+
+    Dummy input is cast to the configured device float dtype to match
+    runtime features.
     """
-    
     din = _infer_dummy_input(dummy_input, n_orbitals, feature_fn_for_dummy)
-    
-    # Cast dummy input to appropriate dtype
+
     if precision_config is not None:
-        target_dtype = (
-            jnp.float64 if precision_config.enable_x64_device 
-            else jnp.float32
-        )
-        din = jnp.asarray(din, dtype=target_dtype)
-    
+        din = jnp.asarray(din, dtype=precision_config.jax_float)
+    else:
+        din = jnp.asarray(din)
+
     return WavefunctionModel.create(
         module,
         jax.random.PRNGKey(int(seed)),
@@ -274,8 +282,6 @@ def make_model(
         force_holomorphic=force_holomorphic,
     )
 
-
-# --- Serialization Utilities ---
 
 def to_state_dict(variables: Variables) -> dict:
     """Convert Flax variables to plain dict for serialization."""
@@ -308,7 +314,7 @@ def from_state_dict(
         strict_keys: Key checking mode ("warn" | "error" | "ignore")
     
     Returns:
-        Restored variables (Flax handles shape/dtype validation)
+        Restored variables
     """
     if strict_keys not in ("warn", "error", "ignore"):
         raise ValueError(f"strict_keys must be 'warn'/'error'/'ignore', got {strict_keys}")
@@ -326,8 +332,6 @@ def from_state_dict(
     
     return flax_ser.from_state_dict(template, state_dict)
 
-
-# --- Public API ---
 
 __all__ = [
     "PyTree",

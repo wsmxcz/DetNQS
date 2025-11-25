@@ -49,7 +49,6 @@ class Driver:
         optimizer
     ):
         self.cfg = config
-        self.cfg.precision.apply()
         self.model = model
         self.strategy = strategy
         self.optimizer = optimizer
@@ -257,19 +256,46 @@ class Driver:
             state, history, total_time, 
             final_ctx, final_psi_cache
         )
-    
+
     def _initialize_state(self) -> OuterState:
-        """Bootstrap from Hartree-Fock determinant."""
-        sys = self.cfg.system
-        hf_det = np.array([
-            [(1 << sys.n_alpha) - 1, (1 << sys.n_beta) - 1]
-        ], dtype=np.uint64)
+        """Bootstrap from Hartree-Fock determinant.
         
+        Fallback: fill the lowest n_alpha / n_beta orbitals in order.
+        """
+        sys = self.cfg.system
+
+        hf_det: np.ndarray | None = None
+
+        # Try loading from interface HDF5 if present.
+        if sys.meta_path is not None:
+            try:
+                # Local import to avoid hard dependency at module import time.
+                from .interface import load_initial_det
+
+                hf_det = load_initial_det(sys.meta_path)
+                if hf_det is None:
+                    self.logger.info(
+                        "No HF determinant found in HDF5; using default filling."
+                    )
+                else:
+                    self.logger.info(
+                        f"Loaded HF determinant from HDF5: {sys.meta_path}"
+                    )
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to load HF determinant from HDF5: {e}. "
+                    "Falling back to default filling."
+                )
+
+        # Fallback: simple bitstring with first n_alpha/n_beta orbitals occupied.
+        if hf_det is None:
+            hf_det = _make_hf_bitstring(sys.n_alpha, sys.n_beta)
+
         return OuterState(
             cycle=0,
             s_dets=hf_det,
             params=self.model.variables,
-            e_ref=None
+            e_ref=None,
         )
     
     def _update_state(self, state, result, ctx, evolve: bool) -> OuterState:
@@ -366,6 +392,15 @@ class Driver:
 
         return result
 
+def _make_hf_bitstring(n_alpha: int, n_beta: int) -> np.ndarray:
+    """Build HF determinant bitstring with lowest orbitals occupied."""
+    alpha_bits = 0
+    beta_bits = 0
+    for i in range(n_alpha):
+        alpha_bits |= (1 << i)
+    for i in range(n_beta):
+        beta_bits |= (1 << i)
+    return np.array([[alpha_bits, beta_bits]], dtype=np.uint64)
 
 class _History:
     """Energy trajectory tracker for convergence analysis."""

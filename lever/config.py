@@ -105,18 +105,43 @@ class PrecisionConfig:
 @dataclass(frozen=True)
 class SystemConfig:
     """
-    Physical system specification from FCIDUMP file.
-    
+    Physical system specification from an FCIDUMP + optional HDF5 metadata.
+
     Attributes:
-        fcidump_path: Path to FCIDUMP integral file
-        n_orbitals: Number of spatial orbitals
-        n_alpha: Number of α-spin electrons
-        n_beta: Number of β-spin electrons
+        fcidump_path: Path to FCIDUMP integral file.
+        n_orbitals:   Number of spatial orbitals represented in FCIDUMP.
+        n_alpha:      Number of α-spin electrons in the FCIDUMP Hamiltonian.
+        n_beta:       Number of β-spin electrons in the FCIDUMP Hamiltonian.
+        meta_path:    Optional path to a side-car HDF5 file produced by
+                      lever.interface.MoleculeBuilder. When present, LEVER
+                      components can load additional metadata (geometry,
+                      HF reference, benchmarks, etc.).
     """
     fcidump_path: str
     n_orbitals: int
     n_alpha: int
     n_beta: int
+    meta_path: str | None = None
+
+    @classmethod
+    def from_hdf5(cls, h5_path: str) -> "SystemConfig":
+        """
+        Construct SystemConfig from a LEVER interface HDF5 file.
+
+        The HDF5 file is expected to follow the schema produced by
+        lever.interface.MoleculeBuilder.export().
+        """
+        # Local import to avoid circular dependency at module import time.
+        from .interface.builder import read_from_hdf5
+
+        data = read_from_hdf5(h5_path)
+        return cls(
+            fcidump_path=data["fcidump_path"],
+            n_orbitals=data["n_orbitals"],
+            n_alpha=data["n_alpha"],
+            n_beta=data["n_beta"],
+            meta_path=data.get("meta_path"),
+        )
 
 
 @dataclass(frozen=True)
@@ -149,13 +174,13 @@ class LoopConfig:
     """
     # Outer loop (cycle evolution)
     max_outer: int = 20                # Maximum evolutionary cycles
-    outer_tol: float = 1e-6            # Convergence tolerance
-    outer_patience: int = 3            # Consecutive converged cycles needed
+    outer_tol: float = 1e-5            # Convergence tolerance
+    outer_patience: int = 5            # Consecutive converged cycles needed
     
     # Inner loop (fixed-space optimization)
     max_inner: int = 400             # Maximum optimization steps per cycle
     inner_tol: float = 1e-8             # |E_k - E_{k-1}| tolerance (<=0 disables)
-    inner_patience: int = 100            # Consecutive steps with small delta
+    inner_patience: int = 200            # Consecutive steps with small delta
 
     # Optional batch processing
     chunk_size: int | None = None      # Gradient accumulation chunk size
@@ -192,9 +217,8 @@ class LeverConfig:
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
     
     def __post_init__(self) -> None:
-        """Apply global precision policy during initialization."""
-        if self.precision.enable_x64:
-            jax.config.update("jax_enable_x64", True)
+        """Apply global precision policy once when config is created."""
+        self.precision.apply()
 
 __all__ = [
     "ScreenMode",

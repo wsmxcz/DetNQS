@@ -25,7 +25,6 @@ from .. import core, engine
 from ..dtypes import COOMatrix, SpaceRep, PsiCache
 
 if TYPE_CHECKING:
-    from ..config import LeverConfig
     from ..dtypes import LeverResult
 
 
@@ -46,7 +45,7 @@ class VariationalEvaluator:
         """
         Compute exact ground-state energy E₀ = min eig(H).
         
-        Algorithm: Dense solver for small/dense matrices, Davidson for large sparse.
+        Algorithm: dense solver for small matrices, Davidson for large sparse matrices.
         """
         if ham.shape[0] == 0:
             return self.e_nuc
@@ -61,8 +60,8 @@ class VariationalEvaluator:
         ).tocsr()
         H_sparse.sum_duplicates()
         
-        # Heuristic selection: dense solver for small/dense matrices
-        density = ham.nnz / (n * n) if n > 0 else 0
+        # Heuristic: dense solver for small or dense matrices
+        density = ham.nnz / (n * n) if n > 0 else 0.0
         use_dense = (n < 2000) or (density > 0.1)
         
         if use_dense:
@@ -74,11 +73,11 @@ class VariationalEvaluator:
         return self._run_davidson(H_sparse)
 
     def _run_davidson(self, H_sparse: sp.csr_matrix) -> float:
-        """Davidson diagonalization for sparse matrices with diagonal preconditioner."""
+        """Davidson diagonalization with diagonal preconditioner."""
         n = H_sparse.shape[0]
         diag = H_sparse.diagonal()
         
-        # Initial guess: lowest diagonal element
+        # Initial guess: basis vector at smallest diagonal element
         i_min = int(np.argmin(diag.real))
         x0 = np.zeros(n, dtype=diag.dtype)
         x0[i_min] = 1.0
@@ -93,42 +92,21 @@ class VariationalEvaluator:
             nroots=1,
             max_cycle=100,
             tol=1e-8,
-            verbose=0
+            verbose=0,
         )
         return float(np.atleast_1d(e_vals)[0]) + self.e_nuc
-
-    def compute_fci_energy(self, config: LeverConfig) -> float:
-        """Compute Full CI energy (exponential scaling, small systems only)."""
-        sys = config.system
-        fci_dets = core.gen_fci_dets(sys.n_orbitals, sys.n_alpha, sys.n_beta)
-        
-        ham_fci, _ = engine.hamiltonian.get_ham_ss(
-            S_dets=fci_dets,
-            int_ctx=self.int_ctx,
-            n_orbitals=sys.n_orbitals
-        )
-        return self.diagonalize(ham_fci)
 
     def compute_sc_variational_energy(
         self,
         result: LeverResult,
         *,
         use_heatbath: bool = False,
-        eps1: float = 1e-6
+        eps1: float = 1e-6,
     ) -> float:
         """
-        Compute variational energy E = ⟨Ψ|H|Ψ⟩/⟨Ψ|Ψ⟩ on S∪C space.
+        Compute variational energy E = ⟨Ψ|H|Ψ⟩ / ⟨Ψ|Ψ⟩ on S ∪ C space.
         
-        Uses C++ streaming kernel to evaluate expectation value without
-        constructing full Hamiltonian matrix.
-        
-        Args:
-            result: LeverResult with final_space and final_psi_cache
-            use_heatbath: Enable Heat-Bath screening for double excitations
-            eps1: Threshold for screening matrix elements
-            
-        Returns:
-            Total variational energy (including nuclear repulsion)
+        Uses C++ streaming kernel for expectation value without full Hamiltonian.
         """
         if result.final_space is None or result.final_psi_cache is None:
             raise ValueError(
@@ -160,7 +138,7 @@ class VariationalEvaluator:
             self.int_ctx,
             self.n_orb,
             use_heatbath,
-            eps1
+            eps1,
         )
 
         if norm <= 1e-14:
@@ -173,28 +151,35 @@ class VariationalEvaluator:
         result: LeverResult,
         model: Any,
         *,
-        compute_fci: bool = False,
         compute_s_ci: bool = False,
-        compute_sc_var: bool = True
+        compute_sc_var: bool = True,
     ) -> dict[str, float]:
-        """Perform post-calculation analysis on final result."""
-        energies = {'e_lever': result.full_energy_history[-1]}
+        """
+        Perform post-calculation analysis on final result.
+        
+        Returns dictionary of deterministic energies:
+            - e_lever: final optimization energy
+            - e_var:   exact variational energy on S ∪ C
+            - e_s_ci:  exact CI energy in S-space
+        """
+        if not result.full_energy_history:
+            raise ValueError("LeverResult has empty energy history.")
+
+        energies: dict[str, float] = {
+            "e_lever": float(result.full_energy_history[-1]),
+        }
         
         # Exact variational energy on S ∪ C
         if compute_sc_var and result.final_space is not None:
-            energies['e_var'] = self.compute_sc_variational_energy(result)
+            energies["e_var"] = self.compute_sc_variational_energy(result)
         
         # S-space CI (Davidson diagonalization)
         if compute_s_ci:
             ham_s, _ = engine.hamiltonian.get_ham_ss(
                 S_dets=result.final_s_dets,
                 int_ctx=self.int_ctx,
-                n_orbitals=result.config.system.n_orbitals
+                n_orbitals=result.config.system.n_orbitals,
             )
-            energies['e_s_ci'] = self.diagonalize(ham_s)
-            
-        # Full CI benchmark (expensive)
-        if compute_fci:
-            energies['e_fci'] = self.compute_fci_energy(result.config)
+            energies["e_s_ci"] = self.diagonalize(ham_s)
             
         return energies

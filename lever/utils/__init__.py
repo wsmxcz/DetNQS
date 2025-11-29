@@ -12,12 +12,6 @@ Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
 
-from .features import (
-    compute_normalized_amplitudes,
-    create_psi_cache,
-    dets_to_features,
-    masks_to_vecs,
-)
 from .jax_utils import (
     tree_add,
     tree_dot,
@@ -33,12 +27,6 @@ from .space_utils import (
 )
 
 __all__ = [
-    # Features
-    "masks_to_vecs",
-    "dets_to_features",
-    "compute_normalized_amplitudes",
-    "create_psi_cache",
-    
     # JAX utilities
     "tree_dot",
     "tree_scale",

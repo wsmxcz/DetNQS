@@ -178,7 +178,7 @@ class VariationalEvaluator:
             ham_s, _ = engine.hamiltonian.get_ham_ss(
                 S_dets=result.final_s_dets,
                 int_ctx=self.int_ctx,
-                n_orbitals=result.config.system.n_orbitals,
+                n_orb=result.config.system.n_orb,
             )
             energies["e_s_ci"] = self.diagonalize(ham_s)
             

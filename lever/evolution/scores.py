@@ -19,11 +19,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..dtypes import ScoreResult
+from ..utils.config_utils import capture_config
 
 if TYPE_CHECKING:
     from ..dtypes import OuterCtx, PsiCache
 
-
+@capture_config
 class AmplitudeScorer:
     """
     Scores determinants by probability mass |ψ_i|².

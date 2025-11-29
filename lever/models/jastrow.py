@@ -29,11 +29,11 @@ class Jastrow(nn.Module):
     modifying nodal structure. Operates in occupation number basis.
     
     Args:
-        n_orbitals: Number of spatial orbitals (input dimension: 2*n_orbitals)
+        n_orb: Number of spatial orbitals (input dimension: 2*n_orb)
         param_dtype: Parameter data type (typically real for positive-definite form)
     """
 
-    n_orbitals: int
+    n_orb: int
     param_dtype: Any = jnp.float32
 
     # Real-valued correlation factor
@@ -47,12 +47,12 @@ class Jastrow(nn.Module):
         Mathematical form: log J(s) = Σᵢ uᵢsᵢ + ½ Σᵢⱼ sᵢVᵢⱼsⱼ
         
         Args:
-            s: Occupation vector [2*n_orbitals]
+            s: Occupation vector [2*n_orb]
             
         Returns:
             log-Jastrow factor (scalar)
         """
-        n_vis = 2 * self.n_orbitals
+        n_vis = 2 * self.n_orb
         x = s.astype(self.param_dtype)
 
         # One-body on-site interactions: Σᵢ uᵢsᵢ

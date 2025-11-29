@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Unified configuration management for LEVER workflows.
+Unified configuration management using Pydantic.
 
-Provides centralized control of system parameters, Hamiltonian construction,
-optimization loops, and numerical precision policies.
+Acts as the Single Source of Truth (SSOT) for numerical experiments.
+Loads physical parameters from SystemMeta and manages optimization hyperparameters.
 
 File: lever/config.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -13,219 +13,281 @@ Date: November, 2025
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass, field, asdict, is_dataclass
-from pathlib import Path
-from typing import Any, Dict, Union
+import importlib
 from enum import Enum
-import jax
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
 
+import jax
 import numpy as np
 import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
+# Import SystemMeta from the concrete metadata module to avoid circular imports
+from .interface.metadata import SystemMeta
 
 
 # ============================================================================
-# Enumeration Types
+# Enums
 # ============================================================================
 
 class ScreenMode(str, Enum):
-    """C-space screening strategy: disabled, static threshold, or dynamic."""
+    """Strategies for screening Connected (C) space determinants."""
     NONE = "none"
     STATIC = "static"
     DYNAMIC = "dynamic"
 
 
 class ComputeMode(str, Enum):
-    """
-    Hamiltonian contraction algorithms:
-    - ASYMMETRIC: Full T-space with asymmetric gradient
-    - PROXY:      T-space with symmetric proxy gradient
-    - EFFECTIVE:  S-space only with downfolded H_eff
-    """
+    """Hamiltonian contraction strategies."""
     ASYMMETRIC = "asymmetric"
     PROXY = "proxy"
     EFFECTIVE = "effective"
 
 
 # ============================================================================
-# Configuration Dataclasses
+# Sub-Configurations
 # ============================================================================
 
-@dataclass(frozen=True)
-class PrecisionConfig:
-    """Global precision policy.
-
-    Default: single precision on device (float32/complex64),
-    with an option to enable full double precision.
+class SystemConfig(BaseModel):
     """
-    enable_x64: bool = False
-    override_device_complex: Any | None = None
-    override_device_float: Any | None = None
+    Runtime view of the physical system (projected from SystemMeta).
 
-    def apply(self) -> None:
-        """Apply global JAX precision settings.
-
-        Must be called once at startup, before creating JAX arrays.
-        """
-        jax.config.update("jax_enable_x64", self.enable_x64)
-
-    @property
-    def jax_float(self):
-        """Device-side real dtype (float32 or float64)."""
-        from jax import dtypes
-        if self.override_device_float is not None:
-            return self.override_device_float
-        return dtypes.canonicalize_dtype(float)
-
-    @property
-    def jax_complex(self):
-        """Device-side complex dtype (complex64 or complex128)."""
-        from jax import dtypes
-        if self.override_device_complex is not None:
-            return self.override_device_complex
-        return dtypes.canonicalize_dtype(complex)
-
-    @property
-    def numpy_float(self):
-        """Host real dtype for arrays going through callbacks.
-
-        Note: heavy CPU kernels (Numba) still compute in float64 internally.
-        """
-        return np.dtype(self.jax_float).type
-
-    @property
-    def numpy_complex(self):
-        """Host complex dtype for arrays going through callbacks.
-
-        Note: heavy CPU kernels (Numba) still compute in complex128 internally.
-        """
-        return np.dtype(self.jax_complex).type
-
-
-@dataclass(frozen=True)
-class SystemConfig:
+    Attributes like 'root_dir' are ephemeral runtime contexts used to
+    resolve absolute paths and are not serialized to YAML.
     """
-    Physical system specification from an FCIDUMP + optional HDF5 metadata.
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
-    Attributes:
-        fcidump_path: Path to FCIDUMP integral file.
-        n_orbitals:   Number of spatial orbitals represented in FCIDUMP.
-        n_alpha:      Number of α-spin electrons in the FCIDUMP Hamiltonian.
-        n_beta:       Number of β-spin electrons in the FCIDUMP Hamiltonian.
-        meta_path:    Optional path to a side-car HDF5 file produced by
-                      lever.interface.MoleculeBuilder. When present, LEVER
-                      components can load additional metadata (geometry,
-                      HF reference, benchmarks, etc.).
-    """
-    fcidump_path: str
-    n_orbitals: int
+    name: str
+
+    # Dimensions (active space)
+    n_orb: int
     n_alpha: int
     n_beta: int
-    meta_path: str | None = None
+    n_core: int
+    is_cas: bool
+
+    # Files (relative to root_dir)
+    meta_file: str
+    fcidump_file: str
+
+    # Context (injected at runtime, excluded from serialization)
+    root_dir: Path = Field(exclude=True)
 
     @classmethod
-    def from_hdf5(cls, h5_path: str) -> "SystemConfig":
+    def from_meta(cls, meta: SystemMeta, root_dir: Path) -> "SystemConfig":
         """
-        Construct SystemConfig from a LEVER interface HDF5 file.
+        Factory: Project SystemMeta into SystemConfig.
 
-        The HDF5 file is expected to follow the schema produced by
-        lever.interface.MoleculeBuilder.export().
+        Assumes the metadata JSON is stored as 'system.json' in root_dir.
+        FCIDUMP filename is taken from meta.files.fcidump.
         """
-        # Local import to avoid circular dependency at module import time.
-        from .interface.builder import read_from_hdf5
-
-        data = read_from_hdf5(h5_path)
         return cls(
-            fcidump_path=data["fcidump_path"],
-            n_orbitals=data["n_orbitals"],
-            n_alpha=data["n_alpha"],
-            n_beta=data["n_beta"],
-            meta_path=data.get("meta_path"),
+            name=meta.system.name,
+            n_orb=meta.orbital_space.n_orb,
+            n_alpha=meta.orbital_space.n_alpha,
+            n_beta=meta.orbital_space.n_beta,
+            n_core=meta.orbital_space.n_core,
+            is_cas=meta.orbital_space.is_cas,
+            meta_file="system.json",
+            fcidump_file=meta.files.fcidump,
+            root_dir=root_dir,
         )
 
+    @property
+    def fcidump_path(self) -> str:
+        """Absolute path to FCIDUMP for integral loading."""
+        return str(self.root_dir / self.fcidump_file)
 
-@dataclass(frozen=True)
-class HamiltonianConfig:
-    """
-    Hamiltonian construction and C-space screening parameters.
-    
-    Controls effective Hamiltonian assembly via Löwdin partitioning:
-        H_eff = H_SS - H_SC @ (E - H_CC + δI)^{-1} @ H_CS
-    
-    Attributes:
-        screening_mode: C-space selection strategy
-        screen_eps: Coefficient threshold for dynamic screening
-        diag_shift: Diagonal shift δ for H_CC regularization
-        reg_eps: Numerical stability for matrix inversion
-    """
+    @property
+    def meta_path(self) -> str:
+        """Absolute path to metadata JSON for initial state loading."""
+        return str(self.root_dir / self.meta_file)
+
+
+class HamiltonianConfig(BaseModel):
+    """Parameters for Hamiltonian construction and screening."""
     screening_mode: ScreenMode = ScreenMode.DYNAMIC
     screen_eps: float = 1e-6
     diag_shift: float = 0.5
     reg_eps: float = 1e-4
 
 
-@dataclass(frozen=True)
-class LoopConfig:
-    """
-    Iteration and convergence control for LEVER loops.
-    
-    Outer loop: Evolve determinant space
-    Inner loop: Optimize parameters in fixed space
-    """
-    # Outer loop (cycle evolution)
-    max_outer: int = 20                # Maximum evolutionary cycles
-    outer_tol: float = 1e-5            # Convergence tolerance
-    outer_patience: int = 5            # Consecutive converged cycles needed
-    
-    # Inner loop (fixed-space optimization)
-    max_inner: int = 400             # Maximum optimization steps per cycle
-    inner_tol: float = 1e-8             # |E_k - E_{k-1}| tolerance (<=0 disables)
-    inner_patience: int = 200            # Consecutive steps with small delta
+class LoopConfig(BaseModel):
+    """Control parameters for Outer (Evolution) and Inner (Optimization) loops."""
+    max_outer: int = 20
+    outer_tol: float = 1e-6
+    outer_patience: int = 3
 
-    # Optional batch processing
-    chunk_size: int | None = None      # Gradient accumulation chunk size
+    max_inner: int = 500
+    inner_tol: float = 1e-8
+    inner_patience: int = 100
+
+    chunk_size: Optional[int] = 8192
 
 
-@dataclass(frozen=True)
-class LeverConfig:
+class RuntimeConfig(BaseModel):
     """
-    Top-level LEVER workflow configuration.
-    
-    Organizes parameters by functional domain:
-      - system: Physical problem specification
-      - hamiltonian: Matrix construction rules
-      - loop: Optimization iteration control
-    
-    Attributes:
-        compute_mode: Hamiltonian contraction algorithm
-        seed: Random number generator seed
-        report_interval: Steps between progress logs
-        num_eps: Numerical epsilon for stability checks
-        normalize_wf: Enable wavefunction normalization
-        precision: Dtype policy configuration
+    Runtime environment settings (precision, RNG seed, JAX config).
     """
-    system: SystemConfig
-    hamiltonian: HamiltonianConfig
-    loop: LoopConfig
-    
+    seed: int = 42
+    enable_x64: bool = True
     compute_mode: ComputeMode = ComputeMode.PROXY
     spin_flip_symmetry: bool = False
-    seed: int = 42
-    report_interval: int = 10
+
+    # Advanced stability / logging
     num_eps: float = 1e-12
     normalize_wf: bool = True
-    precision: PrecisionConfig = field(default_factory=PrecisionConfig)
-    
-    def __post_init__(self) -> None:
-        """Apply global precision policy once when config is created."""
-        self.precision.apply()
+    report_interval: int = 50
+
+    def apply(self) -> None:
+        """Apply global JAX configuration."""
+        jax.config.update("jax_enable_x64", self.enable_x64)
+
+    @property
+    def jax_float(self):
+        from jax import dtypes
+        return dtypes.canonicalize_dtype(float)
+
+    @property
+    def jax_complex(self):
+        from jax import dtypes
+        return dtypes.canonicalize_dtype(complex)
+
+    @property
+    def numpy_float(self):
+        return np.dtype(self.jax_float).type
+
+    @property
+    def numpy_complex(self):
+        return np.dtype(self.jax_complex).type
+
+
+class ObjectSpec(BaseModel):
+    """Snapshot of a Python object's configuration (Model/Optimizer/Strategy)."""
+    target: str  # e.g., "lever.models.Backflow"
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+    def instantiate(self) -> Any:
+        """
+        Dynamically import and construct the target object.
+
+        Recursively instantiates nested ObjectSpecs in params.
+        """
+        module_name, attr_name = self.target.rsplit(".", 1)
+        module = importlib.import_module(module_name)
+        factory = getattr(module, attr_name)
+
+        # Recursively instantiate nested specs
+        resolved_params: Dict[str, Any] = {}
+        for k, v in self.params.items():
+            if isinstance(v, dict) and "target" in v and "params" in v:
+                # Nested spec: recursively instantiate
+                resolved_params[k] = ObjectSpec(**v).instantiate()
+            else:
+                resolved_params[k] = v
+
+        return factory(**resolved_params)
+
+
+# ============================================================================
+# Main Experiment Config
+# ============================================================================
+
+class ExperimentConfig(BaseModel):
+    """
+    Static snapshot of a numerical experiment.
+
+    Ties together:
+      - System (physics and files)
+      - Hamiltonian construction
+      - Optimization loops
+      - Runtime environment
+    """
+    # Core components
+    system: SystemConfig
+    hamiltonian: HamiltonianConfig = Field(default_factory=HamiltonianConfig)
+    loop: LoopConfig = Field(default_factory=LoopConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+
+    # Snapshots (filled by RunContext.record_experiment)
+    model_spec: Optional[ObjectSpec] = None
+    optimizer_spec: Optional[ObjectSpec] = None
+    strategy_spec: Optional[ObjectSpec] = None
+
+    @classmethod
+    def from_meta(
+        cls,
+        meta: SystemMeta,
+        root_dir: Union[str, Path],
+        *,
+        hamiltonian: Optional[HamiltonianConfig] = None,
+        loop: Optional[LoopConfig] = None,
+        runtime: Optional[RuntimeConfig] = None,
+    ) -> "ExperimentConfig":
+        """
+        Python-first initialization with explicit arguments.
+
+        Args:
+            meta: SystemMeta describing the processed system
+            root_dir: Directory containing system.json and FCIDUMP
+        """
+        root_dir = Path(root_dir)
+        sys_cfg = SystemConfig.from_meta(meta, root_dir)
+
+        cfg = cls(
+            system=sys_cfg,
+            hamiltonian=hamiltonian or HamiltonianConfig(),
+            loop=loop or LoopConfig(),
+            runtime=runtime or RuntimeConfig(),
+        )
+        # Apply global settings immediately
+        cfg.runtime.apply()
+        return cfg
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "ExperimentConfig":
+        """Load from YAML file and apply runtime settings."""
+        path = Path(path)
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+        # Inject root_dir context (relative files are local to config.yaml)
+        sys_data = data.pop("system")
+        sys_data["root_dir"] = path.parent
+        sys_cfg = SystemConfig(**sys_data)
+
+        cfg = cls(system=sys_cfg, **data)
+        cfg.runtime.apply()
+        return cfg
+
+    def save(self, path: Union[str, Path]) -> None:
+        """Save to YAML file (root_dir is excluded by model_config)."""
+        path = Path(path)
+        data = self.model_dump(mode="json", exclude_none=True)
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+
+    def build_components(self) -> tuple[Any, Any, Any]:
+        """
+        Rebuild model, optimizer, and strategy from recorded specs.
+
+        Returns:
+            (model, optimizer, strategy): instantiated components
+        """
+        model = self.model_spec.instantiate() if self.model_spec else None
+        optimizer = self.optimizer_spec.instantiate() if self.optimizer_spec else None
+        strategy = self.strategy_spec.instantiate() if self.strategy_spec else None
+        return model, optimizer, strategy
+
 
 __all__ = [
     "ScreenMode",
     "ComputeMode",
-    "PrecisionConfig",
     "SystemConfig",
     "HamiltonianConfig",
     "LoopConfig",
-    "LeverConfig",
+    "RuntimeConfig",
+    "ExperimentConfig",
+    "ObjectSpec",
 ]

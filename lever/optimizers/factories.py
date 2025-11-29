@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Optimizer factory functions with unified interface.
+Optimizer factory with unified Optax-compatible interface.
 
-Provides consistent API for creating both LEVER (QGT-based) and Optax
-(first-order) optimizers. All factories return Optax-compatible objects.
+Provides both LEVER (QGT-based) and first-order optimizers.
+All factories return Optax-compatible GradientTransformation objects.
 
+File: lever/optim/factory.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
@@ -16,23 +17,78 @@ from __future__ import annotations
 from typing import Literal
 
 import optax
+from ..utils.config_utils import capture_config
 
 
+# ============================================================================
+# Learning Rate Schedules
+# ============================================================================
+
+@capture_config
+def cosine_decay_schedule(
+    init_value: float,
+    decay_steps: int,
+    alpha: float = 0.0,
+):
+    """
+    Cosine annealing schedule: η(t) = α + (η₀ - α) · [1 + cos(πt/T)] / 2.
+    
+    Args:
+        init_value: Initial learning rate η₀
+        decay_steps: Total steps T
+        alpha: Minimum learning rate (default: 0)
+    """
+    return optax.cosine_decay_schedule(
+        init_value=init_value,
+        decay_steps=decay_steps,
+        alpha=alpha,
+    )
+
+
+@capture_config
+def exponential_decay_schedule(
+    init_value: float,
+    transition_steps: int,
+    decay_rate: float,
+    staircase: bool = False,
+):
+    """
+    Exponential decay: η(t) = η₀ · γ^(t/T).
+    
+    Args:
+        init_value: Initial learning rate η₀
+        transition_steps: Decay period T
+        decay_rate: Decay factor γ
+        staircase: Use floor(t/T) instead of t/T
+    """
+    return optax.exponential_decay(
+        init_value=init_value,
+        transition_steps=transition_steps,
+        decay_rate=decay_rate,
+        staircase=staircase,
+    )
+
+
+# ============================================================================
+# First-Order Optimizers
+# ============================================================================
+
+@capture_config
 def adam(
     learning_rate: float = 1e-3,
     weight_decay: float = 0.0,
     **kwargs
 ) -> optax.GradientTransformation:
     """
-    Create Adam optimizer (delegates to Optax).
+    Adam optimizer with optional weight decay (AdamW).
+    
+    Update rule: θ ← θ - α · m̂ / (√v̂ + ε)
+    where m̂, v̂ are bias-corrected first/second moment estimates.
     
     Args:
         learning_rate: Step size α
-        weight_decay: L2 regularization coefficient λ
-        **kwargs: Additional arguments (b1, b2, eps, etc.)
-        
-    Returns:
-        Optax optimizer instance
+        weight_decay: L2 regularization λ (enables AdamW if > 0)
+        **kwargs: b1, b2, eps, etc.
     """
     if weight_decay > 0:
         return optax.adamw(
@@ -43,25 +99,30 @@ def adam(
     return optax.adam(learning_rate=learning_rate, **kwargs)
 
 
+@capture_config
 def sgd(
     learning_rate: float = 1e-2,
     momentum: float = 0.0,
     **kwargs
 ) -> optax.GradientTransformation:
     """
-    Create SGD optimizer (delegates to Optax).
+    Stochastic gradient descent with momentum.
+    
+    Update rule: v ← β·v + g, θ ← θ - α·v
     
     Args:
         learning_rate: Step size α
-        momentum: Momentum coefficient β
-        **kwargs: Additional arguments
-        
-    Returns:
-        Optax optimizer instance
+        momentum: Momentum coefficient β ∈ [0, 1)
+        **kwargs: nesterov, etc.
     """
     return optax.sgd(learning_rate=learning_rate, momentum=momentum, **kwargs)
 
 
+# ============================================================================
+# Quantum Natural Gradient Optimizers
+# ============================================================================
+
+@capture_config
 def sr(
     damping: float = 1e-4,
     backend: Literal["matvec", "dense"] = "matvec",
@@ -70,19 +131,19 @@ def sr(
     cg_tol: float = 1e-4
 ):
     """
-    Create stochastic reconfiguration / natural gradient optimizer.
+    Stochastic reconfiguration (quantum natural gradient).
     
-    Solves (S + λI)δ = -g where S is quantum geometric tensor (QGT).
-    Implements imaginary-time evolution dynamics with metric correction.
+    Solves (S + λI)δ = -g where S is the quantum geometric tensor (QGT).
+    Implements imaginary-time evolution with metric-aware updates.
     
     Args:
-        damping: Diagonal regularization λ for stability
+        damping: Diagonal regularization λ for numerical stability
         backend: QGT computation strategy
-            - "matvec": Matrix-free CG solver (memory efficient)
-            - "dense": Direct Cholesky solve (faster for small systems)
-        learning_rate: Step size multiplier (typically 1.0 for SR)
-        cg_maxiter: Max conjugate gradient iterations (matvec only)
-        cg_tol: CG convergence tolerance (matvec only)
+            - "matvec": Matrix-free conjugate gradient (memory efficient)
+            - "dense": Direct Cholesky decomposition (faster for small nets)
+        learning_rate: Step size multiplier (typically 1.0 for natural gradient)
+        cg_maxiter: Max CG iterations (matvec backend only)
+        cg_tol: CG convergence tolerance (matvec backend only)
         
     Returns:
         LEVER Optimizer with Optax-compatible interface
@@ -90,7 +151,6 @@ def sr(
     Example:
         >>> opt = sr(damping=1e-4, backend="matvec")
         >>> state = opt.init(params)
-        >>> # Update step requires tape and energy context
         >>> updates, state = opt.update(grad, state, params, tape=tape, energy=E)
     """
     from .base import Optimizer
@@ -108,21 +168,17 @@ def sr(
     return Optimizer(direction, rule)
 
 
+@capture_config
 def lm(damping: float = 1e-3, learning_rate: float = 1.0):
     """
-    Create linear method optimizer.
+    Linear method optimizer (approximate second-order).
     
-    Solves linear system with energy Hessian approximation:
-    (H + λI)δ = -g where H ≈ ∂²E/∂θ².
-    
-    Note: Simplified implementation. Full second-order features pending.
+    Solves (H + λI)δ = -g where H approximates the energy Hessian.
+    Note: Simplified implementation; full second-order features pending.
     
     Args:
         damping: Diagonal regularization λ
         learning_rate: Step size multiplier
-        
-    Returns:
-        LEVER Optimizer instance
     """
     from .base import Optimizer
     from .direction import LMDirection
@@ -134,4 +190,5 @@ def lm(damping: float = 1e-3, learning_rate: float = 1.0):
     return Optimizer(direction, rule)
 
 
-__all__ = ["adam", "sgd", "sr", "lm"]
+__all__ = ["cosine_decay_schedule", "exponential_decay_schedule", 
+           "adam", "sgd", "sr", "lm"]

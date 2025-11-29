@@ -29,7 +29,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from lever.core import IntCtx, get_local_connections
-from lever.utils.features import dets_to_features
+from lever.engine.features import dets_to_features
 
 if TYPE_CHECKING:
     from lever.config import LeverConfig

@@ -97,6 +97,9 @@ ehthumbs.db
 *.FCIDUMP
 *.pdf
 *.csv
+*.json
+*.msgpack
+*.npz
 performance/
 runs/
 scans/

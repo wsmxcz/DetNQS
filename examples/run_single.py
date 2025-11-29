@@ -1,161 +1,128 @@
+# File: examples/n2_sto3g.py
 # Copyright 2025 The LEVER Authors - All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LEVER variational optimization example for N2 in STO-3G basis.
+LEVER Example: N2 molecule in STO-3G basis.
 
-Demonstrates complete workflow: molecule setup → configuration → 
-wavefunction optimization → analysis and visualization.
-
-File: examples/run_evolution.py  
-Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: November, 2025
+Demonstrates Python-first workflow with unified RunContext and
+system.json / FCIDUMP layout for quantum chemistry simulations.
 """
 
+from __future__ import annotations
+
 import jax
-import jax.numpy as jnp
-import optax
 
-from lever import analysis, config, driver, evolution, models
-from lever.optimizers import adam
+from lever import analysis, evolution, models, solver
+from lever.config import (
+    ExperimentConfig,
+    HamiltonianConfig,
+    LoopConfig,
+    RuntimeConfig,
+    ScreenMode,
+    ComputeMode,
+)
 from lever.interface import MoleculeBuilder
-from lever.monitor import init_run, summary, storage
-from lever.monitor.plotting import plot_outer_convergence, plot_inner_convergence
+from lever.utils.monitor import RunContext
+from lever.optimizers import adam, cosine_decay_schedule
 
-# System identifier for file naming and metadata
-SYSTEM_NAME = "N2_sto3g"
 
+SYSTEM_NAME = "H2_ccpvtz"
 
 def main() -> None:
-    """Execute complete LEVER variational optimization workflow."""
+    """Main workflow: setup → physics → configuration → execution → analysis."""
     
-    # JAX runtime configuration
-    jax.config.update("jax_disable_jit", False)
-    jax.config.update("jax_log_compiles", False)
-    
-    # Precision setup - applied during LeverConfig construction
-    precision_cfg = config.PrecisionConfig(enable_x64=True)
-    print("x64 enabled:", jax.config.read("jax_enable_x64"))
-    print("JAX devices:", jax.devices())
-    
-    # Initialize run directory and logging system
-    run = init_run(cfg=None, system_name=SYSTEM_NAME, root_dir="runs")
+    # 0. Initialize run context with timestamped directory
+    run = RunContext.create(system_name=SYSTEM_NAME, root_dir="runs")
 
-    # 1) Molecular system setup using PySCF interface
-    builder = (
+    # 1. Define molecular system and generate Hamiltonian data
+    meta = (
         MoleculeBuilder(
-            atom="N 0 0 0; N 0 0 10.0",  # N₂ molecule with 10.0 Bohr separation
-            basis="sto-3g",
-            charge=0,
-            spin=0,
+            atom="H 0 0 -1.0; H 0 0 1.0",
+            basis="cc-pvtz",
             work_dir=run.root,
+            name=SYSTEM_NAME,
         )
         .run_scf()
-        .run_benchmarks({"hf", "mp2", "cisd", "ccsd", "ccsd_t", "fci"})
+        .run_benchmarks({"fci"})
+        .export()
     )
 
-    # Export FCIDUMP and HDF5 files with consistent naming
-    exported = builder.export(SYSTEM_NAME)
-
-    # 2) LEVER configuration from molecular data
-    sys_cfg = config.SystemConfig.from_hdf5(str(exported.hdf5_path))
-
-    ham_cfg = config.HamiltonianConfig(
-        screening_mode=config.ScreenMode.DYNAMIC,
-        screen_eps=1e-6,      # Dynamic screening threshold
-        diag_shift=0.,       # No diagonal shift
+    # 2. Configure experiment with physics and runtime parameters
+    cfg = ExperimentConfig.from_meta(
+        meta,
+        root_dir=run.root,
+        hamiltonian=HamiltonianConfig(
+            screening_mode=ScreenMode.DYNAMIC,
+            screen_eps=1e-6,
+        ),
+        loop=LoopConfig(
+            max_outer=20,
+            max_inner=1000,
+            chunk_size=8192,
+        ),
+        runtime=RuntimeConfig(
+            enable_x64=True,
+            compute_mode=ComputeMode.PROXY,
+        ),
     )
 
-    loop_cfg = config.LoopConfig(
-        max_outer=30,         # Maximum outer iterations
-        max_inner=500,        # Maximum inner iterations  
-        chunk_size=8192       # Batch size for sampling
-    )
-    
-    lever_cfg = config.LeverConfig(
-        system=sys_cfg,
-        hamiltonian=ham_cfg,
-        loop=loop_cfg,
-        compute_mode=config.ComputeMode.PROXY,  # Full T-space treatment
-        spin_flip_symmetry=False,
-        precision=precision_cfg,
-    )
-
-    # 3) Neural wavefunction model construction
+    # 3. Model and Optimizer
     model = models.Backflow(
-        n_orbitals=sys_cfg.n_orbitals,
-        n_alpha=sys_cfg.n_alpha,
-        n_beta=sys_cfg.n_beta,
-        seed=42,              # Random seed for reproducibility
-        n_dets=1,             # Single determinant
-        generalized=True,     # Generalized backflow transformations
-        restricted=False,     # Unrestricted orbitals
-        hidden_dims=(64, 64), # Neural network architecture
-        precision=precision_cfg,
+        n_orb=cfg.system.n_orb,
+        n_alpha=cfg.system.n_alpha, 
+        n_beta=cfg.system.n_beta,
+        seed=42,
+        n_dets=1,
+        generalized=True,
+        hidden_dims=(64, 64), 
     )
 
-    # Persist configuration and model metadata
-    run.save_config(lever_cfg, model=model)
-    
-    # 4) Optimization and evolution setup
-    lr_schedule = optax.cosine_decay_schedule(
-        init_value=5e-4,      # Initial learning rate
-        decay_steps=500,      # Decay over 500 steps
-        alpha=0.01,
+    lr_schedule = cosine_decay_schedule(
+        init_value=5e-4,
+        decay_steps=800,
+        alpha=0.02,
     )
     optimizer = adam(learning_rate=lr_schedule, weight_decay=1e-4)
 
-    # Evolution strategy components
-    amp_scorer = evolution.scores.AmplitudeScorer()  # |ψ|²-based scoring
-    mass_selector = evolution.CumulativeMassSelector(
-        mass_threshold=0.999,  # Select configurations covering 99.99% probability mass
-        max_size=8192,          # Maximum selected configurations
-    )
-    evo_strategy = evolution.BasicStrategy(
-        scorer=amp_scorer,
-        selector=mass_selector,
+    # Evolution strategy
+    strategy = evolution.BasicStrategy(
+        scorer=evolution.scores.AmplitudeScorer(),
+        selector=evolution.CumulativeMassSelector(0.9999, max_size=8192), 
     )
 
-    # 5) Execute variational optimization
-    lever_driver = driver.Driver(lever_cfg, model, evo_strategy, optimizer)
-    result = lever_driver.run()
+    # 4. Execute solver
+    result, diag = solver.solve(cfg, model, strategy, optimizer, run_ctx=run)
 
-    # 6) Post-optimization analysis
+    # 5. Analyze results and record experiment artifacts
+    int_ctx = diag["int_ctx"]  # Integration context for expectation values
+    e_nuc = diag["e_nuc"]      # Nuclear repulsion energy
+
     evaluator = analysis.VariationalEvaluator(
-        int_ctx=lever_driver.int_ctx,
-        n_orb=sys_cfg.n_orbitals,
-        e_nuc=lever_driver.int_ctx.get_e_nuc()  # Nuclear repulsion energy
+        int_ctx=int_ctx,
+        n_orb=cfg.system.n_orb,
+        e_nuc=e_nuc,
     )
 
+    # Compute variational energies and wavefunction analysis
     energies = evaluator.analyze_result(
         result,
         model=model,
-        compute_s_ci=True,    # S-space CI analysis
-        compute_sc_var=True,  # S-C variational analysis
+        compute_s_ci=True,
+        compute_sc_var=True,
     )
 
-    storage.append_energies_to_summary(run.root, energies)
-    
-    # Print comprehensive summary
-    summary.print_summary_from_run(
-        run_dir=run.root,
+    # Record complete experiment data for reproducibility
+    run.record_experiment(
+        config=cfg,
+        result=result,
+        diagnostics=diag,
+        meta=meta,
+        model=model,
+        optimizer=optimizer,
+        strategy=strategy,
         energies=energies,
     )
-
-    # 7) Generate convergence plots
-    plot_outer_convergence(
-        run_dir=run.root,
-        log_scale=True,                    # Log-scale for energy differences
-        save_path=run.root / "convergence_outer.pdf",
-    )
-
-    plot_inner_convergence(
-        run_dir=run.root,
-        log_scale=False,                   # Linear scale for inner iterations
-        save_path=run.root / "convergence_inner.pdf",
-    )
-
-    run.close()
 
 
 if __name__ == "__main__":

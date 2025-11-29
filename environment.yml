@@ -33,6 +33,8 @@ dependencies:
   - pytest
   - pytest-benchmark
   - catch2                      # C++ tests
+  - pydantic
+  - pandas
 
   # --- Build backend for C++ extensions ---
   - scikit-build-core>=0.9

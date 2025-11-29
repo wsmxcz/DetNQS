@@ -17,8 +17,9 @@ from __future__ import annotations
 import numpy as np
 
 from ..dtypes import ScoreResult
+from ..utils.config_utils import capture_config
 
-
+@capture_config
 class TopKSelector:
     """Select top-k determinants by score using partial selection algorithm.
     
@@ -54,7 +55,7 @@ class TopKSelector:
         
         return dets[top_indices]
 
-
+@capture_config
 class ThresholdSelector:
     """Select determinants exceeding score threshold with optional size cap."""
 
@@ -96,7 +97,7 @@ class ThresholdSelector:
         
         return dets[passing_mask]
 
-
+@capture_config
 class CumulativeMassSelector:
     """Select determinants until cumulative mass threshold is reached.
     

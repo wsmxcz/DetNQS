@@ -80,7 +80,7 @@ def _from_coo_dict(coo_dict: dict) -> COOMatrix:
 def get_ham_proxy(
     S_dets: NDArray[np.uint64],
     int_ctx: core.IntCtx,
-    n_orbitals: int,
+    n_orb: int,
     mode: str = "none",
     psi_S: NDArray[np.float64] | None = None,
     screen_eps: float = 1e-6,
@@ -102,7 +102,7 @@ def get_ham_proxy(
     Args:
         S_dets: Reference determinants, shape (n_S, 2)
         int_ctx: C++ integral context
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         mode: Screening strategy in {"none", "static", "dynamic"}
         psi_S: S-space wavefunction for dynamic mode
         screen_eps: Screening threshold ε₁
@@ -116,19 +116,19 @@ def get_ham_proxy(
 
     # Dispatch to screening backend
     if mode == "none":
-        C_raw = core.gen_excited_dets(S, n_orbitals)
+        C_raw = core.gen_excited_dets(S, n_orb)
         C = remove_overlaps(C_raw, S)
         result = core.get_ham_block(
             bra_dets=S, 
             ket_dets=C, 
             int_ctx=int_ctx, 
-            n_orbitals=n_orbitals
+            n_orb=n_orb
         )
     elif mode == "static":
         result = core.get_ham_conn(
             dets_S=S,
             int_ctx=int_ctx,
-            n_orbitals=n_orbitals,
+            n_orb=n_orb,
             use_heatbath=True,
             eps1=screen_eps,
         )
@@ -143,7 +143,7 @@ def get_ham_proxy(
             dets_S=S,
             psi_S=psi,
             int_ctx=int_ctx,
-            n_orbitals=n_orbitals,
+            n_orb=n_orb,
             eps1=screen_eps,
         )
     else:
@@ -190,7 +190,7 @@ def get_ham_proxy(
 def get_ham_ss(
     S_dets: NDArray[np.uint64],
     int_ctx: core.IntCtx,
-    n_orbitals: int,
+    n_orb: int,
 ) -> tuple[COOMatrix, SpaceRep]:
     """
     Build H_SS block without C-space discovery.
@@ -201,7 +201,7 @@ def get_ham_ss(
     Args:
         S_dets: Reference determinants, shape (n_S, 2)
         int_ctx: C++ integral context
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
     
     Returns:
         (H_SS, space): Hamiltonian block and S-only space representation
@@ -212,7 +212,7 @@ def get_ham_ss(
     coo_ss = core.get_ham_ss(
         dets_S=S,
         int_ctx=int_ctx,
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
     )
     
     ham_ss = COOMatrix(
@@ -242,7 +242,7 @@ def get_ham_full(
     S_dets: NDArray[np.uint64],
     C_dets: NDArray[np.uint64],
     int_ctx: core.IntCtx,
-    n_orbitals: int,
+    n_orb: int,
 ) -> tuple[COOMatrix, COOMatrix, COOMatrix, SpaceRep]:
     """
     Build complete Hamiltonian blocks for exact S ∪ C subspace.
@@ -255,7 +255,7 @@ def get_ham_full(
         S_dets: Reference determinants, shape (n_S, 2)
         C_dets: External determinants, shape (n_C, 2)
         int_ctx: C++ integral context
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
     
     Returns:
         (H_SS, H_SC, H_CC, space): Complete Hamiltonian and space
@@ -269,7 +269,7 @@ def get_ham_full(
         bra_dets=S,
         ket_dets=C,
         int_ctx=int_ctx,
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
     )
     
     coo_ss, coo_sc = result_S["H_SS"], result_S["H_SC"]
@@ -291,7 +291,7 @@ def get_ham_full(
         bra_dets=C,
         ket_dets=None,
         int_ctx=int_ctx,
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
     )
     
     coo_cc = result_C["H_SS"]

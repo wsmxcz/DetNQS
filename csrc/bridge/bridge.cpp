@@ -302,7 +302,7 @@ NB_MODULE(_lever_cpp, m) {
               );
               return from_coo_matrix(coo);
           },
-          "dets_S"_a, "int_ctx"_a, "n_orbitals"_a,
+          "dets_S"_a, "int_ctx"_a, "n_orb"_a,
           "Build H_SS block for Davidson/Lanczos diagonalization");
 
     // ------------------------------------------------------------------------
@@ -344,7 +344,7 @@ NB_MODULE(_lever_cpp, m) {
           "bra_dets"_a, 
           "ket_dets"_a = nb::none(),
           "int_ctx"_a, 
-          "n_orbitals"_a,
+          "n_orb"_a,
           "Build H_SS and H_SC with explicit C-space determinants");
 
     // ------------------------------------------------------------------------
@@ -382,7 +382,7 @@ NB_MODULE(_lever_cpp, m) {
           },
           "dets_S"_a, 
           "int_ctx"_a, 
-          "n_orbitals"_a,
+          "n_orb"_a,
           "use_heatbath"_a = false, 
           "eps1"_a = 1e-6,
           "Build H_SS, H_SC with automatic C-space generation via integral screening");
@@ -432,7 +432,7 @@ NB_MODULE(_lever_cpp, m) {
           "dets_S"_a, 
           "psi_S"_a, 
           "int_ctx"_a, 
-          "n_orbitals"_a,
+          "n_orb"_a,
           "eps1"_a = 1e-6,
           "Build H_SS, H_SC with amplitude-weighted Heat-Bath screening");
 
@@ -515,14 +515,14 @@ NB_MODULE(_lever_cpp, m) {
           },
           "det"_a,
           "int_ctx"_a,
-          "n_orbitals"_a,
+          "n_orb"_a,
           "use_heatbath"_a = false,
           "eps1"_a = 1e-6,
           "Build local Hamiltonian row for a single determinant.\n\n"
           "Args:\n"
           "  det         : uint64[2] = [alpha_bits, beta_bits]\n"
           "  int_ctx     : integral context\n"
-          "  n_orbitals  : number of spatial orbitals\n"
+          "  n_orb  : number of spatial orbitals\n"
           "  use_heatbath: enable Heat-Bath screening for doubles and singles\n"
           "  eps1        : Heat-Bath / single threshold\n\n"
           "Returns:\n"
@@ -568,14 +568,14 @@ NB_MODULE(_lever_cpp, m) {
           },
           "dets"_a,
           "int_ctx"_a,
-          "n_orbitals"_a,
+          "n_orb"_a,
           "use_heatbath"_a = false,
           "eps1"_a = 1e-6,
           "Build local Hamiltonian connections for a batch of determinants.\n\n"
           "Args:\n"
           "  dets        : uint64[N,2] determinant array\n"
           "  int_ctx     : integral context\n"
-          "  n_orbitals  : number of spatial orbitals\n"
+          "  n_orb  : number of spatial orbitals\n"
           "  use_heatbath: enable Heat-Bath screening for doubles and singles\n"
           "  eps1        : Heat-Bath / single threshold\n\n"
           "Returns:\n"
@@ -621,7 +621,7 @@ NB_MODULE(_lever_cpp, m) {
 
               return nb::make_tuple(res.e_el, res.norm);
           },
-          "dets"_a, "coeffs"_a, "int_ctx"_a, "n_orbitals"_a,
+          "dets"_a, "coeffs"_a, "int_ctx"_a, "n_orb"_a,
           "use_heatbath"_a = false, "eps1"_a = 1e-6,
           "Compute <Psi|H|Psi> and <Psi|Psi> on fixed basis (S U C).");
 }

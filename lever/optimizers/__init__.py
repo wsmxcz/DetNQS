@@ -12,20 +12,29 @@ Stochastic Reconfiguration (SR):
   - Backends: 'dense' (stable), 'matvec' (memory-efficient)
 
 Example:
-    >>> from lever.optimizers import sr, adam
+    >>> from lever.optimizers import sr, adam, cosine_decay_schedule
     >>> 
     >>> # Natural gradient with damping
     >>> opt = sr(damping=1e-4, backend="matvec")
     >>> 
-    >>> # Standard Adam with weight decay
-    >>> opt = adam(learning_rate=5e-4, weight_decay=1e-4)
+    >>> # Adam with cosine decay schedule
+    >>> lr = cosine_decay_schedule(init_value=1e-3, decay_steps=400)
+    >>> opt = adam(learning_rate=lr, weight_decay=1e-4)
 
 Author: Zheng (Alex) Che <wsmxcz@gmail.com>
 Date: November 2025
 """
 
 # Recommended user-facing API
-from .factories import adam, lm, sgd, sr
+from .factories import (
+    adam,
+    lm,
+    sgd,
+    sr,
+    # Learning rate schedules
+    cosine_decay_schedule,
+    exponential_decay_schedule,
+)
 
 # Advanced components
 from .base import (
@@ -46,6 +55,9 @@ __all__ = [
     "lm",
     "sgd",
     "sr",
+    # Learning rate schedules
+    "cosine_decay_schedule",
+    "exponential_decay_schedule",
     # Base abstractions
     "DirectionProvider",
     "DirectionState",

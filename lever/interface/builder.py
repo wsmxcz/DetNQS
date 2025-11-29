@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-PySCF to FCIDUMP + HDF5 conversion pipeline.
+High-level Python interface for generating LEVER Hamiltonian inputs.
 
-Converts molecular specifications (atoms, basis, charge, spin) into:
-  - Standard FCIDUMP file (Hamiltonian)
-  - Compact HDF5 metadata (geometry, electron counts, HF guess)
+Pipeline: SCF → natural orbitals → CAS selection → localization → export
+FCIDUMP contains integral data; JSON provides system context.
 
 File: lever/interface/builder.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -15,448 +14,493 @@ Date: November, 2025
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from datetime import datetime
+from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple, Union
 
 import numpy as np
-import h5py
+import pyscf
 
-from . import pyscf_backend as backend
-
-
-@dataclass(frozen=True)
-class ExportedSystem:
-    """Handle for exported quantum chemistry system."""
-    fcidump_path: Path
-    hdf5_path: Path
-    n_orbitals: int
-    n_alpha: int
-    n_beta: int
-    is_cas: bool
-    n_core: int
+from . import metadata
+from . import pyscf_driver as driver
 
 
-def read_from_hdf5(h5_path: str) -> Dict[str, Any]:
-    """
-    Extract SystemConfig essentials from HDF5 file.
-    
-    Reads: fcidump_path, orbital counts, electron counts, CAS flags.
-    """
-    path = Path(h5_path)
-    with h5py.File(path, "r") as f:
-        g_sys = f["system"]
-        n_orbitals = int(g_sys["n_orbitals"][()])
-        n_alpha = int(g_sys["n_alpha"][()])
-        n_beta = int(g_sys["n_beta"][()])
+# ============================================================================
+# Public API
+# ============================================================================
 
-        is_cas = bool(g_sys.attrs.get("is_cas", False))
-        n_core = int(g_sys["n_core_orbitals"][()]) if "n_core_orbitals" in g_sys else 0
-
-        fcidump_path: str
-        g_files = f.get("files", None)
-        if g_files is not None and "fcidump_path" in g_files:
-            raw = g_files["fcidump_path"][()]
-            fcidump_path = raw.decode("utf8") if isinstance(raw, bytes) else str(raw)
-        else:
-            fcidump_path = str(path.with_suffix(".FCIDUMP"))
-
-    return {
-        "fcidump_path": fcidump_path,
-        "n_orbitals": n_orbitals,
-        "n_alpha": n_alpha,
-        "n_beta": n_beta,
-        "meta_path": str(path),
-        "is_cas": is_cas,
-        "n_core": n_core,
-    }
-
-
-def _write_hdf5(
+def export_system(
+    atom: Union[str, list],
+    basis: str,
     *,
-    hdf5_path: Path,
-    mol,
-    n_orbitals: int,
-    n_alpha: int,
-    n_beta: int,
-    is_cas: bool,
-    n_core: int,
-    fcidump_path: Path,
-    benchmarks: Optional[Dict[str, Optional[float]]],
-) -> None:
+    work_dir: Union[str, Path] = ".",
+    name: str = "system",
+    charge: int = 0,
+    spin: int = 0,
+    unit: str = "Angstrom",
+    symmetry: bool = False,
+    scf: Optional[metadata.SCFConfig] = None,
+    orbitals: Optional[metadata.OrbitalConfig] = None,
+    benchmarks: Optional[Iterable[str]] = None,
+) -> metadata.SystemMeta:
     """
-    Write compact HDF5 metadata with minimal schema.
-    
-    Schema:
-      /system: orbital/electron counts, CAS flags
-      /files: fcidump_path
-      /geometry: atom symbols/coordinates
-      /initialization: HF occupation patterns
-      /benchmarks: optional energy values
+    One-shot system builder: SCF → benchmarks → orbitals → export.
+
+    Args:
+        atom: Molecular geometry
+        basis: Basis set identifier
+        work_dir: Output directory
+        name: System identifier
+        charge: Total charge
+        spin: Spin multiplicity 2S
+        unit: Coordinate unit
+        symmetry: Enable point group symmetry
+        scf: SCF configuration
+        orbitals: Orbital pipeline configuration
+        benchmarks: Benchmark methods (e.g., ["hf", "fci", "ccsd"])
+
+    Returns:
+        SystemMeta describing active-space Hamiltonian
     """
-    hdf5_path.parent.mkdir(parents=True, exist_ok=True)
+    builder = MoleculeBuilder(
+        atom=atom,
+        basis=basis,
+        charge=charge,
+        spin=spin,
+        unit=unit,
+        symmetry=symmetry,
+        work_dir=work_dir,
+        name=name,
+    )
 
-    with h5py.File(hdf5_path, "w") as f:
-        # System metadata
-        g_sys = f.create_group("system")
-        g_sys.create_dataset("n_orbitals", data=int(n_orbitals))
-        g_sys.create_dataset("n_alpha", data=int(n_alpha))
-        g_sys.create_dataset("n_beta", data=int(n_beta))
-        g_sys.create_dataset("charge", data=int(mol.charge))
-        g_sys.create_dataset("spin", data=int(mol.spin))
-        g_sys.create_dataset("n_core_orbitals", data=int(n_core))
-        g_sys.attrs["is_cas"] = bool(is_cas)
+    if scf is not None:
+        builder.scf_config = scf
+    if orbitals is not None:
+        builder.orb_config = orbitals
+    if benchmarks is not None:
+        builder.benchmark_methods = set(benchmarks)
 
-        # File paths
-        g_files = f.create_group("files")
-        g_files.create_dataset("fcidump_path", data=str(fcidump_path.resolve()).encode("utf8"))
-
-        # Molecular geometry
-        g_geom = f.create_group("geometry")
-        coords = mol.atom_coords(unit="Angstrom")
-        symbols = np.array([mol.atom_symbol(i) for i in range(mol.natm)], dtype="S2")
-        g_geom.create_dataset("atom_coords", data=coords)
-        g_geom.create_dataset("atom_symbols", data=symbols)
-        g_geom.attrs["unit"] = "Angstrom"
-
-        # HF initialization data
-        g_init = f.create_group("initialization")
-        hf_occ_alpha = np.zeros((n_orbitals,), dtype=np.int8)
-        hf_occ_beta = np.zeros((n_orbitals,), dtype=np.int8)
-        hf_occ_alpha[:n_alpha] = 1
-        hf_occ_beta[:n_beta] = 1
-        g_init.create_dataset("hf_occ_alpha", data=hf_occ_alpha)
-        g_init.create_dataset("hf_occ_beta", data=hf_occ_beta)
-
-        # Bitstring encoding for determinants (n_orbitals ≤ 64)
-        if n_orbitals <= 64:
-            alpha_bits = sum(1 << i for i in range(n_alpha))
-            beta_bits = sum(1 << i for i in range(n_beta))
-            hf_det = np.array([alpha_bits, beta_bits], dtype="uint64")
-            g_init.create_dataset("hf_det_bitstring", data=hf_det)
-
-        # Optional benchmark energies
-        if benchmarks:
-            g_bench = f.create_group("benchmarks")
-            for key, val in benchmarks.items():
-                if val is not None:
-                    g_bench.attrs[key] = float(val)
+    return builder.run_all()
 
 
-def load_initial_det(h5_path: str) -> Optional[np.ndarray]:
-    """Load HF determinant bitstring from HDF5 file."""
-    path = Path(h5_path)
-    if not path.exists():
-        return None
-
-    with h5py.File(path, "r") as f:
-        g_init = f.get("initialization")
-        if g_init is None or "hf_det_bitstring" not in g_init:
-            return None
-        data = g_init["hf_det_bitstring"][()]
-
-    return np.asarray(data, dtype="uint64").reshape(1, 2)
-
-
-def load_benchmarks(h5_path: str) -> Dict[str, float]:
-    """Load benchmark energies from HDF5 attributes."""
-    path = Path(h5_path)
-    if not path.exists():
-        return {}
-
-    out: Dict[str, float] = {}
-    with h5py.File(path, "r") as f:
-        g = f.get("benchmarks")
-        if g is None:
-            return {}
-        for key, val in g.attrs.items():
-            try:
-                out[str(key)] = float(val)
-            except Exception:
-                continue
-    return out
-
+# ============================================================================
+# Builder Implementation
+# ============================================================================
 
 class MoleculeBuilder:
     """
-    PySCF to FCIDUMP+HDF5 conversion pipeline.
-    
-    Usage:
-        builder = (
-            MoleculeBuilder(atom="N 0 0 0; N 0 0 1.1", basis="cc-pvdz")
-            .run_scf()
-            .apply_natural_orbitals("mp2")
-            .set_active_space(10, 8)
-            .localize_active_space("ibo")
-            .run_benchmarks({"cisd", "ccsd"})
-        )
-        exported = builder.export("n2_cas")
+    Chainable PySCF orchestrator for LEVER Hamiltonian generation.
+
+    Pipeline stages:
+      1. SCF: Hartree-Fock with stability analysis
+      2. Benchmarks: Post-HF methods (FCI, CCSD, etc.)
+      3. Orbitals: Natural orbital transformation → CAS → localization
+      4. Export: FCIDUMP + JSON metadata
     """
 
     def __init__(
         self,
-        atom: Any,
-        basis: str,
         *,
+        atom: Union[str, list, None] = None,
+        basis: Optional[str] = None,
         charge: int = 0,
         spin: int = 0,
+        unit: str = "Angstrom",
         symmetry: bool = False,
-        work_dir: str | Path = ".",
-    ) -> None:
-        self._atom = atom
-        self._basis = basis
-        self._charge = int(charge)
-        self._spin = int(spin)
-        self._symmetry = bool(symmetry)
-        self._work_dir = Path(work_dir)
+        work_dir: Union[str, Path] = ".",
+        name: str = "system",
+        info: Optional[metadata.MoleculeInfo] = None,
+    ):
+        if info is None:
+            if atom is None or basis is None:
+                raise ValueError("Either info or (atom, basis) must be provided")
+            info = metadata.MoleculeInfo(
+                atom=atom,
+                basis=basis,
+                charge=charge,
+                spin=spin,
+                symmetry=symmetry,
+                unit=unit,
+            )
 
-        # PySCF objects
-        self._mol = None
-        self._mf = None
+        self.info: metadata.MoleculeInfo = info
+        self.work_dir = Path(work_dir)
+        self.name = name
 
-        # Current orbital representation
-        self._C: Optional[np.ndarray] = None
-        self._occ: Optional[np.ndarray] = None
+        # Pipeline configurations
+        self.scf_config = metadata.SCFConfig()
+        self.orb_config = metadata.OrbitalConfig()
+        self.benchmark_methods: Set[str] = {"hf"}
 
-        # Active space configuration
-        self._natural_orbital_kind: str = "none"
-        self._active_space: Optional[backend.ActiveSpaceSpec] = None
-        self._localization_method: str = "canonical"
-        self._loc_virtual: bool = False
+        # Computation cache
+        self._scf_result: Optional[driver.ScfResult] = None
+        self._benchmarks: Optional[Dict[str, metadata.BenchmarkItem]] = None
+        self._mo_coeff: Optional[np.ndarray] = None
+        self._mo_occ: Optional[np.ndarray] = None
+        self._hf_occ_sorted: Optional[np.ndarray] = None
+        self._dims: Optional[Tuple[int, int, int]] = None
 
-        # Cached energies
-        self._benchmarks: Dict[str, Optional[float]] = {}
+        # Logging
+        self.log_path = self.work_dir / "interface.log"
+        self._header_logged = False
+        self._setup_logger()
 
-    @property
-    def work_dir(self) -> Path:
-        """Output directory for exported files."""
-        return self._work_dir
+    def _setup_logger(self) -> None:
+        """Initialize file logger."""
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        logger_name = f"LEVER_Interface_{self.name}"
+        self.logger = logging.getLogger(logger_name)
+        self.logger.setLevel(logging.INFO)
 
-    def run_scf(self, method: str = "auto") -> "MoleculeBuilder":
-        """Run SCF calculation and cache molecular objects."""
-        self._mol, self._mf = backend.run_scf(
-            atom=self._atom,
-            basis=self._basis,
-            charge=self._charge,
-            spin=self._spin,
-            symmetry=self._symmetry,
-            scf_type=method,
-        )
-        self._C = np.array(self._mf.mo_coeff, copy=True)
-        self._occ = np.array(self._mf.mo_occ, copy=True)
-        self._natural_orbital_kind = "none"
-        self._active_space = None
-        return self
+        if not self.logger.handlers:
+            fh = logging.FileHandler(self.log_path, mode="a", encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(message)s"))
+            self.logger.addHandler(fh)
 
-    def apply_natural_orbitals(self, kind: str = "none") -> "MoleculeBuilder":
-        """Replace canonical orbitals with natural orbitals of specified kind."""
-        if self._mf is None:
-            raise RuntimeError("run_scf() required before apply_natural_orbitals()")
+    def _log_header(self) -> None:
+        """Log system header once."""
+        if self._header_logged:
+            return
+        self._header_logged = True
 
-        kind = (kind or "none").lower()
-        if kind == "none":
-            self._C = np.array(self._mf.mo_coeff, copy=True)
-            self._occ = np.array(self._mf.mo_occ, copy=True)
-        else:
-            C_no, occ_no = backend.compute_natural_orbitals(self._mf, kind=kind)
-            self._C = C_no
-            self._occ = occ_no
+        log = self.logger.info
+        log(f"--- LEVER Interface: {datetime.now().isoformat()} ---")
+        log(f"System: {self.name}")
+        log(f"Atom: {self.info.atom}")
+        log(f"Basis: {self.info.basis} | Q={self.info.charge} S={self.info.spin}")
 
-        self._natural_orbital_kind = kind
-        self._active_space = None
-        return self
-
-    def set_active_space(self, n_elec: int, n_orb: int) -> "MoleculeBuilder":
-        """
-        Define CAS(n_elec, n_orb) active space.
-        
-        Algorithm:
-          1. Sort orbitals by occupation number
-          2. Partition: [core | active | virtual]
-          3. Reorder MO coefficients accordingly
-        
-        Partition: n_core = (N_total - n_elec)/2, n_active = n_orb
-        """
-        if self._mol is None or self._C is None or self._occ is None:
-            raise RuntimeError("run_scf() and apply_natural_orbitals() required")
-
-        n_elec = int(n_elec)
-        n_orb = int(n_orb)
-        nelec_total = int(self._mol.nelectron)
-        nmo = int(self._C.shape[1])
-
-        if n_elec <= 0 or n_orb <= 0:
-            raise ValueError("n_elec and n_orb must be positive")
-        if n_elec > nelec_total:
-            raise ValueError("Active electrons exceed total electrons")
-
-        n_core_elec = nelec_total - n_elec
-        if n_core_elec < 0 or (n_core_elec % 2) != 0:
-            raise ValueError("Total - active electrons must be non-negative even")
-
-        n_core = n_core_elec // 2
-        if n_core + n_orb > nmo:
-            raise ValueError("n_core + n_orb exceeds orbital count")
-
-        # Sort by occupation: high → low
-        idx_sorted = np.argsort(-self._occ)
-        perm = np.concatenate([
-            idx_sorted[:n_core],           # core
-            idx_sorted[n_core:n_core+n_orb],  # active
-            idx_sorted[n_core+n_orb:]      # virtual
-        ])
-        self._C = self._C[:, perm]
-        self._occ = self._occ[perm]
-
-        # Compute active space electron counts
-        spin = int(self._mol.spin)
-        n_alpha_total = (nelec_total + spin) // 2
-        n_beta_total = nelec_total - n_alpha_total
-
-        self._active_space = backend.ActiveSpaceSpec(
-            n_core=n_core,
-            n_active=n_orb,
-            n_virt=nmo - n_core - n_orb,
-            nelecas_alpha=n_alpha_total - n_core,
-            nelecas_beta=n_beta_total - n_core,
-        )
-        return self
-
-    def localize_active_space(
+    def run_scf(
         self,
-        method: str = "canonical",
-        *,
-        localize_virtual: bool = False,
-    ) -> "MoleculeBuilder":
-        """Apply orbital localization to active space or full space."""
-        if self._mol is None or self._mf is None or self._C is None:
-            raise RuntimeError("run_scf() required before localize_active_space()")
+        cfg: Optional[metadata.SCFConfig] = None,
+        **overrides,
+    ) -> MoleculeBuilder:
+        """Execute SCF with stability analysis."""
+        log = self.logger.info
 
-        method = (method or "canonical").lower()
-        if method in ("canonical", ""):
-            self._localization_method = "canonical"
-            self._loc_virtual = False
-            return self
+        if cfg is None:
+            cfg = self.scf_config
+        if overrides:
+            cfg = cfg.model_copy(update=overrides)
+        self.scf_config = cfg
 
-        # Determine localization window
-        if self._active_space is not None:
-            n_core = self._active_space.n_core
-            active_window = (n_core, n_core + self._active_space.n_active)
-        else:
-            active_window = None
+        res = driver.run_scf(self.info, cfg, log_path=self.log_path)
+        self._scf_result = res
 
-        self._C = backend.localize_orbitals(
-            self._mol,
-            self._mf,
-            self._C,
-            method=method,
-            loc_virtual=localize_virtual,
-            active_window=active_window,
-        )
-        self._localization_method = method
-        self._loc_virtual = bool(localize_virtual)
+        self._log_header()
+        log(f"\n[Step 1] SCF ({cfg.type})")
+        log(f"  Energy:    {res.mf.e_tot:.8f} Ha")
+        log(f"  Converged: {res.converged} (Cycles: {res.n_cycle})")
+        log(f"  <S^2>:     {res.s2:.4f}")
+
+        if not res.converged:
+            log("  WARNING: SCF did NOT converge")
+
+        self._mo_coeff = res.mf.mo_coeff
+        self._mo_occ = res.mf.mo_occ
+        self._hf_occ_sorted = res.mf.mo_occ.copy()
+        self._dims = None
+
         return self
 
     def run_benchmarks(
         self,
-        kinds: Optional[Iterable[str]] = None,
-    ) -> "MoleculeBuilder":
-        """Run quantum chemistry benchmarks and cache energies."""
-        if self._mol is None or self._mf is None:
-            raise RuntimeError("run_scf() required before run_benchmarks()")
+        methods: Optional[Iterable[str]] = None,
+    ) -> MoleculeBuilder:
+        """Compute post-HF benchmarks (FCI, CCSD, etc.)."""
+        log = self.logger.info
 
-        if kinds is None:
-            kinds = {"hf", "mp2", "cisd", "ccsd", "ccsd_t", "fci"}
+        if self._scf_result is None:
+            self.run_scf()
 
-        kinds_set = {k.lower() for k in kinds}
-        cas_mc = None
+        res = self._scf_result
+        assert res is not None
 
-        # Build CASCI if active space defined
-        if self._active_space is not None and "casci" in kinds_set:
-            spec = self._active_space
-            cas_mc = backend.build_casci(
-                self._mf,
-                self._C,
-                ncas=spec.n_active,
-                nelecas=(spec.nelecas_alpha, spec.nelecas_beta),
-                ncore=spec.n_core,
-            )
+        if methods is not None:
+            self.benchmark_methods = set(methods)
 
-        self._benchmarks = backend.run_benchmarks(
-            self._mol,
-            self._mf,
-            kinds=kinds_set,
-            cas_mc=cas_mc,
-        )
+        log(f"\n[Step 2] Benchmarks: {sorted(self.benchmark_methods)}")
+
+        if not res.converged:
+            log("  (Skipping correlated methods - SCF failed)")
+            bench_res = {
+                "hf": metadata.BenchmarkItem(
+                    energy=float(res.mf.e_tot),
+                    status="failed",
+                )
+            }
+        else:
+            bench_res = driver.run_benchmarks(res, self.benchmark_methods)
+            for method, result in bench_res.items():
+                if result.status == "ok" and result.energy is not None:
+                    val = f"{result.energy:.6f}"
+                else:
+                    val = result.status
+                log(f"  {method.upper()}: {val}")
+
+        self._benchmarks = bench_res
         return self
 
-    def export(
+    def run_orbitals(
         self,
-        name: str = "system",
-        *,
-        write_fcidump: bool = True,
-        write_hdf5: bool = True,
-    ) -> ExportedSystem:
-        """Finalize pipeline and write FCIDUMP + HDF5 files."""
-        if self._mol is None or self._C is None:
-            raise RuntimeError("run_scf() required before export()")
+        cfg: Optional[metadata.OrbitalConfig] = None,
+        **overrides,
+    ) -> MoleculeBuilder:
+        """
+        Execute orbital pipeline: natural → CAS → localization.
+        
+        Natural orbitals: Diagonalize density matrix for improved convergence
+        CAS selection: Partition orbitals into core/active/virtual spaces
+        Localization: Apply Boys, Pipek-Mezey, or other schemes
+        """
+        log = self.logger.info
 
-        self._work_dir.mkdir(parents=True, exist_ok=True)
-        base = self._work_dir / name
-        fcidump_path = base.with_suffix(".FCIDUMP")
-        hdf5_path = base.with_suffix(".h5")
+        if self._scf_result is None:
+            self.run_scf()
 
-        # Determine Hamiltonian type and dimensions
-        if self._active_space is None:
-            # Full-space Hamiltonian
-            n_orbitals = int(self._C.shape[1])
-            nelec = int(self._mol.nelectron)
-            spin = int(self._mol.spin)
-            n_alpha = (nelec + spin) // 2
-            n_beta = nelec - n_alpha
-            is_cas = False
-            n_core = 0
+        res = self._scf_result
+        assert res is not None
 
-            if write_fcidump:
-                backend.write_fcidump_full(self._mol, self._C, fcidump_path)
-        else:
-            # CAS Hamiltonian
-            spec = self._active_space
-            n_orbitals = spec.n_active
-            n_alpha = spec.nelecas_alpha
-            n_beta = spec.nelecas_beta
-            is_cas = True
-            n_core = spec.n_core
+        if cfg is None:
+            cfg = self.orb_config
+        if overrides:
+            cfg = cfg.model_copy(update=overrides)
+        self.orb_config = cfg
 
-            if write_fcidump:
-                mc = backend.build_casci(
-                    self._mf,
-                    self._C,
-                    ncas=spec.n_active,
-                    nelecas=(spec.nelecas_alpha, spec.nelecas_beta),
-                    ncore=spec.n_core,
-                )
-                backend.write_fcidump_cas(mc, fcidump_path)
+        if (cfg.active_orb > 0) ^ (cfg.active_elec > 0):
+            raise ValueError("Active space requires both active_orb and active_elec")
 
-        if write_hdf5:
-            _write_hdf5(
-                hdf5_path=hdf5_path,
-                mol=self._mol,
-                n_orbitals=n_orbitals,
-                n_alpha=n_alpha,
-                n_beta=n_beta,
-                is_cas=is_cas,
-                n_core=n_core,
-                fcidump_path=fcidump_path,
-                benchmarks=self._benchmarks or None,
+        log("\n[Step 3] Orbital Pipeline")
+
+        c_curr = res.mf.mo_coeff
+        occ_curr = res.mf.mo_occ
+        hf_occ_curr = res.mf.mo_occ.copy()
+
+        # Natural orbitals: diagonalize 1-RDM for improved basis
+        nat_type = cfg.natural_type
+        if nat_type != "none":
+            log(f"  > Natural Orbitals ({nat_type})")
+            c_curr, occ_curr, hf_occ_curr = driver.make_natural(
+                res, nat_type, hf_occ_curr
             )
 
-        return ExportedSystem(
-            fcidump_path=fcidump_path,
-            hdf5_path=hdf5_path,
-            n_orbitals=n_orbitals,
-            n_alpha=n_alpha,
-            n_beta=n_beta,
-            is_cas=is_cas,
-            n_core=n_core,
+        # CAS partitioning: select active space by occupation
+        n_elec = cfg.active_elec
+        n_orb = cfg.active_orb
+
+        if n_orb > 0:
+            log(f"  > Active Space: ({n_elec}e, {n_orb}o)")
+
+            if (n_elec + res.mol.spin) % 2 != 0:
+                raise ValueError(
+                    f"Active electrons {n_elec} and spin {res.mol.spin} incompatible"
+                )
+
+            c_curr, occ_curr, hf_occ_curr, dims = driver.make_active(
+                c_curr,
+                occ_curr,
+                hf_occ_curr,
+                n_elec,
+                n_orb,
+                res.mol.nelectron,
+            )
+            n_core, n_act, n_virt = dims
+            log(f"    Core={n_core} Active={n_act} Virt={n_virt}")
+        else:
+            # Full-space calculation
+            n_core, n_act = 0, c_curr.shape[1]
+            n_virt = 0
+            idx = np.argsort(occ_curr)[::-1]
+            c_curr = c_curr[:, idx]
+            occ_curr = occ_curr[idx]
+            hf_occ_curr = hf_occ_curr[idx]
+
+        # Localization: transform orbitals for spatial locality
+        loc_method = cfg.local_method
+        if loc_method != "none":
+            loc_window = cfg.local_window
+            log(f"  > Localizing: {loc_method} (window={loc_window})")
+
+            s_core = slice(0, n_core)
+            s_act = slice(n_core, n_core + n_act)
+            s_virt = slice(n_core + n_act, n_core + n_act + n_virt)
+
+            c_curr = driver.localize_orbs(
+                res.mol,
+                c_curr,
+                loc_method,
+                loc_window,
+                (s_core, s_act, s_virt),
+                cfg.local_virtual,
+            )
+
+        self._mo_coeff = c_curr
+        self._mo_occ = occ_curr
+        self._hf_occ_sorted = hf_occ_curr
+        self._dims = (n_core, n_act, n_virt)
+
+        return self
+
+    def export(self) -> metadata.SystemMeta:
+        """
+        Export FCIDUMP + system metadata.
+        
+        FCIDUMP format: Standard integral dump for quantum chemistry codes
+        Metadata: System info, orbital space, SCF results, benchmarks
+        """
+        log = self.logger.info
+
+        if self._scf_result is None:
+            self.run_scf()
+        if self._dims is None or self._mo_coeff is None or self._hf_occ_sorted is None:
+            self.run_orbitals()
+
+        res = self._scf_result
+        assert res is not None
+        c_curr = self._mo_coeff
+        occ_curr = self._mo_occ
+        hf_occ_curr = self._hf_occ_sorted
+        n_core, n_act, n_virt = self._dims  # type: ignore[misc]
+
+        if self._benchmarks is None and self.benchmark_methods:
+            self.run_benchmarks(self.benchmark_methods)
+
+        bench_res = self._benchmarks or {}
+
+        # Write FCIDUMP: two-electron integrals in chemist's notation
+        fcidump_name = "hamiltonian.fcidump"
+        log(f"\n[Step 4] Exporting {fcidump_name}")
+        driver.write_fcidump(
+            res.mol,
+            res.mf,
+            c_curr,
+            str(self.work_dir / fcidump_name),
+            n_core,
+            n_act,
         )
+
+        # Reference state: bitstring representation of HF occupation
+        final_hf_occ = hf_occ_curr[n_core : n_core + n_act]
+        alpha_bits, beta_bits = driver.occ_to_bitstring(final_hf_occ)
+
+        if n_core > 0:
+            n_elec_active = self.orb_config.active_elec
+            n_alpha = (n_elec_active + res.mol.spin) // 2
+            n_beta = n_elec_active - n_alpha
+        else:
+            ne = res.mol.nelectron
+            n_alpha = (ne + res.mol.spin) // 2
+            n_beta = ne - n_alpha
+
+        # Geometry in Angstrom
+        atom_meta = [
+            metadata.AtomMeta(
+                symbol=res.mol.atom_symbol(i),
+                coords=list(coords),
+            )
+            for i, coords in enumerate(res.mol.atom_coords(unit="Angstrom"))
+        ]
+
+        # SCF type detection
+        import pyscf.scf
+        scf_type = "ROHF" if isinstance(res.mf, pyscf.scf.rohf.ROHF) else "RHF"
+
+        # LEVER version
+        try:
+            lever_version = importlib_metadata.version("lever")
+        except importlib_metadata.PackageNotFoundError:
+            lever_version = "unknown"
+
+        # Assemble metadata
+        system_info = metadata.SystemInfo(
+            name=self.name,
+            charge=self.info.charge,
+            spin=self.info.spin,
+            n_electrons=res.mol.nelectron,
+            basis=self.info.basis,
+            unit=self.info.unit,
+            geometry=atom_meta,
+        )
+
+        orbital_space = metadata.OrbitalSpace(
+            n_orb=n_act,
+            n_alpha=int(n_alpha),
+            n_beta=int(n_beta),
+            n_core=int(n_core),
+            is_cas=bool(n_core > 0),
+            active_elec=self.orb_config.active_elec,
+            active_orb=self.orb_config.active_orb,
+        )
+
+        scf_meta = metadata.ScfMeta(
+            type=scf_type,
+            energy=float(res.mf.e_tot),
+            converged=res.converged,
+            n_cycle=res.n_cycle,
+            spin_s2=res.s2,
+        )
+
+        loc_meta = metadata.LocalizationMeta(
+            method=self.orb_config.local_method,
+            window=self.orb_config.local_window,
+            local_virtual=self.orb_config.local_virtual,
+        )
+
+        pipeline_meta = metadata.PipelineMeta(
+            natural_type=self.orb_config.natural_type,
+            localization=loc_meta,
+        )
+
+        ref_state = metadata.ReferenceState(
+            alpha_bits=int(alpha_bits),
+            beta_bits=int(beta_bits),
+            occ_vector=[int(x) for x in final_hf_occ],
+        )
+
+        files_meta = metadata.SystemFiles(
+            fcidump=fcidump_name,
+            log=self.log_path.name,
+        )
+
+        sys_meta = metadata.SystemMeta(
+            lever_version=lever_version,
+            pyscf_version=pyscf.__version__,
+            system=system_info,
+            orbital_space=orbital_space,
+            scf=scf_meta,
+            pipeline=pipeline_meta,
+            reference_state=ref_state,
+            benchmarks=bench_res,
+            files=files_meta,
+        )
+
+        # Save metadata to JSON
+        json_path = self.work_dir / "system.json"
+        sys_meta.save(json_path)
+        log(f"Metadata saved to {json_path.name}")
+
+        # Cleanup logger
+        for h in list(self.logger.handlers):
+            h.close()
+            self.logger.removeHandler(h)
+
+        return sys_meta
+
+    def run_all(self) -> metadata.SystemMeta:
+        """Execute full pipeline: SCF → benchmarks → orbitals → export."""
+        self.run_scf()
+        if self.benchmark_methods:
+            self.run_benchmarks(self.benchmark_methods)
+        self.run_orbitals()
+        return self.export()
+
+    def run(self) -> metadata.SystemMeta:
+        """Backward-compatible alias for run_all()."""
+        return self.run_all()
+
+
+__all__ = [
+    "export_system",
+    "MoleculeBuilder",
+]

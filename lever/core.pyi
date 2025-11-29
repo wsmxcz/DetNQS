@@ -143,7 +143,7 @@ def get_ham_diag(dets: DetArray, int_ctx: IntCtx) -> F64Array:
 def get_ham_ss(
     dets_S: DetArray,
     int_ctx: IntCtx,
-    n_orbitals: int,
+    n_orb: int,
 ) -> CooData:
     """
     Compute H_SS block only without C-space discovery.
@@ -154,7 +154,7 @@ def get_ham_ss(
     Args:
         dets_S: S-space determinants, shape (N, 2)
         int_ctx: Integral context
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         
     Returns:
         Sparse COO matrix for <S|H|S>
@@ -165,7 +165,7 @@ def get_ham_block(
     bra_dets: DetArray,
     ket_dets: Optional[DetArray],
     int_ctx: IntCtx,
-    n_orbitals: int,
+    n_orb: int,
 ) -> HamBlockResult:
     """
     Compute Hamiltonian blocks for predefined spaces.
@@ -177,7 +177,7 @@ def get_ham_block(
         bra_dets: S-space determinants (rows)
         ket_dets: C-space determinants (columns). If None, only <S|H|S> computed
         int_ctx: Integral context
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         
     Returns:
         Dictionary with 'H_SS', 'H_SC', and optional 'det_C', 'size_C'
@@ -188,7 +188,7 @@ def get_ham_block(
 def get_ham_conn(
     dets_S: DetArray,
     int_ctx: IntCtx,
-    n_orbitals: int,
+    n_orb: int,
     use_heatbath: bool = False,
     eps1: float = 1e-6,
 ) -> HamConnResult:
@@ -201,7 +201,7 @@ def get_ham_conn(
     Args:
         dets_S: S-space determinants
         int_ctx: Integral context (heat-bath table required if use_heatbath=True)
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         use_heatbath: Enable heat-bath screening for doubles
         eps1: Heat-bath threshold |⟨ij||ab⟩|
     
@@ -215,7 +215,7 @@ def get_ham_conn_amp(
     dets_S: DetArray,
     psi_S: F64Array,
     int_ctx: IntCtx,
-    n_orbitals: int,
+    n_orb: int,
     eps1: float = 1e-6,
 ) -> HamConnResult:
     """
@@ -229,7 +229,7 @@ def get_ham_conn_amp(
         dets_S: S-space determinants
         psi_S: Amplitudes for dets_S, shape (N,)
         int_ctx: Integral context (heat-bath table required)
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         eps1: Screening threshold |H_ij · ψ_i|
     
     Returns:
@@ -274,7 +274,7 @@ def get_ham_eff(
 def get_local_conn(
     det: npt.NDArray[np.uint64],  # shape (2,)
     int_ctx: IntCtx,
-    n_orbitals: int,
+    n_orb: int,
     use_heatbath: bool = False,
     eps1: float = 1e-6,
 ) -> LocalConnRow:
@@ -284,7 +284,7 @@ def get_local_conn(
     Args:
         det: Single determinant bitstring [alpha_bits, beta_bits], shape (2,)
         int_ctx: Integral context
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         use_heatbath: Enable Heat-Bath screening for excitations
         eps1: Screening threshold
 
@@ -299,7 +299,7 @@ def get_local_conn(
 def get_local_connections(
     dets: DetArray,
     int_ctx: IntCtx,
-    n_orbitals: int,
+    n_orb: int,
     use_heatbath: bool = False,
     eps1: float = 1e-6,
 ) -> LocalConnBatch:
@@ -312,7 +312,7 @@ def get_local_connections(
     Args:
         dets: Bra determinants, shape (N, 2)
         int_ctx: Integral context
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         use_heatbath: Enable Heat-Bath screening
         eps1: Screening threshold
 
@@ -328,7 +328,7 @@ def compute_variational_energy(
     dets: DetArray,
     coeffs: C128Array,
     int_ctx: IntCtx,
-    n_orbitals: int,
+    n_orb: int,
     use_heatbath: bool = False,
     eps1: float = 1e-6,
 ) -> tuple[float, float]:
@@ -341,7 +341,7 @@ def compute_variational_energy(
         dets: Determinants defining the subspace (S U C), shape (N, 2)
         coeffs: Complex coefficients aligned with dets, shape (N,)
         int_ctx: Integral context
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         use_heatbath: Enable heat-bath screening for doubles
         eps1: Screening threshold for heat-bath/singles
         

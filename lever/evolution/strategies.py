@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from .base import EvolutionStrategy, Scorer, Selector
+from ..utils.config_utils import capture_config
 
 if TYPE_CHECKING:
     from ..dtypes import OuterCtx, PsiCache
@@ -32,7 +33,7 @@ def _unique_union(arr1: np.ndarray, arr2: np.ndarray) -> np.ndarray:
         return arr1
     return np.unique(np.concatenate([arr1, arr2], axis=0), axis=0)
 
-
+@capture_config
 class BasicStrategy(EvolutionStrategy):
     """Single-stage evolution: score → select."""
 
@@ -50,7 +51,7 @@ class BasicStrategy(EvolutionStrategy):
         scores = self.scorer.score(ctx, psi_cache)
         return self.selector.select(scores)
 
-
+@capture_config
 class TwoStageStrategy(EvolutionStrategy):
     """
     Two-stage evolution: independent core and frontier selection.
@@ -81,7 +82,7 @@ class TwoStageStrategy(EvolutionStrategy):
         )
         return _unique_union(s_core, s_frontier)
 
-
+@capture_config
 class MassLockingStrategy(EvolutionStrategy):
     """
     ASCI-inspired mass-locking evolution.

@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Step size control rules for variational optimization.
+Step size control for variational optimization.
 
-Implements strategies for computing step size α along search direction:
-  - ConstantRule: α = lr (fixed learning rate)
+Implements adaptive strategies for computing step size α along search direction:
+  - ConstantRule: Fixed or scheduled learning rate α = lr(t)
   - LineSearchRule: Armijo backtracking (Phase 5 placeholder)
-  - TrustRegionRule: Adaptive damping (Phase 5 placeholder)
 
+File: lever/optim/step_size.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: November, 2025
 """
@@ -25,7 +25,7 @@ from .base import RuleState
 if TYPE_CHECKING:
     from ..dtypes import PyTree
 
-# Optax schedule is Callable[[step], ArrayLike]【turn9view0†L147-L164】
+# Optax-compatible schedule: step → scalar
 Schedule = Callable[[int], jnp.ndarray | float]
 ScalarOrSchedule = Union[float, Schedule]
 
@@ -33,12 +33,14 @@ ScalarOrSchedule = Union[float, Schedule]
 @dataclass
 class ConstantRule:
     """
-    Fixed or scheduled step size: α = lr(step).
+    Fixed or scheduled step size: α_t = lr(t).
     
-    learning_rate can be:
-      - a float / ArrayLike constant
-      - an optax schedule: Callable[[int], ArrayLike]
-        (e.g. optax.cosine_decay_schedule, optax.sgdr_schedule, etc.)【turn9view0†L87-L93】【turn9view0†L121-L123】
+    Supports:
+      - Constant: lr = 0.001
+      - Optax schedules: lr = optax.cosine_decay_schedule(init_value, decay_steps)
+    
+    Attributes:
+        learning_rate: Scalar constant or callable schedule
     """
     learning_rate: ScalarOrSchedule = 1e-3
     
@@ -50,21 +52,21 @@ class ConstantRule:
         step: int,
     ) -> tuple[jnp.ndarray, RuleState]:
         """
-        Return step size α(step).
+        Compute step size at iteration t.
         
         Args:
             direction: Search direction (unused)
             state: Rule state (unchanged)
-            energy: Current energy (unused for constant/scheduled lr)
+            energy: Current energy (unused)
             step: Global iteration index (0-based)
+        
+        Returns:
+            (α_t, state): Step size and unchanged state
         """
         lr = self.learning_rate
         if callable(lr):
-            # schedule(step) → scalar / 0-D array
             lr = lr(step)
-        # jnp.asarray makes sure we always return an ArrayLike scalar
-        lr = jnp.asarray(lr)
-        return lr, state
+        return jnp.asarray(lr), state
 
 
 @dataclass
@@ -72,10 +74,12 @@ class LineSearchRule:
     """
     Backtracking line search with Armijo condition (Phase 5 placeholder).
     
-    Will implement: α_k = β^m · α_0 where β ∈ (0,1) and m satisfies
-    f(θ + α_k·d) ≤ f(θ) + c·α_k·∇f^T·d with Armijo constant c ∈ (0,1).
+    Algorithm:
+      Find α_k = β^m · α_0 satisfying Armijo condition:
+        E(θ + α_k·d) ≤ E(θ) + c·α_k·⟨∇E, d⟩
+      where β ∈ (0,1) is backtrack factor, c ∈ (0,1) is Armijo constant.
     
-    Currently delegates to fixed initial_step.
+    Current implementation: Returns initial_step without backtracking.
     
     Attributes:
         initial_step: Starting trial step α_0
@@ -91,7 +95,19 @@ class LineSearchRule:
         energy: float,
         step: int,
     ) -> tuple[float, RuleState]:
-        """Placeholder: returns initial_step without backtracking."""
+        """
+        Compute step size via line search.
+        
+        Args:
+            direction: Search direction
+            state: Rule state
+            energy: Current energy E(θ)
+            step: Global iteration index
+        
+        Returns:
+            (α, state): Step size and updated state
+        """
+        # TODO: Implement Armijo backtracking
         return self.initial_step, state
 
 

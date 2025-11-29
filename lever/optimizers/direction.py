@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Literal, Any
 import flax.struct
 import jax
 
-from ..engine.geometry import qgt_matvec, qgt_dense
+from ..engine.vqs import qgt_matvec, qgt_dense
 from .base import DirectionState
 from .linalg import solve_cg, solve_cholesky
 

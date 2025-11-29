@@ -21,14 +21,15 @@ import jax.numpy as jnp
 
 from .base import WavefunctionModel, make_model
 from .product import ProductModel
-from ..config import PrecisionConfig
+from ..config import RuntimeConfig
+from ..utils.config_utils import capture_config
 
 
 # --- Model Factories ---
 
-
+@capture_config
 def Slater(
-    n_orbitals: int,
+    n_orb: int,
     n_alpha: int,
     n_beta: int,
     *,
@@ -37,7 +38,7 @@ def Slater(
     generalized: bool = False,
     restricted: bool = True,
     use_log_coeffs: bool = True,
-    precision: PrecisionConfig | None = None,
+    precision: RuntimeConfig | None = None,
     param_dtype: Any | None = None,
     kernel_init: Callable | None = None,
 ) -> WavefunctionModel:
@@ -51,7 +52,7 @@ def Slater(
       - Unrestricted: Separate M_α, M_β matrices
   
     Args:
-        n_orbitals: Spatial orbital count
+        n_orb: Spatial orbital count
         n_alpha, n_beta: Electron counts per spin
         seed: Parameter initialization seed
         n_dets: CI expansion terms (1 = single determinant)
@@ -79,7 +80,7 @@ def Slater(
     kernel_init = kernel_init or initializers.orthogonal()
 
     ansatz = SlaterModule(
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
         n_alpha=n_alpha,
         n_beta=n_beta,
         n_dets=n_dets,
@@ -93,18 +94,18 @@ def Slater(
     return make_model(
         module=ansatz,
         seed=seed,
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
         precision_config=precision,
     )
 
-
+@capture_config
 def RBM(
-    n_orbitals: int,
+    n_orb: int,
     *,
     seed: int,
     alpha: float = 1.0,
     use_visible_bias: bool = True,
-    precision: PrecisionConfig | None = None,
+    precision: RuntimeConfig | None = None,
     param_dtype: Any | None = None,
 ) -> WavefunctionModel:
     """
@@ -115,7 +116,7 @@ def RBM(
     partition sum.
   
     Args:
-        n_orbitals: Spatial orbital count (visible = 2N_orb)
+        n_orb: Spatial orbital count (visible = 2N_orb)
         seed: Parameter initialization seed
         alpha: Hidden/visible unit ratio
         use_visible_bias: Enable visible bias terms
@@ -142,17 +143,17 @@ def RBM(
     return make_model(
         module=ansatz,
         seed=seed,
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
         precision_config=precision,
     )
 
-
+@capture_config
 def RBMModPhase(
-    n_orbitals: int,
+    n_orb: int,
     *,
     seed: int,
     alpha: float = 1.0,
-    precision: PrecisionConfig | None = None,
+    precision: RuntimeConfig | None = None,
     param_dtype: Any | None = None,
 ) -> WavefunctionModel:
     """
@@ -162,7 +163,7 @@ def RBMModPhase(
     optimization stability.
   
     Args:
-        n_orbitals: Spatial orbital count
+        n_orb: Spatial orbital count
         seed: Parameter initialization seed
         alpha: Hidden/visible ratio per RBM
         precision: Global precision policy (controls default real dtype)
@@ -185,13 +186,13 @@ def RBMModPhase(
     return make_model(
         module=ansatz,
         seed=seed,
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
         precision_config=precision,
     )
 
-
+@capture_config
 def Backflow(
-    n_orbitals: int,
+    n_orb: int,
     n_alpha: int,
     n_beta: int,
     *,
@@ -200,7 +201,7 @@ def Backflow(
     generalized: bool = False,
     restricted: bool = True,
     hidden_dims: Tuple[int, ...] = (256,),
-    precision: PrecisionConfig | None = None,
+    precision: RuntimeConfig | None = None,
     param_dtype: Any | None = None,
 ) -> WavefunctionModel:
     """
@@ -210,7 +211,7 @@ def Backflow(
     allowing adaptive nodal surfaces for strong correlation.
 
     Args:
-        n_orbitals: Spatial orbital count
+        n_orb: Spatial orbital count
         n_alpha, n_beta: Electron counts per spin
         seed: Parameter initialization seed
         n_dets: Multi-determinant expansion terms
@@ -231,7 +232,7 @@ def Backflow(
             param_dtype = jnp.complex64
 
     ansatz = BackflowMLP(
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
         n_alpha=n_alpha,
         n_beta=n_beta,
         n_dets=n_dets,
@@ -244,16 +245,16 @@ def Backflow(
     return make_model(
         module=ansatz,
         seed=seed,
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
         precision_config=precision,
     )
 
-
+@capture_config
 def Jastrow(
-    n_orbitals: int,
+    n_orb: int,
     *,
     seed: int,
-    precision: PrecisionConfig | None = None,
+    precision: RuntimeConfig | None = None,
     param_dtype: Any | None = None,
 ) -> WavefunctionModel:
     """
@@ -263,7 +264,7 @@ def Jastrow(
     Commonly combined with Slater via Product().
   
     Args:
-        n_orbitals: Spatial orbital count
+        n_orb: Spatial orbital count
         seed: Parameter initialization seed
         precision: Global precision policy (controls default real dtype)
         param_dtype: Optional override for parameter dtype (real)
@@ -281,18 +282,18 @@ def Jastrow(
             param_dtype = jnp.float32
 
     ansatz = JastrowModule(
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
         param_dtype=param_dtype,
     )
 
     return make_model(
         module=ansatz,
         seed=seed,
-        n_orbitals=n_orbitals,
+        n_orb=n_orb,
         precision_config=precision,
     )
 
-
+@capture_config
 def Product(*models: WavefunctionModel) -> ProductModel:
     """
     Compose wavefunctions via logarithmic product.
@@ -307,8 +308,8 @@ def Product(*models: WavefunctionModel) -> ProductModel:
         ProductModel (duck-typed WavefunctionModel)
       
     Example:
-        >>> slater = Slater(n_orbitals=4, n_alpha=2, n_beta=2, seed=42)
-        >>> jastrow = Jastrow(n_orbitals=4, seed=43)
+        >>> slater = Slater(n_orb=4, n_alpha=2, n_beta=2, seed=42)
+        >>> jastrow = Jastrow(n_orb=4, seed=43)
         >>> wf = Product(slater, jastrow)
     """
     return ProductModel(models)

@@ -38,7 +38,7 @@ class Slater(nn.Module):
       - Restricted: Shared spatial orbitals for α/β (RHF-like)
       - Unrestricted: Separate α/β orbital matrices (UHF-like)
     """
-    n_orbitals: int
+    n_orb: int
     n_alpha: int
     n_beta: int
     n_dets: int = 1
@@ -74,18 +74,18 @@ class Slater(nn.Module):
 
         if self.generalized:
             # Spin-orbital formulation: (n_spin_orbitals, n_elec)
-            shape = (*det_prefix, 2 * self.n_orbitals, n_elec)
+            shape = (*det_prefix, 2 * self.n_orb, n_elec)
             return self.param("M_gen", self.kernel_init, shape, self.param_dtype)
         
         if self.restricted:
-            # Shared spatial orbitals: (n_orbitals, max(n_α, n_β))
+            # Shared spatial orbitals: (n_orb, max(n_α, n_β))
             k = max(self.n_alpha, self.n_beta)
-            shape = (*det_prefix, self.n_orbitals, k)
+            shape = (*det_prefix, self.n_orb, k)
             return self.param("M_spatial", self.kernel_init, shape, self.param_dtype)
         
         # Unrestricted: separate α/β matrices
-        shape_a = (*det_prefix, self.n_orbitals, self.n_alpha)
-        shape_b = (*det_prefix, self.n_orbitals, self.n_beta)
+        shape_a = (*det_prefix, self.n_orb, self.n_alpha)
+        shape_b = (*det_prefix, self.n_orb, self.n_beta)
         M_a = self.param("M_alpha", self.kernel_init, shape_a, self.param_dtype)
         M_b = self.param("M_beta", self.kernel_init, shape_b, self.param_dtype)
         return M_a, M_b
@@ -104,8 +104,8 @@ class Slater(nn.Module):
                 rows = jnp.nonzero(s, size=n_elec, fill_value=-1)[0]
                 return rows, None
 
-            α_occ = s[:self.n_orbitals]
-            β_occ = s[self.n_orbitals:]
+            α_occ = s[:self.n_orb]
+            β_occ = s[self.n_orb:]
             rows_α = jnp.nonzero(α_occ, size=self.n_alpha, fill_value=-1)[0]
             rows_β = jnp.nonzero(β_occ, size=self.n_beta, fill_value=-1)[0]
             return rows_α, rows_β

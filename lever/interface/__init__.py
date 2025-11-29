@@ -2,30 +2,33 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Public API interface for PySCF to FCIDUMP/HDF5 export pipeline.
+LEVER Interface Module.
 
-Provides entry points for molecular system construction and data loading
-used by LEVER's variational quantum Monte Carlo engine.
-
-File: lever/interface/__init__.py
-Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: November, 2025
+Tools for generating quantum chemistry calculation inputs (FCIDUMP + JSON metadata).
 """
 
-from __future__ import annotations
-
-from .builder import (
-    MoleculeBuilder,
-    ExportedSystem,
-    read_from_hdf5,
+from .metadata import (
+    SystemMeta,
+    MoleculeInfo, 
+    SCFConfig, 
+    OrbitalConfig,
+    BenchmarkItem,
+    AtomMeta,
     load_initial_det,
-    load_benchmarks,
+    load_benchmarks
 )
 
+from .builder import export_system, MoleculeBuilder
+
 __all__ = [
-    "MoleculeBuilder",
-    "ExportedSystem", 
-    "read_from_hdf5",
+    "export_system",
+    "MoleculeBuilder", 
+    "SystemMeta",
+    "MoleculeInfo",
+    "SCFConfig",
+    "OrbitalConfig", 
+    "BenchmarkItem",
+    "AtomMeta",
     "load_initial_det",
-    "load_benchmarks",
+    "load_benchmarks"
 ]

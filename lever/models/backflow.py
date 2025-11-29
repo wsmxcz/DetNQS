@@ -47,7 +47,7 @@ class BackflowMLP(nn.Module):
     Maintains numerical stability through controlled variance scaling.
     
     Attributes:
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         n_alpha, n_beta: Spin-up/down electron counts
         n_dets: Number of determinants in expansion
         generalized: Use unified spin-orbital matrix
@@ -58,7 +58,7 @@ class BackflowMLP(nn.Module):
         kernel_init, bias_init: Weight initializers
     """
 
-    n_orbitals: int
+    n_orb: int
     n_alpha: int
     n_beta: int
     n_dets: int = 1
@@ -146,17 +146,17 @@ class BackflowMLP(nn.Module):
         det_shape = (self.n_dets,) if is_multi else ()
 
         if self.generalized:
-            shape = (*det_shape, 2 * self.n_orbitals, n_e)
+            shape = (*det_shape, 2 * self.n_orb, n_e)
             return self.param("M_gen", c_orthogonal_init, shape, self.param_dtype)
 
         if self.restricted:
             k = max(self.n_alpha, self.n_beta)
-            shape = (*det_shape, self.n_orbitals, k)
+            shape = (*det_shape, self.n_orb, k)
             return self.param("M_spatial", c_orthogonal_init, shape, self.param_dtype)
 
         # Unrestricted: separate α/β orbital spaces
-        shape_α = (*det_shape, self.n_orbitals, self.n_alpha)
-        shape_β = (*det_shape, self.n_orbitals, self.n_beta)
+        shape_α = (*det_shape, self.n_orb, self.n_alpha)
+        shape_β = (*det_shape, self.n_orb, self.n_beta)
         M_α = self.param("M_alpha", c_orthogonal_init, shape_α, self.param_dtype)
         M_β = self.param("M_beta", c_orthogonal_init, shape_β, self.param_dtype)
         return M_α, M_β
@@ -176,8 +176,8 @@ class BackflowMLP(nn.Module):
                 rows = jnp.nonzero(s, size=n_e, fill_value=-1)[0]
                 return rows, None
 
-            α_occ = s[: self.n_orbitals]
-            β_occ = s[self.n_orbitals:]
+            α_occ = s[: self.n_orb]
+            β_occ = s[self.n_orb:]
             rows_α = jnp.nonzero(α_occ, size=self.n_alpha, fill_value=-1)[0]
             rows_β = jnp.nonzero(β_occ, size=self.n_beta, fill_value=-1)[0]
             return rows_α, rows_β
@@ -187,9 +187,9 @@ class BackflowMLP(nn.Module):
                 rows_α, rows_β = _extract_indices(s)
 
                 if self.generalized:
-                    out_dim = (2 * self.n_orbitals) * n_e
+                    out_dim = (2 * self.n_orb) * n_e
                     Δ = self._mlp("BF_gen", out_dim, s).reshape(
-                        (2 * self.n_orbitals, n_e)
+                        (2 * self.n_orb, n_e)
                     )
                     M_eff = orbitals + Δ
                     rows = rows_α
@@ -197,9 +197,9 @@ class BackflowMLP(nn.Module):
 
                 if self.restricted:
                     k = max(self.n_alpha, self.n_beta)
-                    out_dim = self.n_orbitals * k
+                    out_dim = self.n_orb * k
                     Δ = self._mlp("BF_res", out_dim, s).reshape(
-                        (self.n_orbitals, k)
+                        (self.n_orb, k)
                     )
                     M_eff = orbitals + Δ
                     A_α = M_eff[rows_α, : self.n_alpha]
@@ -208,9 +208,9 @@ class BackflowMLP(nn.Module):
 
                 # Unrestricted
                 M_α_base, M_β_base = orbitals
-                out_dim = self.n_orbitals * (self.n_alpha + self.n_beta)
+                out_dim = self.n_orb * (self.n_alpha + self.n_beta)
                 Δ = self._mlp("BF_unres", out_dim, s).reshape(
-                    (self.n_orbitals, self.n_alpha + self.n_beta)
+                    (self.n_orb, self.n_alpha + self.n_beta)
                 )
                 Δ_α = Δ[:, : self.n_alpha]
                 Δ_β = Δ[:, self.n_alpha :]
@@ -225,10 +225,10 @@ class BackflowMLP(nn.Module):
             rows_α, rows_β = _extract_indices(s)
 
             if self.generalized:
-                out_dim_per_det = (2 * self.n_orbitals) * n_e
+                out_dim_per_det = (2 * self.n_orb) * n_e
                 total_dim = self.n_dets * out_dim_per_det
                 Δ_flat = self._mlp("BF_gen", total_dim, s)
-                Δ = Δ_flat.reshape(self.n_dets, 2 * self.n_orbitals, n_e)
+                Δ = Δ_flat.reshape(self.n_dets, 2 * self.n_orb, n_e)
                 M_eff = orbitals + Δ
                 rows = rows_α
                 A = M_eff[:, rows, :]
@@ -236,10 +236,10 @@ class BackflowMLP(nn.Module):
 
             if self.restricted:
                 k = max(self.n_alpha, self.n_beta)
-                out_dim_per_det = self.n_orbitals * k
+                out_dim_per_det = self.n_orb * k
                 total_dim = self.n_dets * out_dim_per_det
                 Δ_flat = self._mlp("BF_res", total_dim, s)
-                Δ = Δ_flat.reshape(self.n_dets, self.n_orbitals, k)
+                Δ = Δ_flat.reshape(self.n_dets, self.n_orb, k)
                 M_eff = orbitals + Δ
                 A_α = M_eff[:, rows_α, : self.n_alpha]
                 A_β = M_eff[:, rows_β, : self.n_beta]
@@ -247,10 +247,10 @@ class BackflowMLP(nn.Module):
 
             # Unrestricted multi-determinant
             M_α_base, M_β_base = orbitals
-            out_dim_per_det = self.n_orbitals * (self.n_alpha + self.n_beta)
+            out_dim_per_det = self.n_orb * (self.n_alpha + self.n_beta)
             total_dim = self.n_dets * out_dim_per_det
             Δ_flat = self._mlp("BF_unres", total_dim, s)
-            Δ = Δ_flat.reshape(self.n_dets, self.n_orbitals, self.n_alpha + self.n_beta)
+            Δ = Δ_flat.reshape(self.n_dets, self.n_orb, self.n_alpha + self.n_beta)
             Δ_α = Δ[:, :, : self.n_alpha]
             Δ_β = Δ[:, :, self.n_alpha :]
             A_α = (M_α_base + Δ_α)[:, rows_α, :]
@@ -394,7 +394,7 @@ class cBackflowMLP(nn.Module):
     Uses Rayleigh-uniform initialization for proper complex statistics.
     
     Attributes:
-        n_orbitals: Number of spatial orbitals
+        n_orb: Number of spatial orbitals
         n_alpha, n_beta: Spin-up/down electron counts
         n_dets: Number of determinants in expansion
         generalized: Use unified spin-orbital matrix
@@ -406,7 +406,7 @@ class cBackflowMLP(nn.Module):
         logdet_jitter: Diagonal regularization for stability
     """
 
-    n_orbitals: int
+    n_orb: int
     n_alpha: int
     n_beta: int
     n_dets: int = 1
@@ -475,17 +475,17 @@ class cBackflowMLP(nn.Module):
         det_shape = (self.n_dets,) if is_multi else ()
 
         if self.generalized:
-            shape = (*det_shape, 2 * self.n_orbitals, n_e)
+            shape = (*det_shape, 2 * self.n_orb, n_e)
             return self.param("M_gen", c_orthogonal_init, shape, self.param_dtype)
 
         if self.restricted:
             k = max(self.n_alpha, self.n_beta)
-            shape = (*det_shape, self.n_orbitals, k)
+            shape = (*det_shape, self.n_orb, k)
             return self.param("M_spatial", c_orthogonal_init, shape, self.param_dtype)
 
         # Unrestricted: separate α/β orbital spaces
-        shape_α = (*det_shape, self.n_orbitals, self.n_alpha)
-        shape_β = (*det_shape, self.n_orbitals, self.n_beta)
+        shape_α = (*det_shape, self.n_orb, self.n_alpha)
+        shape_β = (*det_shape, self.n_orb, self.n_beta)
         M_α = self.param("M_alpha", c_orthogonal_init, shape_α, self.param_dtype)
         M_β = self.param("M_beta", c_orthogonal_init, shape_β, self.param_dtype)
         return M_α, M_β
@@ -505,8 +505,8 @@ class cBackflowMLP(nn.Module):
                 rows = jnp.nonzero(s, size=n_e, fill_value=0)[0]
                 return rows, None
 
-            α_occ = s[: self.n_orbitals]
-            β_occ = s[self.n_orbitals :]
+            α_occ = s[: self.n_orb]
+            β_occ = s[self.n_orb :]
             rows_α = jnp.nonzero(α_occ, size=self.n_alpha, fill_value=0)[0]
             rows_β = jnp.nonzero(β_occ, size=self.n_beta, fill_value=0)[0]
             return rows_α, rows_β
@@ -516,9 +516,9 @@ class cBackflowMLP(nn.Module):
                 rows_α, rows_β = _extract_indices(s)
 
                 if self.generalized:
-                    out_dim = (2 * self.n_orbitals) * n_e
+                    out_dim = (2 * self.n_orb) * n_e
                     Δ = self._mlp("BF_gen", out_dim, s).reshape(
-                        (2 * self.n_orbitals, n_e)
+                        (2 * self.n_orb, n_e)
                     )
                     M_eff = orbitals + Δ
                     rows = rows_α
@@ -526,9 +526,9 @@ class cBackflowMLP(nn.Module):
 
                 if self.restricted:
                     k = max(self.n_alpha, self.n_beta)
-                    out_dim = self.n_orbitals * k
+                    out_dim = self.n_orb * k
                     Δ = self._mlp("BF_res", out_dim, s).reshape(
-                        (self.n_orbitals, k)
+                        (self.n_orb, k)
                     )
                     M_eff = orbitals + Δ
                     A_α = M_eff[rows_α, : self.n_alpha]
@@ -537,9 +537,9 @@ class cBackflowMLP(nn.Module):
 
                 # Unrestricted
                 M_α_base, M_β_base = orbitals
-                out_dim = self.n_orbitals * (self.n_alpha + self.n_beta)
+                out_dim = self.n_orb * (self.n_alpha + self.n_beta)
                 Δ = self._mlp("BF_unres", out_dim, s).reshape(
-                    (self.n_orbitals, self.n_alpha + self.n_beta)
+                    (self.n_orb, self.n_alpha + self.n_beta)
                 )
                 Δ_α = Δ[:, : self.n_alpha]
                 Δ_β = Δ[:, self.n_alpha :]
@@ -554,10 +554,10 @@ class cBackflowMLP(nn.Module):
             rows_α, rows_β = _extract_indices(s)
 
             if self.generalized:
-                out_dim_per_det = (2 * self.n_orbitals) * n_e
+                out_dim_per_det = (2 * self.n_orb) * n_e
                 total_dim = self.n_dets * out_dim_per_det
                 Δ_flat = self._mlp("BF_gen", total_dim, s)
-                Δ = Δ_flat.reshape(self.n_dets, 2 * self.n_orbitals, n_e)
+                Δ = Δ_flat.reshape(self.n_dets, 2 * self.n_orb, n_e)
                 M_eff = orbitals + Δ
                 rows = rows_α
                 A = M_eff[:, rows, :]
@@ -565,10 +565,10 @@ class cBackflowMLP(nn.Module):
 
             if self.restricted:
                 k = max(self.n_alpha, self.n_beta)
-                out_dim_per_det = self.n_orbitals * k
+                out_dim_per_det = self.n_orb * k
                 total_dim = self.n_dets * out_dim_per_det
                 Δ_flat = self._mlp("BF_res", total_dim, s)
-                Δ = Δ_flat.reshape(self.n_dets, self.n_orbitals, k)
+                Δ = Δ_flat.reshape(self.n_dets, self.n_orb, k)
                 M_eff = orbitals + Δ
                 A_α = M_eff[:, rows_α, : self.n_alpha]
                 A_β = M_eff[:, rows_β, : self.n_beta]
@@ -576,10 +576,10 @@ class cBackflowMLP(nn.Module):
 
             # Unrestricted multi-determinant
             M_α_base, M_β_base = orbitals
-            out_dim_per_det = self.n_orbitals * (self.n_alpha + self.n_beta)
+            out_dim_per_det = self.n_orb * (self.n_alpha + self.n_beta)
             total_dim = self.n_dets * out_dim_per_det
             Δ_flat = self._mlp("BF_unres", total_dim, s)
-            Δ = Δ_flat.reshape(self.n_dets, self.n_orbitals, self.n_alpha + self.n_beta)
+            Δ = Δ_flat.reshape(self.n_dets, self.n_orb, self.n_alpha + self.n_beta)
             Δ_α = Δ[:, :, : self.n_alpha]
             Δ_β = Δ[:, :, self.n_alpha :]
             A_α = (M_α_base + Δ_α)[:, rows_α, :]

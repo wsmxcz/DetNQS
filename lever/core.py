@@ -24,6 +24,9 @@ gen_fci_dets = _lever_cpp.gen_fci_dets
 gen_excited_dets = _lever_cpp.gen_excited_dets
 """Generate single and double excitations from reference determinants."""
 
+gen_complement_dets = _lever_cpp.gen_complement_dets
+"""Generate complement space from reference determinants."""
+
 # --- Hamiltonian Construction ---
 
 get_ham_diag = _lever_cpp.get_ham_diag
@@ -43,12 +46,6 @@ get_ham_conn_amp = _lever_cpp.get_ham_conn_amp
 
 get_ham_eff = _lever_cpp.get_ham_eff
 """Assemble effective Hamiltonian via perturbative correction."""
-
-get_local_conn = _lever_cpp.get_local_conn
-"""Build local Hamiltonian row for a single determinant."""
-
-get_local_connections = _lever_cpp.get_local_connections
-"""Build local Hamiltonian connections for a batch of determinants (CSR-like)."""
 
 compute_variational_energy = _lever_cpp.compute_variational_energy
 """Compute <Psi|H|Psi> and <Psi|Psi> on a fixed determinant basis."""

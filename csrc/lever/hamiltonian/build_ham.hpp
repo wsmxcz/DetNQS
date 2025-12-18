@@ -7,14 +7,14 @@
  *
  * Construction policies:
  *  - KnownSets:  Pre-defined S and C spaces
- *  - StaticHB:   Heat-bath screening with fixed ε₁ cutoff
+ *  - StaticHB:   Heat-Bath screening with fixed ε₁ cutoff
  *  - DynamicAmp: Amplitude-weighted screening τᵢ = ε₁/|ψ_S[i]|
  *
  * Output: Deterministic sorted COO with merged duplicates.
  * Threading: OpenMP parallelism with thread-local sinks.
  *
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: January, 2025
+ * Date: December, 2025
  */
 
 #pragma once
@@ -77,19 +77,19 @@ namespace lever {
 );
 
 /**
- * Build H_SS and discover C via static Heat-bath screening.
+ * Build H_SS and discover C via static Heat-Bath screening.
  *
  * Policy: StaticHB
- *  - Doubles: Keep if |⟨ij||ab⟩| ≥ ε₁ via Heat-bath table
- *  - Singles: Post-evaluate and filter
+ *  - Doubles: Keep if |⟨ij||ab⟩| ≥ ε₁ via Heat-Bath table
+ *  - Singles: Post-evaluate and keep above numerical threshold
  *  - C determinants indexed lexicographically
  *
  * @param dets_S       S determinants
  * @param ham          Hamiltonian evaluator
  * @param n_orb        Number of spatial orbitals
- * @param hb_table     Heat-bath table (required if use_heatbath=true)
- * @param eps1         Heat-bath cutoff threshold
- * @param use_heatbath Enable Heat-bath pruning
+ * @param hb_table     Heat-Bath table (required if use_heatbath=true)
+ * @param eps1         Heat-Bath cutoff threshold
+ * @param use_heatbath Enable Heat-Bath pruning
  * @return HamBlocks{H_SS, H_SC, C_index_map}
  */
 [[nodiscard]] HamBlocks get_ham_conn(
@@ -113,7 +113,7 @@ namespace lever {
  * @param psi_S    Amplitudes aligned with dets_S
  * @param ham      Hamiltonian evaluator
  * @param n_orb    Number of spatial orbitals
- * @param hb_table Heat-bath table (required)
+ * @param hb_table Heat-Bath table (required)
  * @param eps1     Amplitude criterion threshold
  * @return HamBlocks{H_SS, H_SC, C_index_map}
  */

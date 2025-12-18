@@ -270,59 +270,6 @@ def get_ham_eff(
         Assembled H_eff in COO format
     """
     ...
-
-def get_local_conn(
-    det: npt.NDArray[np.uint64],  # shape (2,)
-    int_ctx: IntCtx,
-    n_orb: int,
-    use_heatbath: bool = False,
-    eps1: float = 1e-6,
-) -> LocalConnRow:
-    """
-    Build local Hamiltonian row for a single determinant.
-
-    Args:
-        det: Single determinant bitstring [alpha_bits, beta_bits], shape (2,)
-        int_ctx: Integral context
-        n_orb: Number of spatial orbitals
-        use_heatbath: Enable Heat-Bath screening for excitations
-        eps1: Screening threshold
-
-    Returns:
-        Dict with:
-            'dets': connected determinants, shape (M, 2)
-            'values': H matrix elements, shape (M,)
-    """
-    ...
-
-
-def get_local_connections(
-    dets: DetArray,
-    int_ctx: IntCtx,
-    n_orb: int,
-    use_heatbath: bool = False,
-    eps1: float = 1e-6,
-) -> LocalConnBatch:
-    """
-    Build local Hamiltonian connectivity for a batch of determinants.
-
-    Uses the same screening policy as `get_local_conn`, but returns a
-    CSR-like structure suitable for batched local energy evaluation.
-
-    Args:
-        dets: Bra determinants, shape (N, 2)
-        int_ctx: Integral context
-        n_orb: Number of spatial orbitals
-        use_heatbath: Enable Heat-Bath screening
-        eps1: Screening threshold
-
-    Returns:
-        Dict with:
-            'offsets': int32[N+1] CSR row offsets
-            'dets': uint64[M, 2] concatenated ket determinants
-            'values': float64[M]  matrix elements per CSR entry
-    """
-    ...
     
 def compute_variational_energy(
     dets: DetArray,
@@ -370,7 +317,5 @@ __all__ = [
     "get_ham_conn",
     "get_ham_conn_amp",
     "get_ham_eff",
-    "get_local_conn",
-    "get_local_connections",
     "compute_variational_energy",
 ]

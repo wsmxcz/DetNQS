@@ -3,18 +3,22 @@
 
 /**
  * @file ham_utils.hpp
- * @brief Sparse matrix utilities (COO/CSC/CSR) for Hamiltonian assembly.
+ * @brief Sparse matrix utilities and shared Hamiltonian helpers.
  *
- * Provides coordinate (COO), compressed sparse column (CSC), and compressed
- * sparse row (CSR) formats with conversion, merge, and arithmetic operations.
- *
- * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: November, 2025
+ * This header provides:
+ *   - Numerical thresholds used by Hamiltonian builders
+ *   - Sparse matrix formats (COO/CSR/CSC) and operations
+ *   - HamBlocks container for H_SS / H_SC + C-space map
+ *   - Common determinant/SO utilities for Heat-Bath screening
+ *   - Screened complement generator for ASCI-style selection
  */
 
 #pragma once
 
 #include <lever/determinant/det_space.hpp>
+#include <lever/utils/bit_utils.hpp>
+#include <lever/integral/hb_table.hpp>
+
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -35,6 +39,23 @@ inline constexpr double HEATBATH_THRESH = 1e-15;
 
 /** Micro contribution filter: skip terms with negligible impact */
 inline constexpr double MICRO_CONTRIB_THRESH = 1e-12;
+
+// ============================================================================
+// Screening mode
+// ============================================================================
+
+/**
+ * Screening strategy for connectivity and complement generation.
+ *
+ * None   : pure combinatorial (no integral-based pruning)
+ * Static : fixed ε₁ cutoff on integrals (Heat-Bath doubles)
+ * Dynamic: amplitude-weighted cutoff based on ψ_S
+ */
+enum class ScreenMode : std::uint8_t {
+    None,
+    Static,
+    Dynamic
+};
 
 // ============================================================================
 // Sparse Matrix Formats
@@ -148,8 +169,6 @@ struct HamBlocks {
 /**
  * Canonicalize COO matrix: sort by (row, col), merge duplicates, drop zeros.
  *
- * Algorithm: Indirect sort via index permutation, then single-pass merge.
- *
  * @param coo  Input/output matrix
  * @return     Maximum absolute value: max_ij |H_ij|
  */
@@ -157,8 +176,6 @@ struct HamBlocks {
 
 /**
  * Matrix addition C = A + B for sorted COO matrices.
- *
- * Algorithm: Two-pointer merge (O(nnz_A + nnz_B) time).
  *
  * @param A      First matrix (sorted)
  * @param B      Second matrix (sorted)
@@ -196,8 +213,6 @@ struct HamBlocks {
 /**
  * Convert COO to CSC format.
  *
- * Algorithm: Bucket sort by column, then per-column merge of duplicates.
- *
  * @param coo     Input COO matrix
  * @param n_rows  Number of rows
  * @param n_cols  Number of columns
@@ -211,8 +226,6 @@ struct HamBlocks {
 
 /**
  * Convert COO to CSR format.
- *
- * Algorithm: Bucket sort by row, then per-row merge of duplicates.
  *
  * @param coo     Input COO matrix
  * @param n_rows  Number of rows
@@ -236,18 +249,115 @@ struct HamBlocks {
 /**
  * CSR matrix addition: C = A + B (same shape).
  *
- * Algorithm: Row-wise two-pointer merge with two-pass (count + write).
- *
  * @param A      First matrix
  * @param B      Second matrix
  * @param thresh Drop elements with |val| ≤ thresh
  * @return       Sum matrix in CSR format
- * @throws       std::invalid_argument if shapes mismatch
  */
 [[nodiscard]] CSRMatrix csr_add(
     const CSRMatrix& A,
     const CSRMatrix& B,
     double thresh = 0.0
+);
+
+// ============================================================================
+// Determinant / SO helpers (shared by Hamiltonian code)
+// ============================================================================
+
+/**
+ * Return occupied spin-orbitals of a determinant.
+ * α: 2p, β: 2p+1. Order is deterministic (increasing index).
+ */
+[[nodiscard]] std::vector<int> get_occ_so(const Det& d);
+
+/**
+ * Check if a spin-orbital index is occupied in a determinant.
+ * Out-of-range SO indices are treated as occupied to guard boundaries.
+ */
+[[nodiscard]] bool is_occ_so(const Det& d, int so_idx, int n_orb);
+
+/**
+ * Apply a double excitation i,j → a,b in spin-orbital representation.
+ */
+[[nodiscard]] Det exc2_so(
+    const Det& ket,
+    int i_so,
+    int j_so,
+    int a_so,
+    int b_so
+);
+
+/**
+ * Heuristic capacity estimate for connections from one determinant.
+ */
+[[nodiscard]] size_t est_conn_cap(int n_orb);
+
+/**
+ * Heat-Bath double excitations for a single determinant.
+ *
+ * For each occupied pair (i,j) and each integral row with
+ * |⟨ij||ab⟩| ≥ cutoff, generates the excited determinant if a,b are virtual.
+ */
+template <class Visitor>
+inline void for_each_double_hb(
+    const Det& bra,
+    int n_orb,
+    const HeatBathTable& hb,
+    double cutoff,
+    Visitor&& visit
+) {
+    auto occ = get_occ_so(bra);
+    const size_t n = occ.size();
+    if (n < 2) return;
+
+    for (size_t p = 1; p < n; ++p) {
+        const int i_so = occ[p];
+        for (size_t q = 0; q < p; ++q) {
+            const int j_so = occ[q];
+
+            auto row = hb.row_view(i_so, j_so).with_cutoff(cutoff);
+            for (size_t k = 0; k < row.len; ++k) {
+                const int a_so = row.a[k];
+                const int b_so = row.b[k];
+
+                if (is_occ_so(bra, a_so, n_orb) ||
+                    is_occ_so(bra, b_so, n_orb)) {
+                    continue;
+                }
+
+                std::forward<Visitor>(visit)(
+                    exc2_so(bra, i_so, j_so, a_so, b_so)
+                );
+            }
+        }
+    }
+}
+
+// Forward declaration; full definition is in ham_eval.hpp.
+class HamEval;
+
+/**
+ * Screened complement:
+ *   C = (S_1 ∪ S_2) \ exclude
+ *
+ * where S_1, S_2 are singles/doubles from S, subject to screening:
+ *   - ScreenMode::None:
+ *       fallback to det_space::generate_complement (no integrals)
+ *   - ScreenMode::Static:
+ *       doubles via Heat-Bath with fixed ε₁; singles kept if |H_ik| > thresh
+ *   - ScreenMode::Dynamic:
+ *       doubles with τ_i = ε₁ / max(|ψ_S[i]|, δ);
+ *       singles kept if |H_ik * ψ_S[i]| ≥ ε₁
+ */
+[[nodiscard]] std::vector<Det> generate_complement_screened(
+    std::span<const Det> S,
+    int n_orb,
+    const DetMap& exclude,
+    const HamEval& ham,
+    const HeatBathTable* hb_table,
+    ScreenMode mode,
+    std::span<const double> psi_S = {},
+    double eps1 = 1e-6
 );
 
 } // namespace lever

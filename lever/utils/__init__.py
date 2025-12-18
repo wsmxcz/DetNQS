@@ -19,13 +19,6 @@ from .jax_utils import (
     tree_scale,
     tree_sub,
 )
-from .space_utils import (
-    count_overlaps,
-    get_space_overlap,
-    merge_spaces,
-    remove_overlaps,
-)
-
 __all__ = [
     # JAX utilities
     "tree_dot",
@@ -33,11 +26,4 @@ __all__ = [
     "tree_add",
     "tree_sub",
     "tree_norm",
-    
-    # Space operations
-    "remove_overlaps",
-    "merge_spaces",
-    "get_space_overlap",
-    "count_overlaps",
-    
 ]

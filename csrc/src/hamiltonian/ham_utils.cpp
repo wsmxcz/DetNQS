@@ -3,17 +3,18 @@
 
 /**
  * @file ham_utils.cpp
- * @brief Implementation of sparse matrix operations and format conversions.
- *
- * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: November, 2025
+ * @brief Implementation of sparse matrix operations and shared helpers.
  */
 
 #include <lever/hamiltonian/ham_utils.hpp>
+#include <lever/hamiltonian/ham_eval.hpp>
+#include <lever/determinant/det_ops.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace lever {
 
@@ -58,7 +59,6 @@ double sort_and_merge_coo(COOMatrix& coo) {
             ++i;
         }
 
-        // Drop zeros, track maximum
         const double abs_val = std::abs(val);
         if (abs_val > 0.0) {
             max_abs = std::max(max_abs, abs_val);
@@ -86,19 +86,16 @@ COOMatrix coo_add(const COOMatrix& A, const COOMatrix& B, double thresh) {
         const u32 rb = B.rows[j], cb = B.cols[j];
 
         if (ra < rb || (ra == rb && ca < cb)) {
-            // A entry comes first
             if (std::abs(A.vals[i]) > thresh) {
                 C.push_back(ra, ca, A.vals[i]);
             }
             ++i;
         } else if (rb < ra || (rb == ra && cb < ca)) {
-            // B entry comes first
             if (std::abs(B.vals[j]) > thresh) {
                 C.push_back(rb, cb, B.vals[j]);
             }
             ++j;
         } else {
-            // Same position: merge
             const double val = A.vals[i] + B.vals[j];
             if (std::abs(val) > thresh) {
                 C.push_back(ra, ca, val);
@@ -108,7 +105,6 @@ COOMatrix coo_add(const COOMatrix& A, const COOMatrix& B, double thresh) {
         }
     }
 
-    // Exhaust remaining entries
     while (i < m) {
         if (std::abs(A.vals[i]) > thresh) {
             C.push_back(A.rows[i], A.cols[i], A.vals[i]);
@@ -139,7 +135,7 @@ COOMatrix mirror_upper_to_full(const COOMatrix& upper) {
 
         full.push_back(i, j, v);
         if (i != j) {
-            full.push_back(j, i, v);  // Mirror to lower triangle
+            full.push_back(j, i, v);
         }
     }
 
@@ -173,7 +169,6 @@ CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
         buckets[c].emplace_back(coo.rows[k], coo.vals[k]);
     }
 
-    // Sort each column and merge duplicates
     size_t nnz = 0;
     for (u32 j = 0; j < n_cols; ++j) {
         auto& bucket = buckets[j];
@@ -186,7 +181,6 @@ CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
             return a.first < b.first;
         });
 
-        // Merge duplicates in sorted bucket
         u32 last_row = bucket[0].first;
         double acc = bucket[0].second;
 
@@ -204,7 +198,6 @@ CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
             }
         }
 
-        // Flush final entry
         if (acc != 0.0) {
             csc.row_indices.push_back(last_row);
             csc.values.push_back(acc);
@@ -235,7 +228,6 @@ CSRMatrix coo_to_csr(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
         buckets[r].emplace_back(coo.cols[k], coo.vals[k]);
     }
 
-    // Sort each row and merge duplicates
     size_t nnz = 0;
     for (u32 i = 0; i < n_rows; ++i) {
         auto& bucket = buckets[i];
@@ -248,7 +240,6 @@ CSRMatrix coo_to_csr(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
             return a.first < b.first;
         });
 
-        // Merge duplicates in sorted bucket
         u32 last_col = bucket[0].first;
         double acc = bucket[0].second;
 
@@ -266,7 +257,6 @@ CSRMatrix coo_to_csr(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
             }
         }
 
-        // Flush final entry
         if (acc != 0.0) {
             csr.col_indices.push_back(last_col);
             csr.values.push_back(acc);
@@ -308,7 +298,6 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     C.row_ptrs.resize(C.n_rows + 1);
     C.row_ptrs[0] = 0;
 
-    // First pass: count non-zeros per row
     size_t total_nnz = 0;
     for (u32 i = 0; i < C.n_rows; ++i) {
         size_t row_nnz = 0;
@@ -350,7 +339,6 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     C.col_indices.resize(total_nnz);
     C.values.resize(total_nnz);
 
-    // Second pass: write merged entries
     for (u32 i = 0; i < C.n_rows; ++i) {
         size_t write_pos = C.row_ptrs[i];
 
@@ -411,6 +399,154 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     }
 
     return C;
+}
+
+// ============================================================================
+// Determinant / SO helpers
+// ============================================================================
+
+std::vector<int> get_occ_so(const Det& d) {
+    std::vector<int> occ;
+    occ.reserve(popcount(d.alpha) + popcount(d.beta));
+
+    for (u64 am = d.alpha; am; am = clear_lsb(am)) {
+        occ.push_back(so_from_mo(ctz(am), 0));
+    }
+    for (u64 bm = d.beta; bm; bm = clear_lsb(bm)) {
+        occ.push_back(so_from_mo(ctz(bm), 1));
+    }
+
+    return occ;
+}
+
+bool is_occ_so(const Det& d, int so_idx, int n_orb) {
+    const int mo = mo_from_so(so_idx);
+    if (mo < 0 || mo >= n_orb) return true;
+
+    const u64 bit = (1ULL << mo);
+    if (spin_from_so(so_idx) == 0) {
+        return (d.alpha & bit) != 0;
+    }
+    return (d.beta & bit) != 0;
+}
+
+Det exc2_so(const Det& ket, int i_so, int j_so, int a_so, int b_so) {
+    Det out = ket;
+
+    auto flip = [&](int so, bool set_bit) {
+        const int mo = mo_from_so(so);
+        const int sp = spin_from_so(so);
+        const u64 bit = (1ULL << mo);
+
+        u64& mask = (sp == 0) ? out.alpha : out.beta;
+        if (set_bit) {
+            mask |= bit;
+        } else {
+            mask &= ~bit;
+        }
+    };
+
+    flip(i_so, false);
+    flip(j_so, false);
+    flip(a_so, true);
+    flip(b_so, true);
+
+    return out;
+}
+
+size_t est_conn_cap(int n_orb) {
+    // 1 diagonal + O(n_orb) singles + ~10% of n_orb^2 doubles
+    if (n_orb <= 0) return 1;
+    const size_t n = static_cast<size_t>(n_orb);
+    return static_cast<size_t>(1 + 2 * n + (n * n) / 10);
+}
+
+// ============================================================================
+// Screened complement
+// ============================================================================
+
+std::vector<Det> generate_complement_screened(
+    std::span<const Det> S,
+    int n_orb,
+    const DetMap& exclude,
+    const HamEval& ham,
+    const HeatBathTable* hb_table,
+    ScreenMode mode,
+    std::span<const double> psi_S,
+    double eps1
+) {
+    if (S.empty()) return {};
+
+    // No screening: defer to pure combinatorial generator.
+    if (mode == ScreenMode::None) {
+        return det_space::generate_complement(S, n_orb, exclude, true);
+    }
+
+    if (!hb_table) {
+        throw std::invalid_argument(
+            "generate_complement_screened: Heat-Bath table is required "
+            "for screened modes"
+        );
+    }
+
+    if (mode == ScreenMode::Dynamic && psi_S.size() != S.size()) {
+        throw std::invalid_argument(
+            "generate_complement_screened: psi_S size must match |S| "
+            "for dynamic screening"
+        );
+    }
+
+    std::unordered_set<Det> uniq;
+    uniq.reserve(S.size() * 16);
+
+    const double num_thresh = MAT_ELEMENT_THRESH;
+    const double delta = 1e-12;
+
+    const size_t n_S = S.size();
+    for (size_t i = 0; i < n_S; ++i) {
+        const Det& bra = S[i];
+
+        // --- Singles ---
+        det_ops::for_each_single(bra, n_orb, [&](const Det& ket) {
+            if (exclude.contains(ket)) return;
+
+            const double h = ham.compute_elem(bra, ket);
+            if (std::abs(h) <= num_thresh) return;
+
+            if (mode == ScreenMode::Dynamic) {
+                const double c = psi_S[i];
+                const double w = std::abs(h * c);
+                if (w < eps1) return;
+            }
+            // Static mode keeps all singles above numerical threshold.
+            uniq.insert(ket);
+        });
+
+        // --- Doubles (Heat-Bath) ---
+        double cutoff = eps1;
+        if (mode == ScreenMode::Dynamic) {
+            const double amp = std::max(std::abs(psi_S[i]), delta);
+            cutoff = eps1 / amp;
+        }
+
+        for_each_double_hb(
+            bra,
+            n_orb,
+            *hb_table,
+            cutoff,
+            [&](const Det& ket) {
+                if (exclude.contains(ket)) return;
+                uniq.insert(ket);
+            }
+        );
+    }
+
+    std::vector<Det> out;
+    out.reserve(uniq.size());
+    for (const auto& d : uniq) {
+        out.push_back(d);
+    }
+    return det_space::canonicalize(std::move(out));
 }
 
 } // namespace lever

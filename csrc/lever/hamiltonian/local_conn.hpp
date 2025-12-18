@@ -3,13 +3,13 @@
 
 /**
  * @file local_conn.hpp
- * @brief Local Hamiltonian connectivity generators and streaming energy evaluation.
+ * @brief Local Hamiltonian connectivity and variational energy computation.
  *
- * Provides tools to generate Hamiltonian rows on-the-fly and compute
- * variational energies without full matrix construction.
+ * Computes ⟨D|H|D'⟩ rows for individual determinants or batches.
+ * Supports Heat-Bath screening: |⟨ij||ab⟩| ≥ ε₁.
  *
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: November, 2025
+ * Date: December, 2025
  */
 
 #pragma once
@@ -24,43 +24,38 @@
 
 namespace lever {
 
-/**
- * Connectivity row for a single determinant |bra⟩.
- * Contains list of connected |ket⟩ and matrix elements H_bra,ket.
- */
+/** Connectivity row for a single determinant. */
 struct LocalConnRow {
     std::vector<Det> dets;
     std::vector<double> values;
 };
 
-/**
- * Batch connectivity in CSR-like format (offsets, flat arrays).
- */
+/** Batch connectivity in CSR-like format. */
 struct LocalConnBatch {
     std::vector<int> offsets;
     std::vector<Det> dets;
     std::vector<double> values;
 };
 
-/**
- * Result of exact variational energy calculation.
- */
+/** Result of ⟨Ψ|H|Ψ⟩. */
 struct VariationalResult {
-    double e_el;  ///< Electronic energy <Psi|H|Psi>
-    double norm;  ///< Squared norm <Psi|Psi>
+    double e_el;
+    double norm;
 };
 
-// ─── Connectivity Generators ──────────────────────────────────────────
-
 /**
- * Generate Hamiltonian row for a single determinant.
+ * Compute Hamiltonian row for a single determinant.
  *
- * @param bra           Reference determinant
- * @param ham           Hamiltonian evaluator
- * @param n_orb         Number of orbitals
- * @param hb_table      Heat-bath table (optional)
- * @param eps1          Screening threshold
- * @param use_heatbath  Enable HB screening for doubles
+ * Enumerates diagonal, singles, and doubles connections.
+ * Doubles screening: |⟨ij||ab⟩| ≥ ε₁ via Heat-Bath table.
+ *
+ * @param bra Determinant for row index
+ * @param ham Hamiltonian evaluator
+ * @param n_orb Number of spatial orbitals
+ * @param hb_table Heat-Bath table (optional)
+ * @param eps1 Heat-Bath cutoff threshold
+ * @param use_heatbath Enable Heat-Bath pruning
+ * @return LocalConnRow{connected dets, matrix elements}
  */
 [[nodiscard]] LocalConnRow get_local_conn(
     const Det& bra,
@@ -72,8 +67,17 @@ struct VariationalResult {
 );
 
 /**
- * Generate Hamiltonian connections for a batch of determinants.
- * Parallelized with OpenMP.
+ * Compute Hamiltonian rows for a batch of determinants (parallel).
+ *
+ * OpenMP parallel with dynamic scheduling.
+ *
+ * @param samples Determinant batch
+ * @param ham Hamiltonian evaluator
+ * @param n_orb Number of spatial orbitals
+ * @param hb_table Heat-Bath table (optional)
+ * @param eps1 Heat-Bath cutoff threshold
+ * @param use_heatbath Enable Heat-Bath pruning
+ * @return LocalConnBatch{offsets, dets, values} in CSR-like format
  */
 [[nodiscard]] LocalConnBatch get_local_connections(
     std::span<const Det> samples,
@@ -84,19 +88,20 @@ struct VariationalResult {
     bool use_heatbath = false
 );
 
-// ─── Streaming Energy Evaluation ──────────────────────────────────────
-
 /**
- * Compute <Psi|H|Psi> and <Psi|Psi> on a fixed basis.
+ * Compute variational energy ⟨Ψ|H|Ψ⟩ on a fixed determinant basis.
  *
- * Streaming algorithm:
- * 1. Build DetMap for O(1) index lookup.
- * 2. Iterate bra in basis (parallel).
- * 3. Generate connected kets on-the-fly.
- * 4. Accumulate E += conj(c_bra) * H_bra,ket * c_ket.
+ * Streaming algorithm: Σᵢ cᵢ* Σⱼ Hᵢⱼ cⱼ.
+ * Uses DetMap for O(1) coefficient lookup.
  *
- * @param basis       Basis determinants (S U C)
- * @param coeffs      Coefficients aligned with basis
+ * @param basis Determinant basis
+ * @param coeffs Complex coefficients aligned with basis
+ * @param ham Hamiltonian evaluator
+ * @param n_orb Number of spatial orbitals
+ * @param hb_table Heat-Bath table (optional)
+ * @param eps1 Heat-Bath cutoff threshold
+ * @param use_heatbath Enable Heat-Bath pruning
+ * @return VariationalResult{e_el, norm}
  */
 [[nodiscard]] VariationalResult compute_variational_energy(
     std::span<const Det> basis,

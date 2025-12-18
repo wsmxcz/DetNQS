@@ -2,98 +2,76 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Numerical utilities for wavefunction models.
+Numerical utilities for neural quantum states.
 
-Provides stable complex arithmetic operations and specialized initializers
-for neural quantum state architectures.
+Provides:
+  - Stable complex arithmetic: logsumexp, logdet, log(cosh)
+  - Specialized initializers: Glorot/He with Rayleigh magnitudes
 
 File: lever/models/utils.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: January, 2025
+Date: December 2025
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Tuple
+import functools
+from typing import Any, Callable, Literal, Tuple
 
 import jax
 import jax.numpy as jnp
 
-
-# ============================================================================
-# Stable Complex Arithmetic
-# ============================================================================
-
-
 def logsumexp_c(z: jnp.ndarray, axis: int = 0) -> jnp.ndarray:
-    """
-    Numerically stable log-sum-exp for complex arrays.
-    
-    Computes log(Σ exp(z)) using the shift trick: m + log(Σ exp(z - m))
-    where m = max(Re(z)) prevents overflow.
-    
+    """Stable log(Σ exp(z)) for complex arrays using max shift trick.
+  
+    Implements: log(Σ exp(z_i)) = m + log(Σ exp(z_i - m)), where m = max(Re(z_i))
+  
     Args:
-        z: Complex-valued input
+        z: Complex-valued input array
         axis: Reduction axis
-    
+  
     Returns:
-        log(Σ exp(z)) computed stably
+        log(Σ exp(z)) along specified axis
     """
     m = jnp.max(jnp.real(z), axis=axis, keepdims=True)
     m_squeezed = jnp.squeeze(m, axis=axis)
     return m_squeezed + jnp.log(jnp.sum(jnp.exp(z - m), axis=axis))
 
-
-def logdet_c(A: jnp.ndarray) -> jnp.ndarray:
+def logdet_c(A: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Stable log-determinant for complex matrices.
-    
-    Uses sign-logabs decomposition to handle large/small magnitudes.
-    
-    Args:
-        A: Complex square matrix
-    
+    Stable slogdet wrapper.
+
     Returns:
-        log(det(A))
+        sign:   real (±1) for real A; complex unit-magnitude for complex A
+        logabs: real log(|det(A)|)
     """
     sign, logabs = jnp.linalg.slogdet(A)
-    return logabs + jnp.log(sign.astype(A.dtype))
+    return sign, logabs
 
 
 def log_cosh(z: jnp.ndarray) -> jnp.ndarray:
-    """
-    Stable log(cosh(z)) for complex inputs.
-    
+    """Stable log(cosh(z)) for complex inputs.
+  
     Uses identity: log(cosh(z)) = |Re(z)| + log(1 + exp(-2|Re(z)|)) - log(2)
-    which remains stable for large |Re(z)|.
-    
+  
     Args:
         z: Complex-valued array
-    
+  
     Returns:
-        log(cosh(z)) computed element-wise
+        log(cosh(z))
     """
-    # Exploit cosh symmetry: cosh(z) = cosh(-z)
     z_abs_real = jnp.where(jnp.real(z) < 0, -z, z)
     return z_abs_real + jnp.log1p(jnp.exp(-2.0 * z_abs_real)) - jnp.log(2.0)
 
 
-# ============================================================================
-# Complex Weight Initializers
-# ============================================================================
-
-
 def _compute_fans(shape: tuple[int, ...]) -> tuple[float, float]:
-    """
-    Compute fan-in/fan-out for variance scaling.
-    
-    Handles Dense (2D) and Conv (higher-D) weight shapes.
-    
+    """Compute fan-in/fan-out for weight variance scaling.
+  
     Args:
         shape: Weight tensor shape
-    
+  
     Returns:
-        (fan_in, fan_out) tuple
+        (fan_in, fan_out)
     """
     if len(shape) < 2:
         return 1.0, 1.0
@@ -106,105 +84,182 @@ def _compute_fans(shape: tuple[int, ...]) -> tuple[float, float]:
 
 
 def complex_glorot_init() -> Callable:
-    """
-    Complex Glorot/Xavier initializer: |W| ~ Rayleigh(σ), arg(W) ~ U(0,2π).
-    
-    Target variance v = 2/(fan_in + fan_out), achieved via σ² = v/2.
-    Maintains same total variance as real Glorot.
-    
+    """Complex Xavier/Glorot initializer.
+  
+    Magnitude: Rayleigh(σ) with σ^2 = 1/(fan_in + fan_out)
+    Phase: U(0, 2π)
+  
     Returns:
-        Flax-compatible initializer function
+        Flax-compatible initializer
     """
-    def _init(key: jax.Array, shape: tuple[int, ...], dtype=jnp.complex64) -> jax.Array:
+    def _init(
+        key: jax.Array,
+        shape: tuple[int, ...],
+        dtype=jnp.complex64
+    ) -> jax.Array:
         fan_in, fan_out = _compute_fans(shape)
         variance = 2.0 / (fan_in + fan_out)
-        sigma = jnp.sqrt(variance / 2.0)  # Rayleigh scale
-        
+        sigma = jnp.sqrt(variance / 2.0)
+      
         k_amp, k_phase = jax.random.split(key)
         amplitude = jax.random.rayleigh(k_amp, sigma, shape=shape)
         phase = jax.random.uniform(k_phase, shape=shape, minval=0.0, maxval=2.0 * jnp.pi)
-        
+      
         return (amplitude * jnp.exp(1j * phase)).astype(dtype)
 
     return _init
 
 
 def complex_he_init() -> Callable:
-    """
-    Complex He initializer: |W| ~ Rayleigh(σ), arg(W) ~ U(0,2π).
-    
-    Target variance v = 2/fan_in for ReLU-like activations.
-    Larger scale suitable for post-activation layers.
-    
+    """Complex He initializer for ReLU activations.
+  
+    Magnitude: Rayleigh(σ) with σ^2 = 2/fan_in
+    Phase: U(0, 2π)
+  
     Returns:
-        Flax-compatible initializer function
+        Flax-compatible initializer
     """
-    def _init(key: jax.Array, shape: tuple[int, ...], dtype=jnp.complex64) -> jax.Array:
+    def _init(
+        key: jax.Array,
+        shape: tuple[int, ...],
+        dtype=jnp.complex64
+    ) -> jax.Array:
         fan_in, _ = _compute_fans(shape)
         variance = 2.0 / fan_in
         sigma = jnp.sqrt(variance / 2.0)
-        
+      
         k_amp, k_phase = jax.random.split(key)
         amplitude = jax.random.rayleigh(k_amp, sigma, shape=shape)
         phase = jax.random.uniform(k_phase, shape=shape, minval=0.0, maxval=2.0 * jnp.pi)
-        
+      
         return (amplitude * jnp.exp(1j * phase)).astype(dtype)
 
     return _init
 
 
 def c_init(sigma: float) -> Callable:
-    """
-    Complex weight initializer with fixed Rayleigh scale.
-    
-    Generates random complex numbers with:
-      - Amplitude ~ Rayleigh(sigma)
-      - Phase ~ Uniform(0, 2π)
-    
+    """Fixed-scale complex initializer.
+  
     Args:
-        sigma: Rayleigh distribution scale parameter
-    
+        sigma: Rayleigh scale parameter
+  
     Returns:
-        Flax-compatible initializer function
+        Flax-compatible initializer
     """
-    def _init(key: jax.Array, shape: tuple[int, ...], dtype=jnp.complex128) -> jax.Array:
+    def _init(
+        key: jax.Array,
+        shape: tuple[int, ...],
+        dtype=jnp.complex128
+    ) -> jax.Array:
         k_amp, k_phase = jax.random.split(key)
         amp = jax.random.rayleigh(k_amp, scale=sigma, shape=shape)
-        phase = jax.random.uniform(
-            k_phase, shape=shape, minval=0.0, maxval=2.0 * jnp.pi
-        )
+        phase = jax.random.uniform(k_phase, shape=shape, minval=0.0, maxval=2.0 * jnp.pi)
         return (amp * jnp.exp(1j * phase)).astype(dtype)
-    
+  
     return _init
 
 
-def c_orthogonal_init(key: jax.Array, shape: Tuple[int, ...], dtype: Any) -> jax.Array:
-    """
-    Initialize complex matrix with orthonormal columns via QR decomposition.
-    
-    For rectangular (m, n) with m ≥ n, produces Q satisfying Q^†Q = I.
-    Maintains proper complex Gaussian statistics before orthogonalization.
-    
+def c_orthogonal_init(
+    key: jax.Array,
+    shape: Tuple[int, ...],
+    dtype: Any
+) -> jax.Array:
+    """Complex orthonormal initializer via QR decomposition.
+  
+    Generates Q satisfying Q^† Q = I for m ≥ n in shape (..., m, n).
+  
     Args:
-        key: PRNG key for random generation
-        shape: Output matrix shape (m, n) or (..., m, n) for batched
-        dtype: Complex dtype (complex64 or complex128)
-    
+        key: PRNG key
+        shape: Output shape
+        dtype: Complex dtype
+  
     Returns:
-        Complex matrix with orthonormal columns
+        Matrix with orthonormal columns
     """
     real_dtype = jnp.float32 if dtype == jnp.complex64 else jnp.float64
     key_re, key_im = jax.random.split(key)
 
-    # Generate complex Gaussian: E[|z|²] = 1
     re = jax.random.normal(key_re, shape, dtype=real_dtype) / jnp.sqrt(2.0)
     im = jax.random.normal(key_im, shape, dtype=real_dtype) / jnp.sqrt(2.0)
-
     A = jax.lax.complex(re, im)
 
-    # QR decomposition for column orthonormality
     Q, _ = jnp.linalg.qr(A)
     return Q
+
+
+def backflow_orbitals_init(
+    n_orb: int,
+    n_alpha: int,
+    n_beta: int,
+    mode: Literal["restricted", "unrestricted", "generalized"],
+) -> Callable:
+    """Initializer for backflow reference orbitals M.
+  
+    RHF/UHF: Identity matrix I_{n_orb × n_e}
+    GHF: Spin-orbital one-hot encoding
+  
+    Args:
+        n_orb: Number of spatial orbitals
+        n_alpha: Alpha electron count
+        n_beta: Beta electron count
+        mode: Orbital coupling scheme
+  
+    Returns:
+        Flax-compatible initializer
+    """
+    n_e = n_alpha + n_beta
+
+    def _init_rhf_uhf(
+        key: jax.Array,
+        shape: Tuple[int, ...],
+        dtype: Any = jnp.float32,
+    ) -> jax.Array:
+        del key  # Deterministic initialization
+        if len(shape) < 2:
+            raise ValueError(f"Expected ≥2D shape, got {shape}")
+
+        *batch_shape, m, n = shape
+        eye = jnp.eye(m, n, dtype=jnp.result_type(dtype, jnp.float32))
+
+        if batch_shape:
+            eye = jnp.broadcast_to(eye, (*batch_shape, m, n))
+
+        return eye.astype(dtype)
+
+    def _init_ghf(
+        key: jax.Array,
+        shape: Tuple[int, ...],
+        dtype: Any = jnp.float32,
+    ) -> jax.Array:
+        del key  # Deterministic initialization
+        if len(shape) < 2:
+            raise ValueError(f"Expected ≥2D shape, got {shape}")
+
+        *batch_shape, m, n = shape
+
+        if m != 2 * n_orb:
+            raise ValueError(f"Expected m = 2n_orb = {2 * n_orb}, got {m}")
+        if n != n_e:
+            raise ValueError(f"Expected n = n_e = {n_e}, got {n}")
+
+        base_dtype = jnp.result_type(dtype, jnp.float32)
+        mat = jnp.zeros((m, n), dtype=base_dtype)
+
+        if n_alpha > 0:
+            rows_a = jnp.arange(n_alpha)
+            mat = mat.at[rows_a, rows_a].set(1.0)
+
+        if n_beta > 0:
+            rows_b = n_orb + jnp.arange(n_beta)
+            cols_b = n_alpha + jnp.arange(n_beta)
+            mat = mat.at[rows_b, cols_b].set(1.0)
+
+        if batch_shape:
+            mat = jnp.broadcast_to(mat, (*batch_shape, m, n))
+
+        return mat.astype(dtype)
+
+    return _init_ghf if mode == "generalized" else _init_rhf_uhf
 
 
 __all__ = [
@@ -215,4 +270,5 @@ __all__ = [
     "complex_he_init",
     "c_init",
     "c_orthogonal_init",
+    "backflow_orbitals_init",
 ]

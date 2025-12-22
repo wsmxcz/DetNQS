@@ -81,26 +81,26 @@ def main() -> None:
     detspace = DetSpace.initialize(hf_det)
 
     # Construct NQS parametrizer
-    parametrizer = models.slater.MLP(
+    parametrizer = models.parametrizers.MLP(
         n_so=system.n_so,
         dim=256,
-        depth=1,
+        depth=2,
         param_dtype=jnp.float64,
     )
 
     # Build Slater-type wavefunction model
-    model = models.make_slater(
+    model = models.make_slater2nd(
         system=system,
         parametrizer=parametrizer,
-        update="additive",
-        n_det=1,
-        rank=4,
+        mapper="thouless",     # "none" | "full" | "submatrix" | "thouless"
+        kmax=6,
+        use_fast_kernel=True,
         param_dtype=jnp.float64,
     )
 
     # Configure optimizer and selector
     optimizer = optax.adamw(learning_rate=5e-4)
-    selector = TopKSelector(256)
+    selector = TopKSelector(8192)
 
     # Select driver based on computational mode
     driver_cls = {

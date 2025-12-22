@@ -27,6 +27,7 @@ add_library(lever_core STATIC
     src/determinant/det_enum.cpp
     src/determinant/det_ops.cpp
     src/determinant/det_space.cpp
+    src/determinant/det_batch.cpp
     src/integral/integral_mo.cpp
     src/integral/hb_table.cpp
     src/hamiltonian/ham_eval.cpp

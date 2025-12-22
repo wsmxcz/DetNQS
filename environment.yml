@@ -36,10 +36,6 @@ dependencies:
   - pytest-benchmark
   - ipykernel
   - matplotlib
-  - tqdm
-  - rich
-  - pyyaml
-  - hydra-core
   - pandas
 
   # --- JAX / ML stack via pip (newer than conda-forge, and CUDA deps handled) ---

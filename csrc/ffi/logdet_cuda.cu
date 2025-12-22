@@ -9,7 +9,7 @@
  *            → (sign, log|det|) via diagonal elements and pivot parity
  *   Backward: grad = cot_logabs * (A^{-1})^T, where A^{-1} from GESV(A, I)
  *
- * Supports matrix sizes N in [2, 64] with bucketed compile-time sizes {16, 32, 64}.
+ * Supports matrix sizes N in [2, 64] with bucketed compile-time sizes {2, 4, 8, 16, 32, 64}.
  * Padding to bucket size uses block-diagonal structure: blockdiag(A, I).
  *
  * Architecture support: SM 8.0+ (Ampere/Hopper), compiled for {800, 900, 1200}.
@@ -82,17 +82,24 @@ static inline int SelectSmVariant() {
   return 800;
 }
 
-// Snap N to compile-time bucket: 16/32/64
+// Snap N to compile-time bucket: 2/4/8/16/32/64
 static inline int BucketN(int N) {
+  if (N <= 2) return 2;
+  if (N <= 4) return 4;
+  if (N <= 8) return 8;
   if (N <= 16) return 16;
   if (N <= 32) return 32;
   return 64;
 }
-
-// Batches per block: smaller matrices → more batches
+// Batches per block: smaller matrices → more batches for better occupancy
 template <int Nb>
 struct BatchesPerBlock {
-  static constexpr int value = (Nb <= 16) ? 4 : (Nb <= 32 ? 2 : 1);
+  static constexpr int value = 
+      (Nb <= 2) ? 16 : 
+      (Nb <= 4) ? 8 : 
+      (Nb <= 8) ? 4 : 
+      (Nb <= 16) ? 4 : 
+      (Nb <= 32) ? 2 : 1;
 };
 
 // ============================================================================
@@ -502,29 +509,35 @@ static ffi::Error DispatchSmBwd(int sm, cudaStream_t stream,
   }
 }
 
+// ============================================================================
+// Dispatch Logic: SM Variant × Bucket Size
+// ============================================================================
 template <typename Scalar>
 static ffi::Error DispatchFwd(cudaStream_t stream,
                               const Scalar* A, Scalar* sign, Scalar* logabs,
                               int B, int N_actual) {
   const int sm = SelectSmVariant();
   const int Nb = BucketN(N_actual);
-
   switch (Nb) {
+    case 2:  return DispatchSmFwd<Scalar, 2>(sm, stream, A, sign, logabs, B, N_actual);
+    case 4:  return DispatchSmFwd<Scalar, 4>(sm, stream, A, sign, logabs, B, N_actual);
+    case 8:  return DispatchSmFwd<Scalar, 8>(sm, stream, A, sign, logabs, B, N_actual);
     case 16: return DispatchSmFwd<Scalar, 16>(sm, stream, A, sign, logabs, B, N_actual);
     case 32: return DispatchSmFwd<Scalar, 32>(sm, stream, A, sign, logabs, B, N_actual);
     case 64: return DispatchSmFwd<Scalar, 64>(sm, stream, A, sign, logabs, B, N_actual);
     default: return InvalidArg("Invalid matrix bucket size");
   }
 }
-
 template <typename Scalar>
 static ffi::Error DispatchBwd(cudaStream_t stream,
                               const Scalar* A, const Scalar* cot, Scalar* grad,
                               int B, int N_actual) {
   const int sm = SelectSmVariant();
   const int Nb = BucketN(N_actual);
-
   switch (Nb) {
+    case 2:  return DispatchSmBwd<Scalar, 2>(sm, stream, A, cot, grad, B, N_actual);
+    case 4:  return DispatchSmBwd<Scalar, 4>(sm, stream, A, cot, grad, B, N_actual);
+    case 8:  return DispatchSmBwd<Scalar, 8>(sm, stream, A, cot, grad, B, N_actual);
     case 16: return DispatchSmBwd<Scalar, 16>(sm, stream, A, cot, grad, B, N_actual);
     case 32: return DispatchSmBwd<Scalar, 32>(sm, stream, A, cot, grad, B, N_actual);
     case 64: return DispatchSmBwd<Scalar, 64>(sm, stream, A, cot, grad, B, N_actual);

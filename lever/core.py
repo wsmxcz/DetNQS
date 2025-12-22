@@ -27,6 +27,9 @@ gen_excited_dets = _lever_cpp.gen_excited_dets
 gen_complement_dets = _lever_cpp.gen_complement_dets
 """Generate complement space from reference determinants."""
 
+prepare_det_batch = _lever_cpp.prepare_det_batch
+"""Prepare determinant batch features on CPU."""
+
 # --- Hamiltonian Construction ---
 
 get_ham_diag = _lever_cpp.get_ham_diag

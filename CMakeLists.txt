@@ -16,6 +16,15 @@ message(STATUS "Benchmark data directory set to: ${LEVER_BENCHMARK_DIR}")
 # --- Find Dependencies ---
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 
+# --- Locate jaxlib headers (xla/ffi/api/ffi.h) ---
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c
+          "import os, jaxlib; print(os.path.join(os.path.dirname(jaxlib.__file__), 'include'))"
+  OUTPUT_VARIABLE JAXLIB_INCLUDE_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+message(STATUS "jaxlib include dir: ${JAXLIB_INCLUDE_DIR}")
+
 execute_process(
     COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
     OUTPUT_STRIP_TRAILING_WHITESPACE

@@ -1,48 +1,49 @@
-# file: environment.yml
 name: lever
 channels:
+  - nvidia
   - conda-forge
-  - defaults
+channel_priority: strict
 
 dependencies:
-  # --- Core toolchain (C++/Build) ---
-  - python>=3.11
-  - cmake>=3.28,<3.30           # Recent, stable CMake for scikit-build-core
-  - ninja                       # Faster builds with CMake/Ninja
-  - cxx-compiler                # C++20-capable compiler meta-package
-  - pkg-config                  # Helps CMake locate system/conda libs
-  - eigen                       # C++ linear algebra headers
-  - openmp                 # Preferred OpenMP runtime in conda-forge
-
-  # --- Python numerics & JIT ---
-  - numpy>=2.1              # NumPy 2.x line
-  - scipy>=1.14                 # SciPy with NP2 + Python 3.13 wheels
-  - numba>=0.61.2               # JIT for loops; supports Py3.13 & NumPy 2.1/2.2
-  - jax>=0.7               # JAX
-  - jaxlib>=0.7            # JAX runtime
-
-
-  # --- Dev & utilities ---
+  # --- Core ---
+  - python=3.13
   - pip
-  - ipykernel                   # Jupyter kernel
+
+  # --- BuildBuild toolchain ---
+  - cmake>=3.28,<3.31
+  - ninja
+  - c-compiler
+  - cxx-compiler
+  - pkg-config
+  - nanobind>=2.8
+  - scikit-build-core>=0.10
+  - eigen
+  - openmp
+  - catch2
+
+  # --- CUDA Toolkit (complete toolchain: nvcc + nvvm + cicc etc.) ---
+  # Pin to 12.9 for RTX 50 (Blackwell) + A100/H100 compatibility
+  - cuda=12.9
+  - mathdx=25.06.0
+  
+  # Optional (if you want conda-provided cuDNN too; JAX pip path can also pull cuDNN wheels)
+  - cudnn>=9
+
+  # --- Python numerics / dev ---
+  - numpy>=2.1
+  - scipy>=1.14
+  - pytest
+  - pytest-benchmark
+  - ipykernel
   - matplotlib
   - tqdm
   - rich
   - pyyaml
-  - hydra-core                  # Configuration management
-  - pytest
-  - pytest-benchmark
-  - catch2                      # C++ tests
-  - pydantic
+  - hydra-core
   - pandas
 
-  # --- Build backend for C++ extensions ---
-  - scikit-build-core>=0.9
-  - nanobind>=2.8               # Modern C++/Python bindings (instead of pybind11)
-
-  # --- ML stack (JAX-based) ---
-
+  # --- JAX / ML stack via pip (newer than conda-forge, and CUDA deps handled) ---
   - pip:
-    - flax>=0.12                  # Flax/NNX; recent releases pair with JAX 0.7
-    - optax>=0.2                  # Optimizers for JAX
-  # You can add GPU later (separate env or extra file).
+      - "jax[cuda_12]>=0.8.1"
+      - "flax>=0.12"
+      - "optax>=0.2"

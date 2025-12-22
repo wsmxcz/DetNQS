@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from ...system import MolecularSystem
+from ...utils.det_utils import DetBatch
 from ..utils import logdet_c, logsumexp_c
 
 from .networks import Parametrizer, MLP
@@ -50,7 +51,7 @@ class SlaterLogAmplitude(nn.Module):
     coeff_dtype: Any = None
 
     @nn.compact
-    def __call__(self, occ_so: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, batch: DetBatch) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
         Args:
             occ_so: (..., n_elec) occupied spin-orbital indices
@@ -59,7 +60,7 @@ class SlaterLogAmplitude(nn.Module):
             sign: (...) complex or real phase factor
             logabs: (...) log(|psi|)
         """
-        occ = occ_so.astype(jnp.int32)
+        occ = batch.occ.astype(jnp.int32)  # <- only change: take occ from batch
         bundle = self.spo_map(occ)
         phi_occ, j_sign, j_logabs = bundle.phi_occ, bundle.j_sign, bundle.j_logabs
 

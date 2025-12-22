@@ -2,18 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Deterministic variational state for sampling-free selected CI NQS.
+State management for NQS-enhanced selected CI optimization.
 
-Implements batch-native neural log(psi) on fixed determinant spaces with
-VJP-based gradients. Features chunked forward/backward passes and
-functional outer-loop updates.
-
-Wavefunction parametrization: psi = sign * exp(logabs)
-  - sign: real (±1) or complex (unit magnitude phase)
-  - logabs: real log-amplitude
+Core components:
+  - Immutable State dataclass bridging CPU determinant space to device computation
+  - Batch preparation: DetSpace.T_dets (CPU uint64) -> DetBatch (device)
+  - Forward/backward passes with optional memory-efficient chunking
 
 File: lever/state.py
-Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+Author: Zheng (Alex) Che, wsmxcz@gmail.com
 Date: December, 2025
 """
 
@@ -29,166 +26,109 @@ from flax import struct
 
 from .space import DetSpace
 from .system import MolecularSystem
+from .utils.det_utils import DetBatch, get_batch_spec, prepare_batch
 from .utils.jax_utils import PyTree, apply_chunked, vjp_chunked
-from .utils.occupations import bitstrings_to_indices
 
-
-# Type aliases
-ApplyFn = Callable[[PyTree, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]
+ApplyFn = Callable[[PyTree, DetBatch], tuple[jnp.ndarray, jnp.ndarray]]
 VjpFn = Callable[[tuple[jnp.ndarray, jnp.ndarray]], PyTree]
 
 
 @struct.dataclass(eq=False)
-class DeterministicState:
+class State:
     """
-    Variational quantum state on selected CI space with batch-native neural log(psi).
-    
-    Manages network parameters and determinant space for sampling-free
-    wavefunction evaluation. Supports arbitrary batch dimensions for
-    efficient GPU utilization.
-    
+    Immutable state container for inner optimization loop.
+
     Attributes:
-        system: Molecular system (integrals, electron counts)
-        detspace: Current determinant space (T_dets managed by Driver)
-        apply_fn: Batch-native model (params, occ_batch) -> (sign, logabs)
-        params: Network parameter PyTree
-        _T_dets: Device-resident bitstrings [n_T, 2]
-        _occ_so: Precomputed spin-orbital indices [n_T, n_elec] (uint8)
-        sign_dtype: Output dtype for sign component
-        logabs_dtype: Output dtype for logabs component
-        wf_is_complex: True if wavefunction has complex phase
+        system: Molecular system reference (static)
+        model: Neural network model (static, defines batch_spec)
+        params: Network parameters (PyTree, updated per inner step)
+        batch: Device DetBatch (updated per outer loop)
     """
-    
+
     system: MolecularSystem = struct.field(pytree_node=False)
-    detspace: DetSpace = struct.field(pytree_node=False)
-    apply_fn: ApplyFn = struct.field(pytree_node=False)
+    model: Any = struct.field(pytree_node=False)
     params: PyTree
-    _T_dets: jnp.ndarray = struct.field(pytree_node=True, default=None)
-    _occ_so: jnp.ndarray = struct.field(pytree_node=True, default=None)
-    
-    sign_dtype: Any = struct.field(pytree_node=False, default=jnp.float32)
-    logabs_dtype: Any = struct.field(pytree_node=False, default=jnp.float32)
-    wf_is_complex: bool = struct.field(pytree_node=False, default=False)
-    
+    batch: DetBatch
+
     @classmethod
-    def from_model(
+    def init(
         cls,
         system: MolecularSystem,
         detspace: DetSpace,
-        model,
-        params: PyTree,
-    ) -> DeterministicState:
-        """
-        Construct state from model and parameters.
-        
-        Precomputes occupation indices and probes output dtypes.
-        """
-        T_dets = np.asarray(detspace.T_dets, dtype=np.uint64)
-        occ_so_np = bitstrings_to_indices(
-            T_dets,
-            n_orb=system.n_orb,
-            n_alpha=system.n_alpha,
-            n_beta=system.n_beta,
-            dtype=np.uint8,
-        )
-        
-        def apply_fn(p: PyTree, occ_batch: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-            occ_batch = occ_batch.astype(jnp.int32)
-            sign, logabs = model.apply({"params": p}, occ_batch)
-            return sign, logabs
-        
-        # Probe output dtypes
-        sample_occ = jnp.asarray(occ_so_np[:1], dtype=jnp.int32)
-        sign0, logabs0 = apply_fn(params, sample_occ)
-        wf_is_complex = jnp.issubdtype(sign0.dtype, jnp.complexfloating)
-        
-        return cls(
-            system=system,
-            detspace=detspace,
-            apply_fn=apply_fn,
-            params=params,
-            _T_dets=jax.device_put(jnp.asarray(T_dets, dtype=jnp.uint64)),
-            _occ_so=jax.device_put(jnp.asarray(occ_so_np, dtype=jnp.uint8)),
-            sign_dtype=sign0.dtype,
-            logabs_dtype=jnp.real(logabs0).dtype,
-            wf_is_complex=bool(wf_is_complex),
-        )
-    
-    @classmethod
-    def init_from_model(
-        cls,
-        system: MolecularSystem,
-        detspace: DetSpace,
-        model,
+        model: Any,
+        *,
         key: jax.Array | None = None,
-    ) -> DeterministicState:
+    ) -> "State":
         """
-        Construct state with automatic parameter initialization.
-        
-        Initializes model with batch=1 occupation vector to match
-        training shape: (1, n_elec).
+        Initialize state from molecular system and determinant space.
+
+        Workflow:
+          1. Prepare single-sample batch for shape inference
+          2. Initialize model parameters
+          3. Build full device batch from detspace
         """
-        T_dets = np.asarray(detspace.T_dets, dtype=np.uint64)
-        if T_dets.shape[0] == 0:
+        T = np.asarray(detspace.T_dets, dtype=np.uint64)
+        if T.shape[0] == 0:
             raise ValueError("Empty determinant space")
-        
-        occ_so_np = bitstrings_to_indices(
-            T_dets[:1],
+
+        spec = get_batch_spec(model)
+        key = jax.random.PRNGKey(42) if key is None else key
+
+        # Single-sample batch for param initialization
+        b1 = prepare_batch(
+            T[:1],
             n_orb=system.n_orb,
             n_alpha=system.n_alpha,
             n_beta=system.n_beta,
-            dtype=np.uint8,
+            ref=system.hf_determinant(),
+            spec=spec,
         )
-        
-        sample_occ = jnp.asarray(occ_so_np, dtype=jnp.int32)
-        key = jax.random.PRNGKey(42) if key is None else key
-        variables = model.init(key, sample_occ)
-        
-        return cls.from_model(system, detspace, model, variables["params"])
-    
-    def update_space(self, new_detspace: DetSpace) -> DeterministicState:
+
+        variables = model.init(key, jax.device_put(b1))
+        params = variables["params"]
+
+        tmp = cls(system=system, model=model, params=params, batch=b1)
+        return tmp.update_space(detspace)
+
+    def update_space(self, detspace: DetSpace) -> "State":
         """
-        Create new state with updated determinant space.
-        
-        Recomputes occupation indices while preserving parameters.
-        Called during outer-loop space evolution.
+        Rebuild device batch from new determinant space (outer-loop transition).
+
+        CPU->device transfer: DetSpace.T_dets -> prepare_batch -> device_put
         """
-        T_dets_np = np.asarray(new_detspace.T_dets, dtype=np.uint64)
-        occ_so_np = bitstrings_to_indices(
-            T_dets_np,
+        T = np.asarray(detspace.T_dets, dtype=np.uint64)
+        if T.shape[0] == 0:
+            empty = DetBatch(occ=np.zeros((0, self.system.n_elec), dtype=np.int32), aux={})
+            return self.replace(batch=jax.device_put(empty))
+
+        spec = get_batch_spec(self.model)
+        cpu_batch = prepare_batch(
+            T,
             n_orb=self.system.n_orb,
             n_alpha=self.system.n_alpha,
             n_beta=self.system.n_beta,
-            dtype=np.uint8,
+            ref=self.system.hf_determinant(),
+            spec=spec,
         )
-        
-        return self.replace(
-            detspace=new_detspace,
-            _T_dets=jax.device_put(jnp.asarray(T_dets_np, dtype=jnp.uint64)),
-            _occ_so=jax.device_put(jnp.asarray(occ_so_np, dtype=jnp.uint8)),
-        )
-    
-    @property
-    def parameters(self) -> PyTree:
-        """Current parameter PyTree."""
-        return self.params
-    
+        return self.replace(batch=jax.device_put(cpu_batch))
+
+    def _apply(self, p: PyTree, b: DetBatch) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Apply model: (params, batch) -> (sign, logabs)."""
+        b = b.replace(occ=b.occ.astype(jnp.int32))
+        return self.model.apply({"params": p}, b)
+
     @property
     def n_det(self) -> int:
-        """Total determinant count in current T-space."""
-        return self._T_dets.shape[0]
-    
-    @property
-    def param_dtype(self) -> jnp.dtype:
-        """Parameter dtype from first leaf."""
-        leaves = jax.tree.leaves(self.params)
-        return leaves[0].dtype if leaves else jnp.float64
-    
+        """Number of determinants in current batch."""
+        return int(self.batch.occ.shape[0])
+
     @property
     def psi_dtype(self) -> jnp.dtype:
-        """Wavefunction dtype: complex if sign is complex, else real."""
-        return self.sign_dtype if self.wf_is_complex else self.logabs_dtype
-    
+        """Infer wavefunction dtype from forward pass."""
+        b1 = self.batch[:1]
+        s, la = self._apply(self.params, b1)
+        return s.dtype if jnp.issubdtype(s.dtype, jnp.complexfloating) else jnp.real(la).dtype
+
     def forward(
         self,
         indices: jnp.ndarray | None = None,
@@ -196,32 +136,27 @@ class DeterministicState:
         chunk_size: int | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Evaluate (sign, logabs) on specified determinants.
-        
+        Forward pass: params -> (sign, logabs).
+
         Args:
-            indices: Determinant indices (None = full T-space)
-            chunk_size: Batch size for chunked evaluation
-        
-        Returns:
-            (sign, logabs)
+            indices: Optional subset of batch indices
+            chunk_size: Process in chunks for memory efficiency if set
         """
-        occ = self._occ_so if indices is None else self._occ_so[indices]
-        n_eval = occ.shape[0]
-        
-        if n_eval == 0:
-            sign = jnp.zeros((0,), dtype=self.sign_dtype)
-            logabs = jnp.zeros((0,), dtype=self.logabs_dtype)
-            return sign, logabs
-        
+        b = self.batch if indices is None else self.batch[indices]
+        n = int(b.occ.shape[0])
+
+        if n == 0:
+            s1, la1 = self._apply(self.params, self.batch[:1])
+            return (
+                jnp.zeros((0,), dtype=s1.dtype),
+                jnp.zeros((0,), dtype=jnp.real(la1).dtype),
+            )
+
         if chunk_size is None:
-            return self.apply_fn(self.params, occ)
-        
-        return apply_chunked(self.apply_fn, self.params, occ, int(chunk_size))
-    
-    def __call__(self) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Evaluate (sign, logabs) on full T-space."""
-        return self.forward()
-    
+            return self._apply(self.params, b)
+
+        return apply_chunked(self._apply, self.params, b, int(chunk_size))
+
     def value_and_vjp(
         self,
         indices: jnp.ndarray | None = None,
@@ -229,69 +164,56 @@ class DeterministicState:
         chunk_size: int | None = None,
     ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], VjpFn]:
         """
-        Compute (sign, logabs) and VJP function for gradient calculation.
-        
-        Args:
-            indices: Determinant indices (None = full T-space)
-            chunk_size: Batch size for chunked evaluation
-        
+        Compute forward outputs and VJP function for backpropagation.
+
         Returns:
-            (sign, logabs): Forward pass outputs
-            vjp_fn: VJP function (cot_sign, cot_logabs) -> grad_params
+            ((sign, logabs), vjp_fn): Forward outputs and gradient pullback
         """
-        occ = self._occ_so if indices is None else self._occ_so[indices]
-        n_eval = occ.shape[0]
-        
-        if n_eval == 0:
+        b = self.batch if indices is None else self.batch[indices]
+        n = int(b.occ.shape[0])
+
+        if n == 0:
             empty_grad = jax.tree_util.tree_map(jnp.zeros_like, self.params)
-            sign = jnp.zeros((0,), dtype=self.sign_dtype)
-            logabs = jnp.zeros((0,), dtype=self.logabs_dtype)
-            return (sign, logabs), lambda _: empty_grad
-        
+            s1, la1 = self._apply(self.params, self.batch[:1])
+            outs0 = (
+                jnp.zeros((0,), dtype=s1.dtype),
+                jnp.zeros((0,), dtype=jnp.real(la1).dtype),
+            )
+            return outs0, (lambda _: empty_grad)
+
         if chunk_size is None:
-            outs, pullback = jax.vjp(lambda p: self.apply_fn(p, occ), self.params)
-            
+            outs, pullback = jax.vjp(lambda p: self._apply(p, b), self.params)
+
             def vjp_fn(cot: tuple[jnp.ndarray, jnp.ndarray]) -> PyTree:
-                cot_sign, cot_logabs = cot
-                cot_sign = cot_sign.astype(outs[0].dtype)
-                cot_logabs = cot_logabs.astype(jnp.real(outs[1]).dtype)
-                (grads,) = pullback((cot_sign, cot_logabs))
+                cot_s, cot_la = cot
+                cot_s = cot_s.astype(outs[0].dtype)
+                cot_la = cot_la.astype(jnp.real(outs[1]).dtype)
+                (grads,) = pullback((cot_s, cot_la))
                 return jax.tree_util.tree_map(
-                    lambda g, p: g.astype(p.dtype) if g is not None else jnp.zeros_like(p),
+                    lambda g, p: (g.astype(p.dtype) if g is not None else jnp.zeros_like(p)),
                     grads,
                     self.params,
                 )
-            
+
             return outs, vjp_fn
-        
+
         outs = self.forward(indices, chunk_size=chunk_size)
-        
+
         def vjp_fn(cot: tuple[jnp.ndarray, jnp.ndarray]) -> PyTree:
-            return vjp_chunked(self.apply_fn, self.params, occ, cot, int(chunk_size))
-        
+            return vjp_chunked(self._apply, self.params, b, cot, int(chunk_size))
+
         return outs, vjp_fn
-    
+
     def apply_gradients(
         self,
         gradients: PyTree,
         opt_state: Any,
         optimizer: optax.GradientTransformation,
-    ) -> tuple[DeterministicState, Any]:
-        """
-        Apply optimizer update to parameters.
-        
-        Args:
-            gradients: Parameter gradients from VJP
-            opt_state: Current optimizer state
-            optimizer: Optax optimizer instance
-        
-        Returns:
-            new_state: State with updated parameters
-            new_opt_state: Updated optimizer state
-        """
+    ) -> tuple["State", Any]:
+        """Apply gradients via Optax optimizer."""
         updates, new_opt_state = optimizer.update(gradients, opt_state, self.params)
         new_params = optax.apply_updates(self.params, updates)
         return self.replace(params=new_params), new_opt_state
 
 
-__all__ = ["DeterministicState"]
+__all__ = ["State"]

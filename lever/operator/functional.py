@@ -23,7 +23,7 @@ from typing import Any, Callable
 import jax.numpy as jnp
 
 from ..space import DetSpace
-from ..state import DeterministicState
+from ..state import State
 from .hamiltonian import ProxyHamiltonian, SSHamiltonian
 from .kernel import ProxyContraction, SSContraction
 
@@ -75,7 +75,7 @@ def _cotangents_from_g(
 
 
 def _energy_step_s(
-    state: DeterministicState,
+    state: State,
     ham: SSHamiltonian,
     op: Callable[[jnp.ndarray], SSContraction],
     *,
@@ -119,7 +119,7 @@ def _energy_step_s(
 
 
 def _energy_step_proxy(
-    state: DeterministicState,
+    state: State,
     ham: ProxyHamiltonian,
     op: Callable[[jnp.ndarray, jnp.ndarray], ProxyContraction],
     detspace: DetSpace,
@@ -173,7 +173,7 @@ def _energy_step_proxy(
 
 
 def _energy_step_asym(
-    state: DeterministicState,
+    state: State,
     ham: ProxyHamiltonian,
     op: Callable[[jnp.ndarray, jnp.ndarray], ProxyContraction],
     detspace: DetSpace,
@@ -235,7 +235,7 @@ def make_energy_step(
     mode: str = "variational",
     eps: float = 1e-12,
     chunk_size: int | None = None,
-) -> Callable[[DeterministicState], tuple[float, Any]]:
+) -> Callable[[State], tuple[float, Any]]:
     """
     Build energy and gradient function for inner optimization sweep.
     
@@ -254,7 +254,7 @@ def make_energy_step(
         step: Function (state) -> (energy, gradient)
     """
     if isinstance(ham, SSHamiltonian):
-        def step(state: DeterministicState) -> tuple[float, Any]:
+        def step(state: State) -> tuple[float, Any]:
             return _energy_step_s(state, ham, op, eps=eps, chunk_size=chunk_size)
         return step
     
@@ -262,12 +262,12 @@ def make_energy_step(
         raise ValueError("detspace required for ProxyHamiltonian")
     
     if mode == "proxy":
-        def step(state: DeterministicState) -> tuple[float, Any]:
+        def step(state: State) -> tuple[float, Any]:
             return _energy_step_proxy(state, ham, op, detspace, eps=eps, chunk_size=chunk_size)
         return step
     
     if mode == "asymmetric":
-        def step(state: DeterministicState) -> tuple[float, Any]:
+        def step(state: State) -> tuple[float, Any]:
             return _energy_step_asym(state, ham, op, detspace, eps=eps, chunk_size=chunk_size)
         return step
     

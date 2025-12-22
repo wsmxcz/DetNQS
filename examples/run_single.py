@@ -1,46 +1,45 @@
-# lever/examples/run_single.py
 # Copyright 2025 The LEVER Authors - All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
 Command-line interface for LEVER quantum chemistry calculations.
 
-LEVER (Low-rank Enhanced Variational Eigensolver with RBM) integrates
-selected CI with neural quantum states for full-configuration interaction
-in orbital space. Three operational modes are supported:
-  - Variational: NQS-enhanced selected CI solving H_SS with PT2 correction
-  - Effective: Down-folded C-space effects into effective Hamiltonian H_eff
+LEVER integrates selected CI with neural quantum states for full-CI
+in orbital space. Three operational modes:
+  - Variational: NQS-enhanced sCI, solve H_SS with PT2 correction
+  - Effective: C-space effects down-folded into H_eff on S-space
   - Proxy: Diagonal approximation on full T = S ∪ C space
 
-Workflow follows three-layer design:
+Workflow design:
   L0: Static C++ layer (integrals, heat-bath tables)
-  L1: Outer loop (DetSpace evolution, Hamiltonian reconstruction)
+  L1: Outer loop (S/C space evolution, H reconstruction)
   L2: Inner loop (JIT-compiled network optimization)
 
+File: lever/examples/run_single.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: December, 2025
-File: lever/examples/run_single.py
 """
 
 from __future__ import annotations
 
 import argparse
 import time
+import warnings
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import optax
 
-from lever.driver import EffectiveDriver, ProxyDriver, VariationalDriver, AsymmetricDriver
 from lever import models
+from lever.driver import AsymmetricDriver, EffectiveDriver, ProxyDriver, VariationalDriver
 from lever.space import DetSpace
-from lever.space.selector import TopKSelector, ThresholdSelector, TopFractionSelector
+from lever.space.selector import ThresholdSelector, TopFractionSelector, TopKSelector
 from lever.system import MolecularSystem
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse LEVER command-line arguments."""
+    """Parse command-line arguments for LEVER execution."""
     parser = argparse.ArgumentParser(
         description="LEVER: Neural quantum states for selected CI",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -48,14 +47,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "fcidump",
         type=Path,
-        help="FCIDUMP file with molecular integrals"
+        help="Path to FCIDUMP file containing molecular integrals",
     )
     parser.add_argument(
         "--mode",
         type=str,
         choices=("variational", "effective", "proxy", "asymmetric"),
         default="variational",
-        help="Computational mode selection"
+        help="Computational mode: variational|effective|proxy|asymmetric",
     )
     return parser.parse_args()
 
@@ -63,24 +62,25 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Execute LEVER workflow with timing diagnostics."""
     args = parse_args()
-  
-    # JAX configuration
+
+    # Configure JAX runtime
     jax.config.update("jax_platforms", "cuda,cpu")
-    jax.config.update("jax_enable_x64", True)
+    jax.config.update("jax_enable_x64", False)
     jax.config.update("jax_log_compiles", False)
     jax.config.update("jax_debug_nans", False)
     print(f"JAX devices: {jax.devices()}")
-  
+    warnings.filterwarnings("ignore", message="Explicitly requested dtype.*is not available")
+
     start_time = time.perf_counter()
-  
-    # L0: Molecular system initialization
+
+    # L0: Initialize molecular system from FCIDUMP
     system = MolecularSystem.from_fcidump(args.fcidump)
 
-    # L1: Determinant space initialization
+    # L1: Initialize determinant space with HF reference
     hf_det = system.hf_determinant()
     detspace = DetSpace.initialize(hf_det)
 
-    # User constructs parametrizer
+    # Construct NQS parametrizer
     parametrizer = models.slater.MLP(
         n_so=system.n_so,
         dim=256,
@@ -88,7 +88,7 @@ def main() -> None:
         param_dtype=jnp.float64,
     )
 
-    # Construct Slater wavefunction
+    # Build Slater-type wavefunction model
     model = models.make_slater(
         system=system,
         parametrizer=parametrizer,
@@ -98,41 +98,39 @@ def main() -> None:
         param_dtype=jnp.float64,
     )
 
-    schedule = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=500, alpha=0.02)
-    optimizer = optax.adamw(learning_rate=schedule)
+    # Configure optimizer and selector
+    optimizer = optax.adamw(learning_rate=5e-4)
     selector = TopKSelector(256)
-    # selector = ThresholdSelector(threshold=1e-8)
-    # selector = TopFractionSelector(0.99999)
 
-    # Driver selection for compute mode
+    # Select driver based on computational mode
     driver_cls = {
         "variational": VariationalDriver,
         "effective": EffectiveDriver,
         "proxy": ProxyDriver,
-        "asymmetric": AsymmetricDriver
+        "asymmetric": AsymmetricDriver,
     }[args.mode]
-  
+
     driver = driver_cls.build(
         system=system,
         detspace=detspace,
         model=model,
         optimizer=optimizer,
         selector=selector,
-        chunk_size=None,
+        chunk_size=8192,
         use_gpu_kernel=False,
     )
-  
-    # L2: Execute optimization cycles
+
+    # L2: Execute optimization with outer/inner loop structure
     result = driver.run()
-  
-    # Final energy calculation: E_total = E_elec + E_nuc
+
+    # Compute final total energy: E_total = E_elec + E_nuc
     e_elec_final = result.energies[-1]
     e_total_final = e_elec_final + result.e_nuc
     elapsed = time.perf_counter() - start_time
-  
-    # Summary output
+
+    # Print summary
     print("\n" + "=" * 60)
-    print(f"System: NORB={system.n_orb}, NELEC={system.n_elec}, MS2={system.ms2}")
+    print(f"System: N_orb={system.n_orb}, N_elec={system.n_elec}, MS2={system.ms2}")
     print(f"Mode: {args.mode.upper()}")
     print(f"E_nuc:   {result.e_nuc:>18.8f} Ha")
     print(f"E_elec:  {e_elec_final:>18.8f} Ha")

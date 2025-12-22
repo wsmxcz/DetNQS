@@ -5,7 +5,7 @@
 JAX utilities for PyTree operations and memory-efficient chunking.
 
 Provides:
-  - Tree algebra: dot products, norms, element-wise operations
+  - Tree algebra: dot products, norms, element-wise ops
   - Memory-efficient batching: chunked forward/backward passes
 
 File: lever/utils/jax_utils.py
@@ -25,149 +25,168 @@ PyTree = Any
 
 
 def tree_dot(a: PyTree, b: PyTree) -> jnp.ndarray:
-    """
-    Compute inner product <a, b> = sum_i conj(a_i) * b_i.
-    
-    Returns complex scalar for complex inputs, real for real inputs.
-    """
+    """Inner product: <a|b> = sum_i conj(a_i) * b_i."""
     leaves_a = jax.tree_util.tree_leaves(a)
     leaves_b = jax.tree_util.tree_leaves(b)
     return sum(jnp.sum(jnp.conj(x) * y) for x, y in zip(leaves_a, leaves_b))
 
 
 def tree_norm(tree: PyTree) -> jnp.ndarray:
-    """Compute L2 norm: ||tree|| = sqrt(<tree, tree>)."""
+    """L2 norm: ||tree|| = sqrt(<tree|tree>)."""
     return jnp.sqrt(tree_dot(tree, tree).real)
 
 
 def tree_add(a: PyTree, b: PyTree) -> PyTree:
-    """Element-wise addition: a + b."""
+    """Element-wise addition."""
     return jax.tree.map(lambda x, y: x + y, a, b)
 
 
 def tree_sub(a: PyTree, b: PyTree) -> PyTree:
-    """Element-wise subtraction: a - b."""
+    """Element-wise subtraction."""
     return jax.tree.map(lambda x, y: x - y, a, b)
 
 
 def tree_scale(scalar: float | jnp.ndarray, tree: PyTree) -> PyTree:
-    """Scalar multiplication: scalar * tree."""
+    """Scalar multiplication."""
     return jax.tree.map(lambda x: scalar * x, tree)
 
 
 def tree_conj(tree: PyTree) -> PyTree:
-    """Element-wise complex conjugation."""
+    """Element-wise conjugation."""
     return jax.tree.map(jnp.conj, tree)
 
 
+def _leading_dim(tree: PyTree) -> int:
+    """Extract static leading dimension from first leaf for JIT compatibility."""
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        raise ValueError("Empty PyTree")
+    n = leaves[0].shape[0]
+    if not isinstance(n, int):
+        raise ValueError("Chunking requires static leading dimension")
+    return n
+
+
 def apply_chunked(
-    apply_fn: Callable[[PyTree, jnp.ndarray], PyTree],
+    apply_fn: Callable[[PyTree, PyTree], PyTree],
     params: PyTree,
-    inputs: jnp.ndarray,
+    inputs: PyTree,
     chunk_size: int,
 ) -> PyTree:
     """
-    Apply function in chunks to reduce memory usage.
-    
-    Splits input batch into chunks of size chunk_size, applies function
-    to each chunk via lax.scan, then concatenates results. Pads last
-    chunk by repeating final sample if needed.
-    
+    Apply function in chunks over batch dimension to reduce memory.
+  
+    Algorithm: Pad inputs (replicate last) to multiple of chunk_size,
+    reshape to (n_chunks, chunk_size, ...), scan over chunks, trim output.
+  
     Args:
-        apply_fn: Function (params, inputs) -> outputs (PyTree)
+        apply_fn: f(params, inputs) -> outputs
         params: Model parameters
-        inputs: Input array, shape (n_samples, ...)
-        chunk_size: Maximum samples per chunk
-    
+        inputs: Batched inputs (leading dim N)
+        chunk_size: Chunk size
+      
     Returns:
-        PyTree with leading dimension n_samples
+        Concatenated outputs for all N samples
     """
-    n_samples = inputs.shape[0]
+    n_samples = _leading_dim(inputs)
     if n_samples <= chunk_size:
         return apply_fn(params, inputs)
-    
+
     n_chunks = (n_samples + chunk_size - 1) // chunk_size
     n_padded = n_chunks * chunk_size
     pad_len = n_padded - n_samples
-    input_shape = inputs.shape[1:]
-    
-    if pad_len > 0:
-        padding = jnp.broadcast_to(inputs[-1:], (pad_len, *input_shape))
-        inputs = jnp.concatenate([inputs, padding], axis=0)
-    
-    inputs = inputs.reshape(n_chunks, chunk_size, *input_shape)
-    
+
+    def pad_last(x):
+        if pad_len <= 0:
+            return x
+        pad = jnp.broadcast_to(x[-1:], (pad_len,) + x.shape[1:])
+        return jnp.concatenate([x, pad], axis=0)
+
+    inputs_pad = jax.tree_util.tree_map(pad_last, inputs)
+
+    def reshape_in(x):
+        return x.reshape((n_chunks, chunk_size) + x.shape[1:])
+
+    inputs_2d = jax.tree_util.tree_map(reshape_in, inputs_pad)
+
     def scan_body(carry, x_chunk):
         y_chunk = apply_fn(params, x_chunk)
         return carry, y_chunk
-    
-    _, outputs = lax.scan(scan_body, None, inputs)
-    
+
+    _, outputs = lax.scan(scan_body, None, inputs_2d)
+
     def merge_and_trim(leaf):
         leaf = leaf.reshape((n_padded,) + leaf.shape[2:])
         return leaf[:n_samples]
-    
+
     return jax.tree_util.tree_map(merge_and_trim, outputs)
 
 
 def vjp_chunked(
-    apply_fn: Callable[[PyTree, jnp.ndarray], PyTree],
+    apply_fn: Callable[[PyTree, PyTree], PyTree],
     params: PyTree,
-    inputs: jnp.ndarray,
+    inputs: PyTree,
     cotangents: PyTree,
     chunk_size: int,
 ) -> PyTree:
     """
-    Compute VJP in chunks to reduce memory usage.
-    
-    Splits forward and backward passes into chunks, accumulating
-    gradients via lax.scan. Input padding replicates last sample;
-    cotangent padding uses zeros.
-    
+    Vector-Jacobian product in chunks to reduce memory.
+  
+    Algorithm: Pad inputs (replicate last) and cotangents (zeros),
+    reshape to (n_chunks, chunk_size, ...), accumulate grad_params
+    via scan: grad = sum_i vjp_i(cotangent_i).
+  
     Args:
-        apply_fn: Function (params, inputs) -> outputs (PyTree)
+        apply_fn: f(params, inputs) -> outputs
         params: Model parameters
-        inputs: Input array, shape (n_samples, ...)
-        cotangents: Output gradients (PyTree with leading dim n_samples)
-        chunk_size: Maximum samples per chunk
-    
+        inputs: Batched inputs (leading dim N)
+        cotangents: Gradient w.r.t. outputs
+        chunk_size: Chunk size
+      
     Returns:
-        Gradient PyTree with same structure as params
+        Gradient w.r.t. params
     """
-    n_samples = inputs.shape[0]
+    n_samples = _leading_dim(inputs)
     if n_samples <= chunk_size:
         _, vjp_fn = jax.vjp(lambda p: apply_fn(p, inputs), params)
         (grads,) = vjp_fn(cotangents)
         return grads
-    
+
     n_chunks = (n_samples + chunk_size - 1) // chunk_size
     n_padded = n_chunks * chunk_size
     pad_len = n_padded - n_samples
-    input_shape = inputs.shape[1:]
-    
-    if pad_len > 0:
-        in_pad = jnp.broadcast_to(inputs[-1:], (pad_len, *input_shape))
-        inputs = jnp.concatenate([inputs, in_pad], axis=0)
-    
-    inputs = inputs.reshape(n_chunks, chunk_size, *input_shape)
-    
-    def pad_and_reshape_cot(leaf):
-        if pad_len > 0:
-            zeros = jnp.zeros((pad_len,) + leaf.shape[1:], dtype=leaf.dtype)
-            leaf = jnp.concatenate([leaf, zeros], axis=0)
-        return leaf.reshape((n_chunks, chunk_size) + leaf.shape[1:])
-    
-    cotangents = jax.tree_util.tree_map(pad_and_reshape_cot, cotangents)
+
+    def pad_last(x):
+        if pad_len <= 0:
+            return x
+        pad = jnp.broadcast_to(x[-1:], (pad_len,) + x.shape[1:])
+        return jnp.concatenate([x, pad], axis=0)
+
+    def pad_zeros(x):
+        if pad_len <= 0:
+            return x
+        zeros = jnp.zeros((pad_len,) + x.shape[1:], dtype=x.dtype)
+        return jnp.concatenate([x, zeros], axis=0)
+
+    inputs_pad = jax.tree_util.tree_map(pad_last, inputs)
+    cot_pad = jax.tree_util.tree_map(pad_zeros, cotangents)
+
+    def reshape_2d(x):
+        return x.reshape((n_chunks, chunk_size) + x.shape[1:])
+
+    inputs_2d = jax.tree_util.tree_map(reshape_2d, inputs_pad)
+    cot_2d = jax.tree_util.tree_map(reshape_2d, cot_pad)
+
     grad_acc = jax.tree_util.tree_map(jnp.zeros_like, params)
-    
+
     def scan_body(grad_acc, scan_in):
         x_chunk, cot_chunk = scan_in
         _, vjp_fn = jax.vjp(lambda p: apply_fn(p, x_chunk), params)
-        (grad_chunk,) = vjp_fn(cot_chunk)
-        grad_acc = jax.tree_util.tree_map(lambda a, g: a + g, grad_acc, grad_chunk)
+        (g_chunk,) = vjp_fn(cot_chunk)
+        grad_acc = jax.tree_util.tree_map(lambda a, g: a + g, grad_acc, g_chunk)
         return grad_acc, None
-    
-    grads, _ = lax.scan(scan_body, grad_acc, (inputs, cotangents))
+
+    grads, _ = lax.scan(scan_body, grad_acc, (inputs_2d, cot_2d))
     return grads
 
 

@@ -11,7 +11,7 @@ import numpy as np
 
 from ..operator import functional as func_mod
 from ..space import DetSpace
-from ..state import DeterministicState
+from ..state import State
 
 
 @dataclass
@@ -41,7 +41,7 @@ class RunRecord:
 
 
 def measure_energy(
-    state: DeterministicState,
+    state: State,
     ham: Any,
     op: Callable,
     *,
@@ -99,7 +99,7 @@ class RuntimeRecorder:
         self,
         outer: int,
         *,
-        state: DeterministicState,
+        state: State,
         detspace: DetSpace,
         ham: Any,
         op: Callable,

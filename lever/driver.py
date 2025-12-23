@@ -5,15 +5,15 @@
 Deterministic optimization drivers for LEVER variational framework.
 
 Computational modes:
-  - Variational: E[ψ_S] = <ψ_S|H_SS|ψ_S> / <ψ_S|ψ_S>
-  - Effective:   E_eff[ψ_S] via Löwdin downfolding H_eff = H_SS + H_SC·(E_ref - H_CC + ε·I)^(-1)·H_CS
-  - Proxy:       E[ψ_T] on T-space with diagonal C-block approximation
-  - Asymmetric:  E_asym = <ψ|P_S H|ψ> / <ψ|P_S|ψ>
+  - Variational: E[psi_S] = <psi_S|H_SS|psi_S> / <psi_S|psi_S>
+  - Effective:   E_eff[psi_S] via Löwdin downfolding H_eff = H_SS + H_SC·(E_ref - H_CC + eps·I)^(-1)·H_CS
+  - Proxy:       E[psi_T] on T-space with diagonal C-block approximation
+  - Asymmetric:  E_asym = <psi|P_S H|psi> / <psi|P_S|psi>
 
-Architecture layers:
+Architecture:
   - L0 (C++):    Static integrals, Heat-Bath tables, COO assembly
   - L1 (Python): Outer loop - space evolution, Hamiltonian rebuild
-  - L2 (JAX):    Inner loop - JIT single-step optimization
+  - L2 (JAX):    Inner loop - JIT optimization sweep
 
 File: lever/driver.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -22,17 +22,16 @@ Date: December, 2025
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import time
 
 from . import core
-from .analysis.trace import Trace
 from .operator import functional as func_mod
 from .operator import hamiltonian as ham_mod
 from .operator import kernel as kern_mod
@@ -42,41 +41,26 @@ from .system import MolecularSystem
 
 
 @dataclass
-class DriverResult:
-    """Container for driver execution results."""
-
-    state: State
-    detspace: DetSpace
-    trace: Trace
-    e_nuc: float
-
-    def total_energies(self) -> np.ndarray:
-        """Total energies: E_tot = E_elec + E_nuc."""
-        return self.trace.energies + self.e_nuc
-
-
-@dataclass
 class BaseDriver:
     """
-    Base driver for deterministic LEVER optimization.
+    Base driver for deterministic variational optimization.
 
-    Outer loop workflow:
+    Outer loop:
       1. Build Hamiltonian for current S/C spaces
       2. Execute inner optimization loop
       3. Compute norm decomposition on T-space
-      4. Update S-space via amplitude-based selection
-      5. Check convergence on energy
+      4. Trigger callbacks with diagnostic stats
+      5. Update S-space via amplitude-based selection
+      6. Check convergence on energy
 
-    Inner loop workflow:
-      - Forward pass: ψ(x; θ)
-      - Compute energy and gradient: E[θ], ∇_θ E
-      - Update parameters: θ ← optimizer(θ, ∇_θ E)
-      - Check convergence: ΔE < tol for patience consecutive steps
+    Inner loop:
+      - Evaluate psi(x; theta) and compute E[theta], grad_theta E
+      - Update parameters: theta <- optimizer(theta, grad_theta E)
+      - Check convergence: delta_E < tol for patience consecutive steps
 
-    Subclass hooks:
-      - mode_tag(): Mode identifier string
-      - build_hamiltonian(): Construct Hamiltonian operators
-      - post_sweep(): Process results after inner loop
+    Subclass requirements:
+      - mode_tag(): Return mode identifier string
+      - build_hamiltonian(): Construct Hamiltonian and SpMV operator
     """
 
     system: MolecularSystem
@@ -86,8 +70,8 @@ class BaseDriver:
     opt_state: optax.OptState
     selector: Selector
 
-    max_outer: int = 50
-    max_inner: int = 500
+    max_outer: int = 10
+    max_inner: int = 1000
 
     inner_tol: float = 1e-8
     inner_patience: int = 100
@@ -95,12 +79,7 @@ class BaseDriver:
     outer_patience: int = 5
 
     chunk_size: int | None = None
-    verbose: bool = True
 
-    _trace: Trace = field(default_factory=Trace.empty, init=False)
-    _start_time: float = field(default=0.0, init=False)
-    _outer_history: list[float] = field(default_factory=list, init=False)
-  
     @classmethod
     def build(
         cls,
@@ -126,7 +105,7 @@ class BaseDriver:
             **driver_kwargs: Additional driver parameters
 
         Returns:
-            Initialized driver ready for run()
+            Initialized driver instance
         """
         state = State.init(
             system=system, detspace=detspace, model=model, key=key
@@ -144,7 +123,7 @@ class BaseDriver:
         )
 
     def mode_tag(self) -> str:
-        """Mode identifier for logging."""
+        """Return mode identifier for logging."""
         return "base"
 
     def build_hamiltonian(self) -> tuple[Any, Any]:
@@ -156,12 +135,8 @@ class BaseDriver:
         """
         raise NotImplementedError
 
-    def post_sweep(self, energy_trace: np.ndarray, n_steps: int) -> None:
-        """Hook for post-inner-loop processing."""
-        pass
-
     def _compute_screening_weights(self) -> np.ndarray | None:
-        """Compute normalized sqrt(p_i) on S-space for screening."""
+        """Compute normalized sqrt(p_i) on S-space for Heat-Bath screening."""
         if self.detspace.size_S == 0:
             return None
 
@@ -178,31 +153,30 @@ class BaseDriver:
 
     def _compute_norms(self) -> tuple[float, float]:
         """
-        Compute norm decomposition: ||ψ_S||² and ||ψ_C||² on T-space.
-        
+        Compute norm decomposition: ||psi_S||^2 and ||psi_C||^2 on T-space.
+      
         Returns:
             (norm_s, norm_c): S-space and C-space norms
         """
         n_s = self.detspace.size_S
         n_c = self.detspace.size_C
-        
-        # Evaluate full T-space wavefunction
+      
         sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
         logabs_t = jnp.real(logabs_t)
-        
+      
         shift = jnp.max(logabs_t) if logabs_t.size > 0 else 0.0
         psi_t = sign_t * jnp.exp(logabs_t - shift)
-        
+      
         psi_s = psi_t[:n_s]
         psi_c = psi_t[n_s:n_s + n_c] if n_c > 0 else jnp.array([])
-        
+      
         norm_s = float(jnp.real(jnp.vdot(psi_s, psi_s)))
         norm_c = float(jnp.real(jnp.vdot(psi_c, psi_c))) if n_c > 0 else 0.0
-        
+      
         return norm_s, norm_c
 
     def evolve_space(self) -> None:
-        """Update S-space via importance sampling on log|ψ_T|."""
+        """Update S-space via importance sampling on log|psi_T|."""
         sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
         logabs_t = jnp.real(logabs_t)
         log_amp_host = np.asarray(logabs_t, dtype=np.float64)
@@ -211,59 +185,27 @@ class BaseDriver:
         self.detspace = new_space
         self.state = self.state.update_space(new_space)
 
-    def _check_outer_convergence(self, value: float) -> tuple[bool, float]:
+    def _check_convergence(self, energy_history: list[float]) -> bool:
         """
         Check outer convergence via sliding window.
 
-        Returns:
-            (converged, max_delta)
-        """
-        self._outer_history.append(value)
+        Args:
+            energy_history: List of energies from consecutive outer steps
 
+        Returns:
+            True if max(delta_E) < tol for patience consecutive steps
+        """
         if (
             self.outer_patience <= 0
-            or len(self._outer_history) <= self.outer_patience
+            or len(energy_history) <= self.outer_patience
         ):
-            return False, float("inf")
+            return False
 
-        window = self._outer_history[-(self.outer_patience + 1) :]
+        window = energy_history[-(self.outer_patience + 1):]
         deltas = [abs(window[i] - window[i - 1]) for i in range(1, len(window))]
         max_delta = max(deltas)
 
-        return max_delta < self.outer_tol, max_delta
-
-    def _print_header(self) -> None:
-        """Print formatted table header."""
-        print("\n" + "=" * 95)
-        header = (
-            f"{'Outer':>6} | {'|S|':>8} | {'|C|':>8} | "
-            f"{'Energy':>18} | {'||ψ_S||²':>10} | {'||ψ_C||²':>10} | {'Time':>10}"
-        )
-        print(header)
-        print("=" * 95)
-
-    def _print_progress(
-        self, 
-        outer: int, 
-        energy: float, 
-        norm_s: float, 
-        norm_c: float, 
-        elapsed: float
-    ) -> None:
-        """Print progress row with norm information."""
-        n_s = self.detspace.size_S
-        n_c = self.detspace.size_C
-        
-        # Normalize to fractions
-        norm_tot = norm_s + norm_c
-        frac_s = norm_s / norm_tot if norm_tot > 1e-14 else 1.0
-        frac_c = norm_c / norm_tot if norm_tot > 1e-14 else 0.0
-      
-        row = (
-            f"{outer:6d} | {n_s:8d} | {n_c:8d} | "
-            f"{energy:18.10f} | {frac_s:10.6f} | {frac_c:10.6f} | {elapsed:10.2f}s"
-        )
-        print(row)
+        return max_delta < self.outer_tol
 
     def _build_sweep(self, ham: Any, op: Callable) -> Callable:
         """Build JIT-compiled inner optimization loop."""
@@ -282,10 +224,9 @@ class BaseDriver:
         )
 
         def sweep(state, opt_state):
-            """Inner loop: optimize parameters until convergence."""
-          
+            """Execute inner loop until convergence."""
+        
             def single_step(state, opt_state):
-                """Single optimization step."""
                 energy_val, grad = energy_step(state)
                 state, opt_state = state.apply_gradients(
                     gradients=grad,
@@ -293,9 +234,9 @@ class BaseDriver:
                     optimizer=self.optimizer,
                 )
                 return state, opt_state, energy_val
-          
+        
             single_step = jax.jit(single_step, donate_argnums=(0, 1))
-          
+        
             energy_trace = []
             last_energy = float("inf")
             streak = 0
@@ -321,13 +262,28 @@ class BaseDriver:
 
         return sweep
 
-    def run(self) -> DriverResult:
-        """Execute outer loop over determinant-space evolution."""
-        self._start_time = time.perf_counter()
+    def post_inner_sweep(self, energy_trace: np.ndarray) -> None:
+        """Hook for mode-specific logic after inner loop (L1 level)."""
+        pass
+
+    def run(self, callbacks: list[Any] | None = None) -> None:
+        """
+        Execute outer loop over determinant-space evolution.
+
+        Args:
+            callbacks: Observer callbacks with methods:
+                      - on_outer_end(step: int, stats: dict, driver: BaseDriver)
+                      - on_run_end(driver: BaseDriver) [optional]
+        """
+        callbacks = callbacks or []
+        start_time = time.perf_counter()
       
-        if self.verbose:
-            self._print_header()
+        for cb in callbacks:
+            if hasattr(cb, "on_run_start"):
+                cb.on_run_start(self)
       
+        energy_history = []
+    
         for outer in range(self.max_outer):
             ham, op = self.build_hamiltonian()
             inner_sweep = self._build_sweep(ham, op)
@@ -336,53 +292,49 @@ class BaseDriver:
                 self.state, self.opt_state
             )
 
-            self.post_sweep(energy_trace, len(energy_trace))
+            self.post_inner_sweep(energy_trace)
 
-            # Compute norms on current T-space
             norm_s, norm_c = self._compute_norms()
 
-            # Record outer loop completion
             if len(energy_trace) > 0:
                 last_e = float(energy_trace[-1])
-                elapsed = time.perf_counter() - self._start_time
-              
-                self._trace = self._trace.append(
-                    outer=outer,
-                    energy=last_e,
-                    timestamp=elapsed,
-                    n_s=self.detspace.size_S,
-                    n_c=self.detspace.size_C,
-                    norm_s=norm_s,
-                    norm_c=norm_c,
-                )
-              
-                if self.verbose:
-                    self._print_progress(outer, last_e, norm_s, norm_c, elapsed)
-              
-                converged, _ = self._check_outer_convergence(last_e)
-                if converged:
+                elapsed = time.perf_counter() - start_time
+            
+                stats = {
+                    "outer_step": outer,
+                    "energy": last_e,
+                    "norm_s": norm_s,
+                    "norm_c": norm_c,
+                    "size_s": self.detspace.size_S,
+                    "size_c": self.detspace.size_C,
+                    "timestamp": elapsed,
+                    "inner_steps": len(energy_trace),
+                    "inner_trace": energy_trace.tolist(),
+                }
+            
+                for cb in callbacks:
+                    cb.on_outer_end(outer, stats, self)
+            
+                energy_history.append(last_e)
+                if self._check_convergence(energy_history):
                     break
 
             self.evolve_space()
 
-        return DriverResult(
-            state=self.state,
-            detspace=self.detspace,
-            trace=self._trace,
-            e_nuc=self.system.e_nuc,
-        )
+        for cb in callbacks:
+            cb.on_run_end(self)
 
 
 @dataclass
 class VariationalDriver(BaseDriver):
     """
-    Variational mode: E = <ψ_S|H_SS|ψ_S> / <ψ_S|ψ_S> on S-space.
+    Variational mode: E = <psi_S|H_SS|psi_S> / <psi_S|psi_S> on S-space.
 
     Workflow:
       1. Construct H_SS on current S-space
-      2. Optimize parameters to minimize E[ψ_S]
+      2. Optimize parameters to minimize E[psi_S]
       3. Generate complement C via Heat-Bath screening
-      4. Update S ← select from T
+      4. Update S <- select from T
     """
 
     screening: str = "dynamic"
@@ -425,17 +377,17 @@ class EffectiveDriver(BaseDriver):
     Effective mode: Löwdin downfolded Hamiltonian in S-space.
 
     Effective Hamiltonian:
-      H_eff = H_SS + H_SC·(E_ref - H_CC + ε·I)^(-1)·H_CS
+      H_eff = H_SS + H_SC · (E_ref - H_CC + eps·I)^(-1) · H_CS
 
     Regularization:
-      - sigma: Constant shift ε·I
+      - sigma: Constant shift eps·I
       - linear_shift: max(0, E_ref - diag(H_CC))
 
     Workflow:
       1. Build proxy H and complement C
       2. Compute H_eff via Löwdin partitioning
-      3. Optimize E_eff = <ψ_S|H_eff|ψ_S>
-      4. Update E_ref ← last energy, S ← select from T
+      3. Optimize E_eff = <psi_S|H_eff|psi_S>
+      4. Update E_ref <- last energy, S <- select from T
     """
 
     screening: str = "static"
@@ -446,6 +398,11 @@ class EffectiveDriver(BaseDriver):
 
     def mode_tag(self) -> str:
         return "effective"
+
+    def post_inner_sweep(self, energy_trace: np.ndarray) -> None:
+        """Update reference energy E_ref for next Hamiltonian rebuild."""
+        if len(energy_trace) > 0:
+            self.e_ref = float(energy_trace[-1])
 
     def build_hamiltonian(self) -> tuple[Any, Any]:
         """Build H_eff via Löwdin downfolding."""
@@ -476,11 +433,6 @@ class EffectiveDriver(BaseDriver):
 
         return ham, op
 
-    def post_sweep(self, energy_trace: np.ndarray, n_steps: int) -> None:
-        """Update reference energy E_ref ← last energy."""
-        if n_steps > 0:
-            self.e_ref = float(energy_trace[n_steps - 1])
-
 
 @dataclass
 class ProxyDriver(BaseDriver):
@@ -489,12 +441,12 @@ class ProxyDriver(BaseDriver):
 
     Hamiltonian blocks:
       H = [[H_SS,       H_SC      ],
-           [H_CS,  diag(H_CC) + δ·I]]
+           [H_CS,  diag(H_CC) + delta·I]]
 
     Workflow:
-      1. Build proxy H on T = S ∪ C with screening
-      2. Optimize E = <ψ_T|H|ψ_T> / <ψ_T|ψ_T>
-      3. Update S ← select from T
+      1. Build proxy H on T = S union C with screening
+      2. Optimize E = <psi_T|H|psi_T> / <psi_T|psi_T>
+      3. Update S <- select from T
     """
 
     screening: str = "dynamic"
@@ -533,14 +485,14 @@ class AsymmetricDriver(BaseDriver):
     Asymmetric mode: VMC-style truncated estimator on S-space.
 
     Energy estimator:
-        E_asym = <ψ|P_S H|ψ> / <ψ|P_S|ψ>
+        E_asym = <psi|P_S H|psi> / <psi|P_S|psi>
 
     where P_S projects onto S-space.
 
     Workflow:
       - Uses proxy Hamiltonian H_T same as ProxyDriver
       - Inner loop minimizes asymmetric Rayleigh quotient
-      - S-space evolution uses full-T amplitudes |ψ_T|
+      - S-space evolution uses full-T amplitudes |psi_T|
     """
 
     screening: str = "static"
@@ -572,7 +524,6 @@ class AsymmetricDriver(BaseDriver):
 
 
 __all__ = [
-    "DriverResult",
     "BaseDriver",
     "VariationalDriver",
     "EffectiveDriver",

@@ -113,4 +113,33 @@ struct VariationalResult {
     bool use_heatbath = false
 );
 
+// --- PT2 (Epstein–Nesbet) ---
+
+/** Result of EN-PT2 correction computed from S-space wavefunction. */
+struct Pt2Result {
+    double e_var;   // variational electronic energy (normalized)
+    double e_pt2;   // second-order correction
+    std::size_t n_ext; // number of unique external dets accumulated
+};
+
+/**
+ * Compute EN-PT2 correction:
+ *   E_PT2 = sum_a | <a|H|Psi_S> |^2 / (E_var - H_aa)
+ *
+ * External determinants "a" are generated on-the-fly from singles/doubles
+ * connected to S, excluding those already in S.
+ *
+ * Note: if use_heatbath=true, doubles are generated via HB table with cutoff eps1,
+ * and singles are filtered by max(eps1, MAT_ELEMENT_THRESH).
+ */
+[[nodiscard]] Pt2Result compute_pt2(
+    std::span<const Det> S,
+    std::span<const std::complex<double>> coeffs_S,
+    const HamEval& ham,
+    int n_orb,
+    const HeatBathTable* hb_table = nullptr,
+    double eps1 = 1e-6,
+    bool use_heatbath = false
+);
+
 } // namespace lever

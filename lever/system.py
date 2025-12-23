@@ -225,5 +225,4 @@ class MolecularSystem:
         beta_word = np.uint64((1 << self.n_beta) - 1)
         return np.asarray([alpha_word, beta_word], dtype=np.uint64)
 
-
 __all__ = ["MolecularSystem", "parse_fcidump_header"]

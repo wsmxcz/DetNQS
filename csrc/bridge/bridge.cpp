@@ -230,6 +230,7 @@ struct IntCtx {
 
 NB_MODULE(_lever_cpp, m) {
     m.doc() = "LEVER C++ core bridge";
+    nb::set_leak_warnings(false);
 
     // ------------------------------------------------------------------------
     // Integral context
@@ -715,4 +716,51 @@ NB_MODULE(_lever_cpp, m) {
           "use_heatbath"_a = false,
           "eps1"_a = 1e-6,
           "Compute variational energy E_el = <Psi|H|Psi> / <Psi|Psi>.");
+
+    // ------------------------------------------------------------------------
+    // EN-PT2 correction
+    // ------------------------------------------------------------------------
+    m.def("compute_pt2",
+          [](DetArrayRO dets,
+             C128VecRO coeffs,
+             const IntCtx* ctx,
+             int n_orb,
+             bool use_heatbath,
+             double eps1) -> nb::tuple {
+
+              if (coeffs.ndim() != 1) {
+                  throw std::invalid_argument("coeffs must be 1D");
+              }
+              const auto S_vec = to_det_vector(dets);
+              if (static_cast<std::size_t>(coeffs.shape(0)) != S_vec.size()) {
+                  throw std::invalid_argument("coeff size mismatch");
+              }
+
+              if (use_heatbath && !ctx->hb) {
+                  throw std::invalid_argument("Heat-Bath table not initialized");
+              }
+
+              std::span<const std::complex<double>> c_span(
+                  coeffs.data(), static_cast<std::size_t>(coeffs.shape(0))
+              );
+
+              auto res = lever::compute_pt2(
+                  std::span<const Det>(S_vec.data(), S_vec.size()),
+                  c_span,
+                  ctx->ham,
+                  n_orb,
+                  use_heatbath ? ctx->hb.get() : nullptr,
+                  eps1,
+                  use_heatbath
+              );
+
+              return nb::make_tuple(res.e_var, res.e_pt2);
+          },
+          "dets_S"_a,
+          "coeffs_S"_a,
+          "int_ctx"_a,
+          "n_orb"_a,
+          "use_heatbath"_a = false,
+          "eps1"_a = 1e-6,
+          "Compute EN-PT2 correction (E_var, E_PT2) from S-space wavefunction.");
 }

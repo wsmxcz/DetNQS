@@ -53,6 +53,9 @@ get_ham_eff = _lever_cpp.get_ham_eff
 compute_variational_energy = _lever_cpp.compute_variational_energy
 """Compute <Psi|H|Psi> and <Psi|Psi> on a fixed determinant basis."""
 
+compute_pt2 = _lever_cpp.compute_pt2
+"""Compute EN-PT2 correction (E_var, E_PT2) from S-space wavefunction."""
+
 __all__ = [
     "IntCtx",
     "gen_fci_dets",
@@ -66,4 +69,5 @@ __all__ = [
     "get_local_conn",
     "get_local_connections",
     "compute_variational_energy",
+    "compute_pt2",
 ]

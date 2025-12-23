@@ -299,6 +299,21 @@ def compute_variational_energy(
     """
     ...
 
+def compute_pt2(
+    dets_S: DetArray,
+    coeffs_S: C128Array,
+    int_ctx: IntCtx,
+    n_orb: int,
+    use_heatbath: bool = False,
+    eps1: float = 1e-6,
+) -> tuple[float, float]:
+    """
+    Compute EN-PT2 correction from S-space wavefunction.
+
+    Returns:
+        (e_var_el, e_pt2) where e_var_el is normalized electronic energy.
+    """
+
 __all__ = [
     "DetArray",
     "F64Array",
@@ -318,4 +333,5 @@ __all__ = [
     "get_ham_conn_amp",
     "get_ham_eff",
     "compute_variational_energy",
+    "compute_pt2"
 ]

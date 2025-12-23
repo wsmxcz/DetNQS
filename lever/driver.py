@@ -29,18 +29,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import time
 
 from . import core
+from .analysis.trace import Trace
 from .operator import functional as func_mod
 from .operator import hamiltonian as ham_mod
 from .operator import kernel as kern_mod
-from .operator import gpu_kernel as gkern_mod
 from .space import DetSpace, Selector
 from .state import State
 from .system import MolecularSystem
-
-
-Callback = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -49,12 +47,12 @@ class DriverResult:
 
     state: State
     detspace: DetSpace
-    energies: list[float]
+    trace: Trace
     e_nuc: float
 
-    def total_energies(self) -> list[float]:
+    def total_energies(self) -> np.ndarray:
         """Total energies: E_tot = E_elec + E_nuc."""
-        return [e + self.e_nuc for e in self.energies]
+        return self.trace.energies + self.e_nuc
 
 
 @dataclass
@@ -65,8 +63,9 @@ class BaseDriver:
     Outer loop workflow:
       1. Build Hamiltonian for current S/C spaces
       2. Execute inner optimization loop
-      3. Update S-space via amplitude-based selection
-      4. Check convergence on energy
+      3. Compute norm decomposition on T-space
+      4. Update S-space via amplitude-based selection
+      5. Check convergence on energy
 
     Inner loop workflow:
       - Forward pass: ψ(x; θ)
@@ -87,7 +86,7 @@ class BaseDriver:
     opt_state: optax.OptState
     selector: Selector
 
-    max_outer: int = 30
+    max_outer: int = 50
     max_inner: int = 500
 
     inner_tol: float = 1e-8
@@ -96,12 +95,12 @@ class BaseDriver:
     outer_patience: int = 5
 
     chunk_size: int | None = None
-    use_gpu_kernel: bool = False
+    verbose: bool = True
 
-    outer_history: list[float] = field(default_factory=list, init=False)
-    callbacks: list[Callback] | None = None
-    analysis_recorder: Any = None
-
+    _trace: Trace = field(default_factory=Trace.empty, init=False)
+    _start_time: float = field(default=0.0, init=False)
+    _outer_history: list[float] = field(default_factory=list, init=False)
+  
     @classmethod
     def build(
         cls,
@@ -145,7 +144,7 @@ class BaseDriver:
         )
 
     def mode_tag(self) -> str:
-        """Mode identifier for callbacks."""
+        """Mode identifier for logging."""
         return "base"
 
     def build_hamiltonian(self) -> tuple[Any, Any]:
@@ -162,12 +161,7 @@ class BaseDriver:
         pass
 
     def _compute_screening_weights(self) -> np.ndarray | None:
-        """
-        Compute normalized screening weights sqrt(p_i) on S-space.
-
-        Returns:
-            Weights or None if S-space is empty
-        """
+        """Compute normalized sqrt(p_i) on S-space for screening."""
         if self.detspace.size_S == 0:
             return None
 
@@ -182,6 +176,31 @@ class BaseDriver:
 
         return np.asarray(jnp.sqrt(prob_s), dtype=np.float64)
 
+    def _compute_norms(self) -> tuple[float, float]:
+        """
+        Compute norm decomposition: ||ψ_S||² and ||ψ_C||² on T-space.
+        
+        Returns:
+            (norm_s, norm_c): S-space and C-space norms
+        """
+        n_s = self.detspace.size_S
+        n_c = self.detspace.size_C
+        
+        # Evaluate full T-space wavefunction
+        sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
+        logabs_t = jnp.real(logabs_t)
+        
+        shift = jnp.max(logabs_t) if logabs_t.size > 0 else 0.0
+        psi_t = sign_t * jnp.exp(logabs_t - shift)
+        
+        psi_s = psi_t[:n_s]
+        psi_c = psi_t[n_s:n_s + n_c] if n_c > 0 else jnp.array([])
+        
+        norm_s = float(jnp.real(jnp.vdot(psi_s, psi_s)))
+        norm_c = float(jnp.real(jnp.vdot(psi_c, psi_c))) if n_c > 0 else 0.0
+        
+        return norm_s, norm_c
+
     def evolve_space(self) -> None:
         """Update S-space via importance sampling on log|ψ_T|."""
         sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
@@ -192,42 +211,62 @@ class BaseDriver:
         self.detspace = new_space
         self.state = self.state.update_space(new_space)
 
-    def _run_callbacks(self, info: dict[str, Any]) -> None:
-        """Invoke registered callbacks."""
-        if self.callbacks:
-            for cb in self.callbacks:
-                cb(info)
-
     def _check_outer_convergence(self, value: float) -> tuple[bool, float]:
         """
         Check outer convergence via sliding window.
 
-        Criterion: max|E_i - E_(i-1)| < tol for last (patience+1) points.
-
         Returns:
             (converged, max_delta)
         """
-        self.outer_history.append(value)
+        self._outer_history.append(value)
 
         if (
             self.outer_patience <= 0
-            or len(self.outer_history) <= self.outer_patience
+            or len(self._outer_history) <= self.outer_patience
         ):
             return False, float("inf")
 
-        window = self.outer_history[-(self.outer_patience + 1) :]
+        window = self._outer_history[-(self.outer_patience + 1) :]
         deltas = [abs(window[i] - window[i - 1]) for i in range(1, len(window))]
         max_delta = max(deltas)
 
         return max_delta < self.outer_tol, max_delta
 
-    def _build_sweep(self, ham: Any, op: Callable) -> Callable:
-        """
-        Build inner optimization loop with JIT single-step updates.
+    def _print_header(self) -> None:
+        """Print formatted table header."""
+        print("\n" + "=" * 95)
+        header = (
+            f"{'Outer':>6} | {'|S|':>8} | {'|C|':>8} | "
+            f"{'Energy':>18} | {'||ψ_S||²':>10} | {'||ψ_C||²':>10} | {'Time':>10}"
+        )
+        print(header)
+        print("=" * 95)
 
-        All mode-specific decisions resolved at L1. The JIT body sees
-        a single energy_step(state) callable.
-        """
+    def _print_progress(
+        self, 
+        outer: int, 
+        energy: float, 
+        norm_s: float, 
+        norm_c: float, 
+        elapsed: float
+    ) -> None:
+        """Print progress row with norm information."""
+        n_s = self.detspace.size_S
+        n_c = self.detspace.size_C
+        
+        # Normalize to fractions
+        norm_tot = norm_s + norm_c
+        frac_s = norm_s / norm_tot if norm_tot > 1e-14 else 1.0
+        frac_c = norm_c / norm_tot if norm_tot > 1e-14 else 0.0
+      
+        row = (
+            f"{outer:6d} | {n_s:8d} | {n_c:8d} | "
+            f"{energy:18.10f} | {frac_s:10.6f} | {frac_c:10.6f} | {elapsed:10.2f}s"
+        )
+        print(row)
+
+    def _build_sweep(self, ham: Any, op: Callable) -> Callable:
+        """Build JIT-compiled inner optimization loop."""
         mode = self.mode_tag()
         detspace = self.detspace
         chunk_size = self.chunk_size
@@ -244,10 +283,9 @@ class BaseDriver:
 
         def sweep(state, opt_state):
             """Inner loop: optimize parameters until convergence."""
-            
-            # Define single optimization step
+          
             def single_step(state, opt_state):
-                """Single optimization step: energy, gradients, parameter update."""
+                """Single optimization step."""
                 energy_val, grad = energy_step(state)
                 state, opt_state = state.apply_gradients(
                     gradients=grad,
@@ -255,11 +293,9 @@ class BaseDriver:
                     optimizer=self.optimizer,
                 )
                 return state, opt_state, energy_val
-            
-            # JIT compile with buffer donation for memory efficiency
-            # donate_argnums=(0, 1) allows JAX to reuse input buffers
+          
             single_step = jax.jit(single_step, donate_argnums=(0, 1))
-            
+          
             energy_trace = []
             last_energy = float("inf")
             streak = 0
@@ -281,51 +317,48 @@ class BaseDriver:
 
                 last_energy = energy
 
-            return state, opt_state, np.array(energy_trace), len(energy_trace)
+            return state, opt_state, np.array(energy_trace)
 
         return sweep
 
     def run(self) -> DriverResult:
         """Execute outer loop over determinant-space evolution."""
-        energies: list[float] = []
-
+        self._start_time = time.perf_counter()
+      
+        if self.verbose:
+            self._print_header()
+      
         for outer in range(self.max_outer):
             ham, op = self.build_hamiltonian()
-
             inner_sweep = self._build_sweep(ham, op)
 
-            self.state, self.opt_state, energy_trace, n_steps = inner_sweep(
+            self.state, self.opt_state, energy_trace = inner_sweep(
                 self.state, self.opt_state
             )
 
-            for inner in range(n_steps):
-                e = float(energy_trace[inner])
-                energies.append(e)
+            self.post_sweep(energy_trace, len(energy_trace))
 
-                self._run_callbacks(
-                    {
-                        "mode": self.mode_tag(),
-                        "outer": outer,
-                        "inner": inner,
-                        "energy": e,
-                    }
+            # Compute norms on current T-space
+            norm_s, norm_c = self._compute_norms()
+
+            # Record outer loop completion
+            if len(energy_trace) > 0:
+                last_e = float(energy_trace[-1])
+                elapsed = time.perf_counter() - self._start_time
+              
+                self._trace = self._trace.append(
+                    outer=outer,
+                    energy=last_e,
+                    timestamp=elapsed,
+                    n_s=self.detspace.size_S,
+                    n_c=self.detspace.size_C,
+                    norm_s=norm_s,
+                    norm_c=norm_c,
                 )
-
-            self.post_sweep(energy_trace, n_steps)
-
-            if self.analysis_recorder is not None:
-                self.analysis_recorder.summarize_outer(
-                    outer,
-                    state=self.state,
-                    ham=ham,
-                    op=op,
-                    detspace=self.detspace,
-                    mode=self.mode_tag(),
-                    chunk_size=self.chunk_size,
-                )
-
-            if n_steps > 0:
-                last_e = float(energy_trace[n_steps - 1])
+              
+                if self.verbose:
+                    self._print_progress(outer, last_e, norm_s, norm_c, elapsed)
+              
                 converged, _ = self._check_outer_convergence(last_e)
                 if converged:
                     break
@@ -335,7 +368,7 @@ class BaseDriver:
         return DriverResult(
             state=self.state,
             detspace=self.detspace,
-            energies=energies,
+            trace=self._trace,
             e_nuc=self.system.e_nuc,
         )
 
@@ -381,12 +414,7 @@ class VariationalDriver(BaseDriver):
         self.state = self.state.update_space(self.detspace)
 
         ham = ham_mod.build_ss_hamiltonian(self.system, self.detspace)
-        psi_dtype = self.state.psi_dtype
-
-        if self.use_gpu_kernel:
-            op = gkern_mod.build_ss_operator_gpu(ham, jax_dtype=psi_dtype)
-        else:
-            op = kern_mod.build_ss_operator(ham, jax_dtype=psi_dtype)
+        op = kern_mod.build_ss_operator(ham, jax_dtype=self.state.psi_dtype)
 
         return ham, op
 
@@ -444,12 +472,7 @@ class EffectiveDriver(BaseDriver):
             epsilon=self.epsilon,
         )
 
-        psi_dtype = self.state.psi_dtype
-
-        if self.use_gpu_kernel:
-            op = gkern_mod.build_ss_operator_gpu(ham, jax_dtype=psi_dtype)
-        else:
-            op = kern_mod.build_ss_operator(ham, jax_dtype=psi_dtype)
+        op = kern_mod.build_ss_operator(ham, jax_dtype=self.state.psi_dtype)
 
         return ham, op
 
@@ -499,12 +522,7 @@ class ProxyDriver(BaseDriver):
         self.detspace = DetSpace(S_dets=self.detspace.S_dets, C_dets=C_dets)
         self.state = self.state.update_space(self.detspace)
 
-        psi_dtype = self.state.psi_dtype
-
-        if self.use_gpu_kernel:
-            op = gkern_mod.build_proxy_operator_gpu(ham, jax_dtype=psi_dtype)
-        else:
-            op = kern_mod.build_proxy_operator(ham, jax_dtype=psi_dtype)
+        op = kern_mod.build_proxy_operator(ham, jax_dtype=self.state.psi_dtype)
 
         return ham, op
 
@@ -548,12 +566,7 @@ class AsymmetricDriver(BaseDriver):
         self.detspace = DetSpace(S_dets=self.detspace.S_dets, C_dets=C_dets)
         self.state = self.state.update_space(self.detspace)
 
-        psi_dtype = self.state.psi_dtype
-
-        if self.use_gpu_kernel:
-            op = gkern_mod.build_proxy_operator_gpu(ham, jax_dtype=psi_dtype)
-        else:
-            op = kern_mod.build_proxy_operator(ham, jax_dtype=psi_dtype)
+        op = kern_mod.build_proxy_operator(ham, jax_dtype=self.state.psi_dtype)
 
         return ham, op
 

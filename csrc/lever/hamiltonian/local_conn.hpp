@@ -5,16 +5,14 @@
  * @file local_conn.hpp
  * @brief Local Hamiltonian connectivity and variational energy computation.
  *
- * Computes ⟨D|H|D'⟩ rows for individual determinants or batches.
- * Supports Heat-Bath screening: |⟨ij||ab⟩| ≥ ε₁.
- *
- * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: December, 2025
+ * Real-only kernels:
+ *  - coeffs are double (no complex)
+ *  - PT2 is computed for a normalized wavefunction (handled internally)
  */
 
 #pragma once
 
-#include <complex>
+#include <cstddef>
 #include <span>
 #include <vector>
 
@@ -37,26 +35,6 @@ struct LocalConnBatch {
     std::vector<double> values;
 };
 
-/** Result of ⟨Ψ|H|Ψ⟩. */
-struct VariationalResult {
-    double e_el;
-    double norm;
-};
-
-/**
- * Compute Hamiltonian row for a single determinant.
- *
- * Enumerates diagonal, singles, and doubles connections.
- * Doubles screening: |⟨ij||ab⟩| ≥ ε₁ via Heat-Bath table.
- *
- * @param bra Determinant for row index
- * @param ham Hamiltonian evaluator
- * @param n_orb Number of spatial orbitals
- * @param hb_table Heat-Bath table (optional)
- * @param eps1 Heat-Bath cutoff threshold
- * @param use_heatbath Enable Heat-Bath pruning
- * @return LocalConnRow{connected dets, matrix elements}
- */
 [[nodiscard]] LocalConnRow get_local_conn(
     const Det& bra,
     const HamEval& ham,
@@ -66,19 +44,6 @@ struct VariationalResult {
     bool use_heatbath = false
 );
 
-/**
- * Compute Hamiltonian rows for a batch of determinants (parallel).
- *
- * OpenMP parallel with dynamic scheduling.
- *
- * @param samples Determinant batch
- * @param ham Hamiltonian evaluator
- * @param n_orb Number of spatial orbitals
- * @param hb_table Heat-Bath table (optional)
- * @param eps1 Heat-Bath cutoff threshold
- * @param use_heatbath Enable Heat-Bath pruning
- * @return LocalConnBatch{offsets, dets, values} in CSR-like format
- */
 [[nodiscard]] LocalConnBatch get_local_connections(
     std::span<const Det> samples,
     const HamEval& ham,
@@ -88,24 +53,20 @@ struct VariationalResult {
     bool use_heatbath = false
 );
 
+/** Result of EN-PT2 correction computed from S-space wavefunction. */
+struct Pt2Result {
+    double e_pt2;       // PT2 correction (Psi_S is normalized in Python)
+    std::size_t n_ext;  // number of unique external dets accumulated
+};
+
 /**
- * Compute variational energy ⟨Ψ|H|Ψ⟩ on a fixed determinant basis.
+ * Compute variational energy numerator <Psi|H|Psi> on a fixed basis (real-only).
  *
- * Streaming algorithm: Σᵢ cᵢ* Σⱼ Hᵢⱼ cⱼ.
- * Uses DetMap for O(1) coefficient lookup.
- *
- * @param basis Determinant basis
- * @param coeffs Complex coefficients aligned with basis
- * @param ham Hamiltonian evaluator
- * @param n_orb Number of spatial orbitals
- * @param hb_table Heat-Bath table (optional)
- * @param eps1 Heat-Bath cutoff threshold
- * @param use_heatbath Enable Heat-Bath pruning
- * @return VariationalResult{e_el, norm}
+ * Note: coeffs must be domain-normalized in Python.
  */
-[[nodiscard]] VariationalResult compute_variational_energy(
+[[nodiscard]] double compute_variational_energy(
     std::span<const Det> basis,
-    std::span<const std::complex<double>> coeffs,
+    std::span<const double> coeffs,
     const HamEval& ham,
     int n_orb,
     const HeatBathTable* hb_table = nullptr,
@@ -113,30 +74,19 @@ struct VariationalResult {
     bool use_heatbath = false
 );
 
-// --- PT2 (Epstein–Nesbet) ---
-
-/** Result of EN-PT2 correction computed from S-space wavefunction. */
-struct Pt2Result {
-    double e_var;   // variational electronic energy (normalized)
-    double e_pt2;   // second-order correction
-    std::size_t n_ext; // number of unique external dets accumulated
-};
-
 /**
- * Compute EN-PT2 correction:
- *   E_PT2 = sum_a | <a|H|Psi_S> |^2 / (E_var - H_aa)
+ * Compute EN-PT2 correction only (real-only).
  *
- * External determinants "a" are generated on-the-fly from singles/doubles
- * connected to S, excluding those already in S.
- *
- * Note: if use_heatbath=true, doubles are generated via HB table with cutoff eps1,
- * and singles are filtered by max(eps1, MAT_ELEMENT_THRESH).
+ * Note:
+ *   - coeffs_S must be domain-normalized in Python.
+ *   - e_ref is the optimized variational electronic energy from Python.
  */
 [[nodiscard]] Pt2Result compute_pt2(
     std::span<const Det> S,
-    std::span<const std::complex<double>> coeffs_S,
+    std::span<const double> coeffs_S,
     const HamEval& ham,
     int n_orb,
+    double e_ref,
     const HeatBathTable* hb_table = nullptr,
     double eps1 = 1e-6,
     bool use_heatbath = false

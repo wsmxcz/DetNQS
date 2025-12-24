@@ -17,7 +17,6 @@ import numpy.typing as npt
 
 DetArray = npt.NDArray[np.uint64]  # Shape (N, 2): determinant bitstrings
 F64Array = npt.NDArray[np.float64]  # Shape (N,): floating point values
-C128Array = npt.NDArray[np.complex128] # Shape (N,): complex values
 U32Array = npt.NDArray[np.uint32]   # Shape (N,): integer indices
 I32Array = npt.NDArray[np.int32]   # Shape (N,): integer indices
 
@@ -273,45 +272,32 @@ def get_ham_eff(
     
 def compute_variational_energy(
     dets: DetArray,
-    coeffs: C128Array,
+    coeffs: F64Array,
     int_ctx: IntCtx,
     n_orb: int,
     use_heatbath: bool = False,
     eps1: float = 1e-6,
-) -> tuple[float, float]:
+) -> float:
     """
-    Compute exact variational energy <Psi|H|Psi> and norm <Psi|Psi> on a fixed basis.
-    
-    Uses a streaming algorithm to evaluate H|Psi> without constructing the full matrix.
-    
-    Args:
-        dets: Determinants defining the subspace (S U C), shape (N, 2)
-        coeffs: Complex coefficients aligned with dets, shape (N,)
-        int_ctx: Integral context
-        n_orb: Number of spatial orbitals
-        use_heatbath: Enable heat-bath screening for doubles
-        eps1: Screening threshold for heat-bath/singles
-        
-    Returns:
-        (e_el, norm) tuple where:
-          e_el = <Psi|H|Psi> electronic energy (no E_nuc)
-          norm = <Psi|Psi> squared norm
+    Compute <Psi|H|Psi> on a fixed basis.
+
+    Note: coeffs must be domain-normalized in Python.
     """
-    ...
 
 def compute_pt2(
     dets_S: DetArray,
-    coeffs_S: C128Array,
+    coeffs_S: F64Array,
     int_ctx: IntCtx,
     n_orb: int,
+    e_ref: float,
     use_heatbath: bool = False,
     eps1: float = 1e-6,
-) -> tuple[float, float]:
+) -> float:
     """
-    Compute EN-PT2 correction from S-space wavefunction.
+    Compute EN-PT2 correction only.
 
-    Returns:
-        (e_var_el, e_pt2) where e_var_el is normalized electronic energy.
+    Note: coeffs_S must be domain-normalized in Python.
+          e_ref must come from the optimizer (electronic energy).
     """
 
 __all__ = [

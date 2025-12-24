@@ -64,7 +64,6 @@ using lever::u64;
 
 using DetArrayRO  = nb::ndarray<const u64, nb::shape<-1, 2>, nb::c_contig, nb::device::cpu>;
 using F64VecRO    = nb::ndarray<const double, nb::shape<-1>, nb::c_contig, nb::device::cpu>;
-using C128VecRO   = nb::ndarray<const std::complex<double>, nb::shape<-1>, nb::c_contig, nb::device::cpu>;
 using SingleDetRO = nb::ndarray<const u64, nb::shape<2>, nb::c_contig, nb::device::cpu>;
 
 using DetArrayOut = nb::ndarray<u64, nb::numpy, nb::shape<-1, 2>>;
@@ -677,90 +676,93 @@ NB_MODULE(_lever_cpp, m) {
     // E = <Psi|H|Psi> / <Psi|Psi>
     // ------------------------------------------------------------------------
     m.def("compute_variational_energy",
-          [](DetArrayRO dets,
-             C128VecRO coeffs,
-             const IntCtx* ctx,
-             int n_orb,
-             bool use_heatbath,
-             double eps1) -> nb::tuple {
+        [](DetArrayRO dets,
+            F64VecRO coeffs,              // real-only, normalized in Python
+            const IntCtx* ctx,
+            int n_orb,
+            bool use_heatbath,
+            double eps1) -> double {
 
-              auto basis_vec = to_det_vector(dets);
+            auto basis_vec = to_det_vector(dets);
 
-              if (coeffs.ndim() != 1) {
-                  throw std::invalid_argument("coeffs must be 1D");
-              }
-              if (static_cast<size_t>(coeffs.shape(0)) != basis_vec.size()) {
-                  throw std::invalid_argument("coeff size mismatch");
-              }
+            if (coeffs.ndim() != 1) {
+                throw std::invalid_argument("coeffs must be 1D");
+            }
+            if (static_cast<size_t>(coeffs.shape(0)) != basis_vec.size()) {
+                throw std::invalid_argument("coeff size mismatch");
+            }
 
-              std::span<const std::complex<double>> c_span(
-                  coeffs.data(), coeffs.shape(0)
-              );
+            std::span<const double> c_span(
+                coeffs.data(), static_cast<size_t>(coeffs.shape(0))
+            );
 
-              auto res = lever::compute_variational_energy(
-                  std::span<const Det>(basis_vec),
-                  c_span,
-                  ctx->ham,
-                  n_orb,
-                  use_heatbath ? ctx->hb.get() : nullptr,
-                  eps1,
-                  use_heatbath
-              );
-
-              return nb::make_tuple(res.e_el, res.norm);
-          },
-          "dets"_a,
-          "coeffs"_a,
-          "int_ctx"_a,
-          "n_orb"_a,
-          "use_heatbath"_a = false,
-          "eps1"_a = 1e-6,
-          "Compute variational energy E_el = <Psi|H|Psi> / <Psi|Psi>.");
+            // Returns ONLY <Psi|H|Psi> (energy for normalized coeffs)
+            return lever::compute_variational_energy(
+                std::span<const Det>(basis_vec),
+                c_span,
+                ctx->ham,
+                n_orb,
+                use_heatbath ? ctx->hb.get() : nullptr,
+                eps1,
+                use_heatbath
+            );
+        },
+        "dets"_a,
+        "coeffs"_a,
+        "int_ctx"_a,
+        "n_orb"_a,
+        "use_heatbath"_a = false,
+        "eps1"_a = 1e-6,
+        "Compute <Psi|H|Psi> (coeffs must be normalized in Python).");
 
     // ------------------------------------------------------------------------
     // EN-PT2 correction
     // ------------------------------------------------------------------------
     m.def("compute_pt2",
-          [](DetArrayRO dets,
-             C128VecRO coeffs,
-             const IntCtx* ctx,
-             int n_orb,
-             bool use_heatbath,
-             double eps1) -> nb::tuple {
+        [](DetArrayRO dets,
+            F64VecRO coeffs,              // real-only, normalized in Python
+            const IntCtx* ctx,
+            int n_orb,
+            double e_ref,                 // <-- NEW: optimized reference energy (electronic)
+            bool use_heatbath,
+            double eps1) -> double {
 
-              if (coeffs.ndim() != 1) {
-                  throw std::invalid_argument("coeffs must be 1D");
-              }
-              const auto S_vec = to_det_vector(dets);
-              if (static_cast<std::size_t>(coeffs.shape(0)) != S_vec.size()) {
-                  throw std::invalid_argument("coeff size mismatch");
-              }
+            if (coeffs.ndim() != 1) {
+                throw std::invalid_argument("coeffs must be 1D");
+            }
+            const auto S_vec = to_det_vector(dets);
+            if (static_cast<std::size_t>(coeffs.shape(0)) != S_vec.size()) {
+                throw std::invalid_argument("coeff size mismatch");
+            }
 
-              if (use_heatbath && !ctx->hb) {
-                  throw std::invalid_argument("Heat-Bath table not initialized");
-              }
+            if (use_heatbath && !ctx->hb) {
+                throw std::invalid_argument("Heat-Bath table not initialized");
+            }
 
-              std::span<const std::complex<double>> c_span(
-                  coeffs.data(), static_cast<std::size_t>(coeffs.shape(0))
-              );
+            std::span<const double> c_span(
+                coeffs.data(), static_cast<std::size_t>(coeffs.shape(0))
+            );
 
-              auto res = lever::compute_pt2(
-                  std::span<const Det>(S_vec.data(), S_vec.size()),
-                  c_span,
-                  ctx->ham,
-                  n_orb,
-                  use_heatbath ? ctx->hb.get() : nullptr,
-                  eps1,
-                  use_heatbath
-              );
+            // Returns ONLY e_pt2; e_ref is provided by optimizer (Python side).
+            auto res = lever::compute_pt2(
+                std::span<const Det>(S_vec.data(), S_vec.size()),
+                c_span,
+                ctx->ham,
+                n_orb,
+                e_ref,
+                use_heatbath ? ctx->hb.get() : nullptr,
+                eps1,
+                use_heatbath
+            );
 
-              return nb::make_tuple(res.e_var, res.e_pt2);
-          },
-          "dets_S"_a,
-          "coeffs_S"_a,
-          "int_ctx"_a,
-          "n_orb"_a,
-          "use_heatbath"_a = false,
-          "eps1"_a = 1e-6,
-          "Compute EN-PT2 correction (E_var, E_PT2) from S-space wavefunction.");
+            return res.e_pt2;
+        },
+        "dets_S"_a,
+        "coeffs_S"_a,
+        "int_ctx"_a,
+        "n_orb"_a,
+        "e_ref"_a,                        // <-- NEW arg
+        "use_heatbath"_a = false,
+        "eps1"_a = 1e-6,
+        "Compute EN-PT2 correction only (coeffs normalized in Python; e_ref from optimizer).");
 }

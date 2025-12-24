@@ -3,10 +3,7 @@
 
 /**
  * @file local_conn.cpp
- * @brief Implementation of local Hamiltonian connectivity.
- *
- * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: December, 2025
+ * @brief Implementation of local Hamiltonian connectivity (real-only).
  */
 
 #include <lever/hamiltonian/local_conn.hpp>
@@ -27,7 +24,7 @@
 namespace lever {
 
 // ============================================================================
-// Local connectivity
+// Local connectivity (unchanged except includes)
 // ============================================================================
 
 LocalConnRow get_local_conn(
@@ -54,7 +51,7 @@ LocalConnRow get_local_conn(
         ? std::max(eps1, num_thresh)
         : num_thresh;
 
-    // Diagonal element
+    // Diagonal
     {
         const double h = ham.compute_diagonal(bra);
         if (std::abs(h) > num_thresh) {
@@ -63,7 +60,7 @@ LocalConnRow get_local_conn(
         }
     }
 
-    // Single excitations
+    // Singles
     det_ops::for_each_single(bra, n_orb, [&](const Det& ket) {
         const double v = ham.compute_elem(bra, ket);
         if (std::abs(v) > single_thresh) {
@@ -72,7 +69,7 @@ LocalConnRow get_local_conn(
         }
     });
 
-    // Double excitations
+    // Doubles
     auto visit = [&](const Det& ket) {
         const double v = ham.compute_elem(bra, ket);
         if (std::abs(v) > num_thresh) {
@@ -109,7 +106,7 @@ LocalConnBatch get_local_connections(
 
 #pragma omp parallel for schedule(dynamic, 32)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
-        rows[i] = get_local_conn(
+        rows[static_cast<size_t>(i)] = get_local_conn(
             samples[static_cast<size_t>(i)],
             ham,
             n_orb,
@@ -138,12 +135,12 @@ LocalConnBatch get_local_connections(
 }
 
 // ============================================================================
-// Variational energy
+// Variational energy (real-only)
 // ============================================================================
 
-VariationalResult compute_variational_energy(
+double compute_variational_energy(
     std::span<const Det> basis,
-    std::span<const std::complex<double>> coeffs,
+    std::span<const double> coeffs,
     const HamEval& ham,
     int n_orb,
     const HeatBathTable* hb_table,
@@ -156,19 +153,19 @@ VariationalResult compute_variational_energy(
             "compute_variational_energy: basis/coeff size mismatch"
         );
     }
-    if (N == 0) return {0.0, 0.0};
+    if (N == 0) return 0.0;
     if (use_heatbath && !hb_table) {
         throw std::invalid_argument(
             "compute_variational_energy: Heat-Bath requested but hb_table is null"
         );
     }
 
+    // Build map for coefficient lookup in O(1)
     std::vector<Det> basis_vec(basis.begin(), basis.end());
     const DetMap det_map = DetMap::from_ordered(std::move(basis_vec), false);
 
-    double norm = 0.0;
-    for (const auto& c : coeffs) norm += std::norm(c);
-    if (norm <= 1e-14) return {0.0, 0.0};
+    // Since coeffs are normalized in Python, use an absolute skip threshold.
+    constexpr double rel_skip = 1e-24;
 
     double e_el = 0.0;
     const double num_thresh = MAT_ELEMENT_THRESH;
@@ -182,10 +179,12 @@ VariationalResult compute_variational_energy(
         for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(N); ++i) {
             const size_t ii = static_cast<size_t>(i);
             const Det& bra = basis[ii];
-            const std::complex<double> c_bra_conj = std::conj(coeffs[ii]);
-            if (std::norm(c_bra_conj) < 1e-24) continue;
+            const double c_i = coeffs[ii];
 
-            std::complex<double> sigma_i = 0.0;
+            // Skip tiny coefficients (coeffs are normalized already)
+            if (c_i * c_i < rel_skip) continue;
+
+            double sigma_i = 0.0;
 
             auto accum = [&](const Det& ket, double v) {
                 if (auto idx = det_map.get_idx(ket)) {
@@ -193,16 +192,19 @@ VariationalResult compute_variational_energy(
                 }
             };
 
+            // Diagonal
             const double diag = ham.compute_diagonal(bra);
             if (std::abs(diag) > num_thresh) {
-                sigma_i += diag * coeffs[ii];
+                sigma_i += diag * c_i;
             }
 
+            // Singles
             det_ops::for_each_single(bra, n_orb, [&](const Det& ket) {
                 const double v = ham.compute_elem(bra, ket);
                 if (std::abs(v) > single_thresh) accum(ket, v);
             });
 
+            // Doubles
             auto d_visit = [&](const Det& ket) {
                 const double v = ham.compute_elem(bra, ket);
                 if (std::abs(v) > num_thresh) accum(ket, v);
@@ -214,22 +216,23 @@ VariationalResult compute_variational_energy(
                 det_ops::for_each_double(bra, n_orb, d_visit);
             }
 
-            e_el += std::real(c_bra_conj * sigma_i);
+            e_el += c_i * sigma_i; // real-only: <c|H|c>
         }
     }
 
-    return {e_el, norm};
+    return e_el; // energy for normalized coeffs
 }
 
 // ============================================================================
-// PT2 (Epstein–Nesbet)
+// PT2 (Epstein–Nesbet) (real-only, normalized internally)
 // ============================================================================
 
 Pt2Result compute_pt2(
     std::span<const Det> S,
-    std::span<const std::complex<double>> coeffs_S,
+    std::span<const double> coeffs_S,
     const HamEval& ham,
     int n_orb,
+    double e_ref,
     const HeatBathTable* hb_table,
     double eps1,
     bool use_heatbath
@@ -238,22 +241,12 @@ Pt2Result compute_pt2(
     if (coeffs_S.size() != nS) {
         throw std::invalid_argument("compute_pt2: S/coeff size mismatch");
     }
-    if (nS == 0) return {0.0, 0.0, 0};
+    if (nS == 0) return {0.0, 0};
     if (use_heatbath && !hb_table) {
         throw std::invalid_argument("compute_pt2: Heat-Bath requested but hb_table is null");
     }
 
-    // Compute variational energy on S (normalized).
-    const auto var = compute_variational_energy(
-        S, coeffs_S, ham, n_orb,
-        use_heatbath ? hb_table : nullptr,
-        eps1, use_heatbath
-    );
-    if (var.norm <= 1e-14) return {0.0, 0.0, 0};
-
-    const double e_var = var.e_el / var.norm;
-
-    // Build an index map for S membership tests (preserve S order).
+    // Build index map for S membership
     std::vector<Det> S_vec(S.begin(), S.end());
     const DetMap map_S = DetMap::from_ordered(std::move(S_vec), false);
 
@@ -262,14 +255,16 @@ Pt2Result compute_pt2(
         ? std::max(eps1, num_thresh)
         : num_thresh;
 
-    // Accumulate v(a) = <a|H|Psi_S> = sum_i H_{i,a} * c_i
-    // using thread-local hash maps to reduce contention.
+    // Coeffs are normalized in Python, so use an absolute skip threshold.
+    constexpr double rel_skip = 1e-24;
+
+    // Accumulate v(a) = <a|H|Psi_S> (Psi_S normalized)
     int n_threads = 1;
 #ifdef _OPENMP
     n_threads = omp_get_max_threads();
 #endif
 
-    using AccMap = std::unordered_map<Det, std::complex<double>>;
+    using AccMap = std::unordered_map<Det, double>;
     std::vector<AccMap> tl_maps(static_cast<std::size_t>(n_threads));
     for (auto& m : tl_maps) m.reserve(nS * 8);
 
@@ -283,28 +278,23 @@ Pt2Result compute_pt2(
 
         const std::size_t ii = static_cast<std::size_t>(i);
         const Det& bra = S[ii];
-        const std::complex<double> c_i = coeffs_S[ii];
+        const double c_i = coeffs_S[ii];
 
-        // Skip tiny coefficients.
-        if (std::norm(c_i) < 1e-24) continue;
+        if (c_i * c_i < rel_skip) continue;
 
-        // Singles: enumerate all, then threshold.
+        // Singles
         det_ops::for_each_single(bra, n_orb, [&](const Det& ket) {
-            if (map_S.get_idx(ket)) return; // exclude internal space
-
+            if (map_S.get_idx(ket)) return; // exclude internal
             const double h = ham.compute_elem(bra, ket);
             if (std::abs(h) <= single_thresh) return;
-
             acc[ket] += h * c_i;
         });
 
-        // Doubles: either full enumeration or HB-screened enumeration.
+        // Doubles
         auto visit_double = [&](const Det& ket) {
             if (map_S.get_idx(ket)) return;
-
             const double h = ham.compute_elem(bra, ket);
             if (std::abs(h) <= num_thresh) return;
-
             acc[ket] += h * c_i;
         };
 
@@ -315,35 +305,31 @@ Pt2Result compute_pt2(
         }
     }
 
-    // Merge thread-local maps.
+    // Merge thread-local maps
     AccMap ext;
     ext.reserve(nS * 32);
     for (auto& m : tl_maps) {
-        for (auto& kv : m) {
-            ext[kv.first] += kv.second;
-        }
+        for (auto& kv : m) ext[kv.first] += kv.second;
     }
 
-    // PT2 sum: sum_a |v(a)|^2 / (E_var - H_aa)
     double e_pt2 = 0.0;
     constexpr double denom_eps = 1e-12;
 
     for (const auto& kv : ext) {
         const Det& a = kv.first;
-        const std::complex<double>& v = kv.second;
+        const double v = kv.second;
 
         const double haa = ham.compute_diagonal(a);
-        double denom = e_var - haa;
+        double denom = e_ref - haa; // use optimized reference energy
 
-        // Avoid numerical blow-ups for near-zero denominators.
         if (std::abs(denom) < denom_eps) {
             denom = (denom >= 0.0) ? denom_eps : -denom_eps;
         }
 
-        e_pt2 += std::norm(v) / denom;
+        e_pt2 += (v * v) / denom; // real-only: |v|^2 = v^2
     }
 
-    return {e_var, e_pt2, ext.size()};
+    return {e_pt2, ext.size()};
 }
 
 } // namespace lever

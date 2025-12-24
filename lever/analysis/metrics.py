@@ -33,39 +33,39 @@ from ..system import MolecularSystem
 def convergence_stats(trace_path: str | Path) -> dict[str, float]:
     """
     Compute convergence statistics from JSONL trace file.
-    
+  
     Args:
         trace_path: Path to .jsonl trace file
-    
+  
     Returns:
         Dict with mean_delta, max_delta, final_energy, n_outers, total_time
     """
     trace_path = Path(trace_path)
     if not trace_path.exists():
         return {}
-    
+  
     energies = []
     timestamps = []
-    
+  
     with trace_path.open("r") as f:
         for line in f:
             if line.strip():
                 record = json.loads(line)
                 energies.append(record["energy"])
                 timestamps.append(record["timestamp"])
-    
+  
     if not energies:
         return {}
-    
+  
     if len(energies) == 1:
         return {
             "final_energy": float(energies[0]),
             "n_outers": 1,
             "total_time": float(timestamps[0]),
         }
-    
+  
     deltas = [abs(energies[i] - energies[i-1]) for i in range(1, len(energies))]
-    
+  
     return {
         "mean_delta": float(np.mean(deltas)),
         "max_delta": float(np.max(deltas)),
@@ -80,69 +80,53 @@ def compute_pt2(
     detspace: DetSpace,
     system: MolecularSystem,
     *,
+    e_ref_elec: float,
     screening: str = "heatbath",
-    eps1: float = 1e-8,
-) -> dict[str, float] | None:
+    eps1: float = 1e-6,
+) -> float | None:
     """
-    Compute Epstein-Nesbet PT2 correction.
-    
-    Second-order perturbation theory on C-space:
-        E_PT2 = sum_{a in C} |<a|H|psi_S>|^2 / (E_S - <a|H|a>)
-    
-    Args:
-        state: Current variational state
-        detspace: Determinant space with S_dets
-        system: Molecular system
-        screening: Heat-Bath mode
-        eps1: Screening threshold
-    
-    Returns:
-        Dict with e_var, e_pt2, e_total (Hartree) or None if unavailable
+    Compute Epstein-Nesbet PT2 correction only (electronic part).
+
+    Notes:
+      - e_ref_elec must come from the LEVER optimization result (electronic energy).
+      - Python guarantees psi_S is normalized before calling the C++ kernel.
+      - C++ does NOT recompute e_var and does NOT do any norm handling.
     """
     try:
         from .. import core
     except (ImportError, AttributeError):
         return None
-    
+
     S_dets = np.asarray(detspace.S_dets, dtype=np.uint64)
     n_s = S_dets.shape[0]
-    
     if n_s == 0:
         return None
-    
-    # Evaluate S-space wavefunction: psi_S = sign * exp(logabs)
+
+    # Evaluate unnormalized psi_S = sign * exp(logabs)
     indices = jnp.arange(n_s, dtype=jnp.int32)
     sign_s, logabs_s = state.forward(indices)
-    
-    logabs_s = jnp.real(logabs_s)
+    sign_s, logabs_s = jnp.real(sign_s), jnp.real(logabs_s)
+
+    # Normalize on Python side (domain-normalized)
     shift = jnp.max(logabs_s)
     psi_s = sign_s * jnp.exp(logabs_s - shift)
-    psi_s = np.asarray(psi_s, dtype=np.complex128)
-    
-    norm_s = np.sqrt(np.vdot(psi_s, psi_s).real)
-    if norm_s < 1e-14:
-        return None
-    psi_s = psi_s / norm_s
-    
-    # Call C++ PT2 kernel
-    use_heatbath = screening == "heatbath"
-    e_var_elec, e_pt2 = core.compute_pt2(
+    psi_s = np.asarray(psi_s, dtype=np.float64)
+    psi_s /= np.linalg.norm(psi_s)
+
+    use_heatbath = (screening == "heatbath")
+
+    # C++ returns ONLY e_pt2 (electronic correction)
+    e_pt2 = core.compute_pt2(
         S_dets,
         psi_s,
         system.int_ctx,
         system.n_orb,
+        e_ref_elec,              # <-- NEW: use optimized e_ref, not computed inside C++
         use_heatbath=use_heatbath,
         eps1=eps1,
     )
-    
-    e_var = float(e_var_elec) + system.e_nuc
-    e_pt2 = float(e_pt2)
-    
-    return {
-        "e_var": e_var,
-        "e_pt2": e_pt2,
-        "e_total": e_var + e_pt2,
-    }
+
+    return float(e_pt2)
 
 
 def compute_variational(
@@ -154,78 +138,108 @@ def compute_variational(
     eps1: float = 1e-6,
 ) -> dict[str, float] | None:
     """
-    Compute full variational energy on T-space.
-    
-    Evaluates Rayleigh quotient:
-        E_var = <psi_T|H|psi_T> / <psi_T|psi_T> + E_nuc
-    
-    where T = S union C is the full target space.
-    
+    Compute variational energies on S-space and optionally T-space.
+
+    Workflow:
+      1. Always compute E_var_S = <ψ_S|H_SS|ψ_S> on S-space
+      2. If C-space exists, compute E_var_T = <ψ_T|H|ψ_T> on full T-space
+
     Args:
-        state: Current variational state
-        detspace: Determinant space with T_dets
+        state: Optimized network state
+        detspace: Determinant space (may or may not have C)
         system: Molecular system
-        use_heatbath: Enable Heat-Bath screening
+        use_heatbath: Enable Heat-Bath screening in C++ kernel
         eps1: Screening threshold
-    
+
     Returns:
-        Dict with e_var (Hartree) or None if unavailable
+        Dict with 'e_var_s' (always) and 'e_var_t' (if C-space exists)
+
+    Notes:
+        - Python normalizes wavefunctions before C++ kernel
+        - C++ returns only <ψ|H|ψ>, no norm handling
+        - Energies include nuclear repulsion
     """
     try:
         from .. import core
     except (ImportError, AttributeError):
         return None
-    
-    T_dets = np.asarray(detspace.T_dets, dtype=np.uint64)
-    n_t = T_dets.shape[0]
-    
-    if n_t == 0:
+
+    result = {}
+
+    # -------------------------------------------------------------------------
+    # Always compute E_var_S on S-space
+    # -------------------------------------------------------------------------
+    S_dets = np.asarray(detspace.S_dets, dtype=np.uint64)
+    if S_dets.shape[0] == 0:
         return None
-    
-    # Evaluate full T-space wavefunction
-    sign_t, logabs_t = state.forward()
-    logabs_t = jnp.real(logabs_t)
-    
-    shift = jnp.max(logabs_t)
-    psi_t = sign_t * jnp.exp(logabs_t - shift)
-    psi_t = np.asarray(psi_t, dtype=np.complex128)
-    
-    # Call C++ variational energy kernel
-    e_elec, norm = core.compute_variational_energy(
-        T_dets,
-        psi_t,
+
+    indices_s = jnp.arange(detspace.size_S, dtype=jnp.int32)
+    sign_s, logabs_s = state.forward(indices_s)
+    sign_s, logabs_s = jnp.real(sign_s), jnp.real(logabs_s)
+
+    # Normalize on Python side
+    shift_s = jnp.max(logabs_s) if logabs_s.size > 0 else 0.0
+    psi_s = sign_s * jnp.exp(logabs_s - shift_s)
+    psi_s = np.asarray(psi_s, dtype=np.float64)
+    psi_s /= np.linalg.norm(psi_s)
+
+    # C++ computes <ψ_S|H_SS|ψ_S>
+    e_elec_s = core.compute_variational_energy(
+        S_dets,
+        psi_s,
         system.int_ctx,
         system.n_orb,
         use_heatbath=use_heatbath,
         eps1=eps1,
     )
-    
-    if norm < 1e-14:
-        return None
-    
-    e_var = float(e_elec / norm) + system.e_nuc
-    
-    return {"e_var": e_var}
+    result["e_var_s"] = float(e_elec_s) + system.e_nuc
+
+    # -------------------------------------------------------------------------
+    # Optionally compute E_var_T on full T-space if C exists
+    # -------------------------------------------------------------------------
+    if detspace.has_C:
+        T_dets = np.asarray(detspace.T_dets, dtype=np.uint64)
+        sign_t, logabs_t = state.forward()
+        sign_t, logabs_t = jnp.real(sign_t), jnp.real(logabs_t)
+
+        # Normalize on Python side
+        shift_t = jnp.max(logabs_t) if logabs_t.size > 0 else 0.0
+        psi_t = sign_t * jnp.exp(logabs_t - shift_t)
+        psi_t = np.asarray(psi_t, dtype=np.float64)
+        psi_t /= np.linalg.norm(psi_t)
+
+        # C++ computes <ψ_T|H|ψ_T>
+        e_elec_t = core.compute_variational_energy(
+            T_dets,
+            psi_t,
+            system.int_ctx,
+            system.n_orb,
+            use_heatbath=use_heatbath,
+            eps1=eps1,
+        )
+        result["e_var_t"] = float(e_elec_t) + system.e_nuc
+
+    return result
 
 
 def extract_norms(trace_path: str | Path) -> dict[str, np.ndarray]:
     """
     Extract norm evolution from JSONL trace.
-    
+  
+    Computes normalized fractions: f_S = ||psi_S||^2 / (||psi_S||^2 + ||psi_C||^2)
+  
     Args:
         trace_path: Path to .jsonl trace file
-    
+  
     Returns:
         Dict with steps, norm_s, norm_c, frac_s, frac_c arrays
     """
     trace_path = Path(trace_path)
     if not trace_path.exists():
         return {}
-    
-    steps = []
-    norm_s = []
-    norm_c = []
-    
+  
+    steps, norm_s, norm_c = [], [], []
+  
     with trace_path.open("r") as f:
         for line in f:
             if line.strip():
@@ -233,17 +247,15 @@ def extract_norms(trace_path: str | Path) -> dict[str, np.ndarray]:
                 steps.append(record["outer_step"])
                 norm_s.append(record["norm_s"])
                 norm_c.append(record["norm_c"])
-    
+  
     steps = np.array(steps, dtype=int)
     norm_s = np.array(norm_s)
     norm_c = np.array(norm_c)
-    
-    # Compute normalized fractions: f_S = ||psi_S||^2 / (||psi_S||^2 + ||psi_C||^2)
-    norm_tot = norm_s + norm_c
-    norm_tot = np.where(norm_tot > 1e-14, norm_tot, 1.0)
+  
+    norm_tot = np.maximum(norm_s + norm_c, 1e-14)
     frac_s = norm_s / norm_tot
     frac_c = norm_c / norm_tot
-    
+  
     return {
         "steps": steps,
         "norm_s": norm_s,

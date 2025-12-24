@@ -51,10 +51,10 @@ get_ham_eff = _lever_cpp.get_ham_eff
 """Assemble effective Hamiltonian via perturbative correction."""
 
 compute_variational_energy = _lever_cpp.compute_variational_energy
-"""Compute <Psi|H|Psi> and <Psi|Psi> on a fixed determinant basis."""
+"""Compute <Psi|H|Psi> on a fixed basis. Coeffs must be normalized in Python."""
 
 compute_pt2 = _lever_cpp.compute_pt2
-"""Compute EN-PT2 correction (E_var, E_PT2) from S-space wavefunction."""
+"""Compute EN-PT2 correction only. Requires e_ref from optimizer (electronic energy)."""
 
 __all__ = [
     "IntCtx",

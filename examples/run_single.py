@@ -4,10 +4,11 @@
 """
 Command-line interface for LEVER quantum chemistry calculations.
 
-Integrates selected CI with neural quantum states. Three modes:
-  - Variational: NQS-enhanced sCI, solve H_SS with PT2 analysis
-  - Effective: C-space down-folded into H_eff on S-space
-  - Proxy: Diagonal approximation on T = S ∪ C
+Computational modes:
+  - Variational: NQS-enhanced sCI on H_SS with optional PT2 analysis
+  - Effective:   Löwdin down-folded H_eff on S-space
+  - Proxy:       Diagonal C-block approximation on T = S ∪ C
+  - Asymmetric:  VMC-style truncated estimator on S-space
 
 File: lever/examples/run_single.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -43,7 +44,7 @@ _DRIVER_MAP = {
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for LEVER workflow."""
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="LEVER: Neural quantum states for selected CI",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -61,15 +62,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_jax() -> None:
-    """Configure JAX runtime settings."""
+    """Configure JAX runtime: GPU priority, float32 default, suppress warnings."""
     jax.config.update("jax_platforms", "cuda,cpu")
     jax.config.update("jax_enable_x64", False)
     jax.config.update("jax_log_compiles", False)
     jax.config.update("jax_debug_nans", False)
-  
-    # Suppress dtype conversion warnings
-    warnings.filterwarnings("ignore", message="Explicitly requested dtype.*is not available")
-  
+
+    warnings.filterwarnings(
+        "ignore", message="Explicitly requested dtype.*is not available"
+    )
+
     print(f"JAX devices: {jax.devices()}")
 
 
@@ -79,7 +81,7 @@ def print_summary(
     stats: dict,
     output_dir: Path | None = None,
 ) -> None:
-    """Print calculation summary."""
+    """Print calculation summary with system info and final energy."""
     print("\n" + "=" * 60)
     print(f"System: N_orb={system.n_orb}, N_elec={system.n_elec}, MS2={system.ms2}")
     print(f"Mode: {mode.upper()}")
@@ -92,89 +94,123 @@ def print_summary(
     print("=" * 60)
 
 
-def run_post_analysis(driver, mode: str) -> None:
-    """Execute post-hoc analysis based on mode."""
+def run_post_analysis(
+    driver,
+    e_ref_elec: float,
+    mode: str,
+) -> None:
+    """
+    Execute post-hoc analysis based on computational mode.
+
+    Args:
+        driver: Optimized driver instance (with final detspace preserved)
+        e_ref_elec: Reference electronic energy from optimization
+        mode: Computational mode string
+    """
     print("\nPost-processing analysis...")
-  
+
     if mode == "variational":
-        # PT2 correction for variational mode
-        pt2_result = compute_pt2(driver.state, driver.detspace, driver.system)
-        if pt2_result is not None:
+        # PT2 correction: E_total = E_var + E_PT2
+        e_pt2 = compute_pt2(
+            state=driver.state,
+            detspace=driver.detspace,
+            system=driver.system,
+            e_ref_elec=e_ref_elec,
+        )
+        if e_pt2 is not None:
+            e_var_total = e_ref_elec + driver.system.e_nuc
+            e_total = e_var_total + e_pt2
             print("\nPT2 correction:")
-            print(f"  E_var:   {pt2_result['e_var']:>18.8f} Ha")
-            print(f"  E_PT2:   {pt2_result['e_pt2']:>18.8f} Ha")
-            print(f"  E_total: {pt2_result['e_total']:>18.8f} Ha")
-  
+            print(f"  E_var:   {e_var_total:>18.8f} Ha")
+            print(f"  E_PT2:   {e_pt2:>18.8f} Ha")
+            print(f"  E_total: {e_total:>18.8f} Ha")
+
     elif mode == "proxy":
-        # Variational energy on full T-space
-        var_result = compute_variational(driver.state, driver.detspace, driver.system)
+        # Variational energies on S and T spaces
+        var_result = compute_variational(
+            state=driver.state,
+            detspace=driver.detspace,
+            system=driver.system,
+        )
         if var_result is not None:
-            print("\nVariational energy on T-space:")
-            print(f"  E_var:   {var_result['e_var']:>18.8f} Ha")
+            print("\nVariational energy analysis:")
+            print(f"  E_var(S): {var_result['e_var_s']:>18.8f} Ha")
+            if "e_var_t" in var_result:
+                print(f"  E_var(T): {var_result['e_var_t']:>18.8f} Ha")
 
 
 def main() -> None:
-    """Execute LEVER workflow with specified mode and configuration."""
+    """Execute LEVER workflow: load system, optimize, and analyze."""
     args = parse_args()
     configure_jax()
-  
-    # Initialize molecular system
+
+    # L0: Load molecular system and initialize HF reference
     system = MolecularSystem.from_fcidump(args.fcidump)
     hf_det = system.hf_determinant()
     detspace = DetSpace.initialize(hf_det)
-  
-    # Build neural network model: MLP + Slater2nd
+
+    # Build neural network: MLP parametrizer + Slater2nd ansatz
     parametrizer = models.parametrizers.MLP(
         n_so=system.n_so,
         dim=256,
         depth=1,
         param_dtype=jnp.float64,
     )
-  
+
     model = models.make_slater2nd(
         system=system,
         parametrizer=parametrizer,
-        mapper="thouless",
+        mapper="full",
         kmax=8,
         use_fast_kernel=True,
         param_dtype=jnp.float64,
     )
-  
+
     # Configure optimizer and determinant selector
     optimizer = optax.adamw(learning_rate=5e-4)
     selector = TopKSelector(1024)
-  
-    # Build driver based on selected mode
+
+    # L1: Build driver for selected mode
     driver = _DRIVER_MAP[args.mode].build(
         system=system,
         detspace=detspace,
         model=model,
         optimizer=optimizer,
         selector=selector,
-        chunk_size=8192,
+        chunk_size=None,
     )
-  
-    # Setup callbacks
+
+    # Setup callbacks for monitoring and checkpointing
     callbacks = [ConsoleCallback(every=1)]
     if args.output is not None:
         args.output.mkdir(parents=True, exist_ok=True)
-        callbacks.extend([
-            JsonCallback(args.output / "trace.jsonl"),
-            CheckpointCallback(args.output / "checkpoints", interval=5, keep_last=5),
-        ])
-  
-    # Run optimization
+        callbacks.extend(
+            [
+                JsonCallback(args.output / "trace.jsonl"),
+                CheckpointCallback(
+                    args.output / "checkpoints", interval=5, keep_last=5
+                ),
+            ]
+        )
+
+    # L2: Run optimization loop
     driver.run(callbacks=callbacks)
-  
-    # Print summary if trace file exists
+
+    # Extract convergence statistics and print summary
     if args.output is not None:
         trace_file = args.output / "trace.jsonl"
         stats = convergence_stats(trace_file)
         if stats:
             print_summary(system, args.mode, stats, args.output)
-  
-    # Post-hoc analysis
-    run_post_analysis(driver, args.mode)
+
+            # Post-hoc analysis: PT2 or variational energy
+            run_post_analysis(
+                driver=driver,
+                e_ref_elec=stats["final_energy"],
+                mode=args.mode,
+            )
+    else:
+        print("\nOptimization completed (no trace file for summary).")
 
 
 if __name__ == "__main__":

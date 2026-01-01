@@ -16,12 +16,12 @@
  * Date: November, 2025
  */
 
-#include <lever/integral/hb_table.hpp>
+#include <detnqs/integral/hb_table.hpp>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
-namespace lever {
+namespace detnqs {
 
 HeatBathTable::HeatBathTable(const IntegralSO& so_ints, HBBuildOptions opt)
     : so_(so_ints)
@@ -167,4 +167,4 @@ void HeatBathTable::finalize_layout_(const std::vector<std::vector<Entry>>& rows
     }
 }
 
-} // namespace lever
+} // namespace detnqs

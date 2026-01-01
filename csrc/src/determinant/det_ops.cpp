@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -12,12 +12,12 @@
  * Date: November, 2025
  */
 
-#include <lever/determinant/det_ops.hpp>
-#include <lever/utils/bit_utils.hpp>
+#include <detnqs/determinant/det_ops.hpp>
+#include <detnqs/utils/bit_utils.hpp>
 
 #include <limits>
 
-namespace lever::det_ops {
+namespace detnqs::det_ops {
 
 // ============================================================================
 // Internal helpers
@@ -282,4 +282,4 @@ std::vector<Det> collect_connected(const Det& ket, int n_orb) {
     return result;
 }
 
-} // namespace lever::det_ops
+} // namespace detnqs::det_ops

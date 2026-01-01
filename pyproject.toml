@@ -4,15 +4,15 @@ requires = [
   "scikit-build-core>=0.10",
   "nanobind>=2.8",
   "numpy>=2.1",
-  "jax>=0.7.2",
-  "jaxlib>=0.7.2",
+  "jax>=0.8.1",
+  "jaxlib>=0.8.1",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "lever"
-version = "0.0.1.dev0"
-description = "LEVER: determinant-driven QC toolkit (development snapshot)"
+name = "detnqs"
+version = "0.1.0"
+description = "DetNQS: An Efficient Framework for Neural Network Quantum States in ab-initio Quantum Chemistry (development snapshot)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -35,13 +35,9 @@ classifiers = [
 dependencies = [
   "numpy>=2.1",
   "scipy>=1.14",
-  "tqdm",
   "matplotlib",
-  "rich",
-  "pyyaml",
-  "hydra-core",
-  "jax>=0.7",
-  "jaxlib>=0.7",
+  "jax>=0.8",
+  "jaxlib>=0.8",
   "flax>=0.12",
   "optax>=0.2",
 ]
@@ -55,7 +51,7 @@ dev = [
 ]
 
 [tool.scikit-build]
-wheel.packages = ["lever"]
+wheel.packages = ["detnqs"]
 
 sdist.include = [
   "CMakeLists.txt",

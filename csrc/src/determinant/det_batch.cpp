@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -13,20 +13,20 @@
  *   phase = (-1)^(n_perm), where n_perm counts permutations to match
  *   canonical ordering during annihilation/creation operations.
  *
- * File: lever/determinant/det_batch.cpp
+ * File: detnqs/determinant/det_batch.cpp
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
  * Date: December, 2025
  */
 
-#include <lever/determinant/det_batch.hpp>
+#include <detnqs/determinant/det_batch.hpp>
 
 #include <array>
 #include <bit>
 #include <stdexcept>
 
-#include <lever/utils/bit_utils.hpp>
+#include <detnqs/utils/bit_utils.hpp>
 
-namespace lever::det_batch {
+namespace detnqs::det_batch {
 
 namespace {
 
@@ -318,4 +318,4 @@ void prepare_det_batch(
     }
 }
 
-}  // namespace lever::det_batch
+}  // namespace detnqs::det_batch

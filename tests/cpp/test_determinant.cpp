@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -17,18 +17,18 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
-#include <lever/determinant/det.hpp>
-#include <lever/determinant/det_ops.hpp>
-#include <lever/determinant/det_space.hpp>
-#include <lever/determinant/det_enum.hpp>
-#include <lever/utils/bit_utils.hpp>
-#include <lever/utils/constants.hpp>
+#include <detnqs/determinant/det.hpp>
+#include <detnqs/determinant/det_ops.hpp>
+#include <detnqs/determinant/det_space.hpp>
+#include <detnqs/determinant/det_enum.hpp>
+#include <detnqs/utils/bit_utils.hpp>
+#include <detnqs/utils/constants.hpp>
 
 #include <algorithm>
 #include <unordered_set>
 #include <vector>
 
-using namespace lever;
+using namespace detnqs;
 
 // -----------------------------------------------------------------------------
 // Determinant primitives: comparison & hash consistency

@@ -1,9 +1,9 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
  * @file bridge.cpp
- * @brief Python-C++ nanobind bridge for LEVER quantum chemistry core.
+ * @brief Python-C++ nanobind bridge for detnqs quantum chemistry core.
  *
  * Provides Python bindings for:
  *  - Determinant space generation (FCI, excitations, screened complement)
@@ -28,18 +28,18 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
-#include <lever/determinant/det.hpp>
-#include <lever/determinant/det_enum.hpp>
-#include <lever/determinant/det_space.hpp>
-#include <lever/determinant/det_batch.hpp>
-#include <lever/hamiltonian/build_ham.hpp>
-#include <lever/hamiltonian/ham_eff.hpp>
-#include <lever/hamiltonian/ham_eval.hpp>
-#include <lever/hamiltonian/ham_utils.hpp>
-#include <lever/hamiltonian/local_conn.hpp>
-#include <lever/integral/hb_table.hpp>
-#include <lever/integral/integral_mo.hpp>
-#include <lever/integral/integral_so.hpp>
+#include <detnqs/determinant/det.hpp>
+#include <detnqs/determinant/det_enum.hpp>
+#include <detnqs/determinant/det_space.hpp>
+#include <detnqs/determinant/det_batch.hpp>
+#include <detnqs/hamiltonian/build_ham.hpp>
+#include <detnqs/hamiltonian/ham_eff.hpp>
+#include <detnqs/hamiltonian/ham_eval.hpp>
+#include <detnqs/hamiltonian/ham_utils.hpp>
+#include <detnqs/hamiltonian/local_conn.hpp>
+#include <detnqs/integral/hb_table.hpp>
+#include <detnqs/integral/integral_mo.hpp>
+#include <detnqs/integral/integral_so.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -49,14 +49,14 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
-using lever::Det;
-using lever::DetMap;
-using lever::FCISpace;
-using lever::HamEval;
-using lever::HeatBathTable;
-using lever::COOMatrix;
-using lever::u32;
-using lever::u64;
+using detnqs::Det;
+using detnqs::DetMap;
+using detnqs::FCISpace;
+using detnqs::HamEval;
+using detnqs::HeatBathTable;
+using detnqs::COOMatrix;
+using detnqs::u32;
+using detnqs::u64;
 
 // ============================================================================
 // NumPy array type aliases for nanobind interface
@@ -103,15 +103,15 @@ struct IntCtx {
     [[nodiscard]] double get_e_nuc() const noexcept { return so.get_e_nuc(); }
 
     void hb_prepare(double threshold) {
-        lever::HBBuildOptions opt{.threshold = threshold};
+        detnqs::HBBuildOptions opt{.threshold = threshold};
         hb = std::make_unique<HeatBathTable>(so, opt);
         hb->build();
     }
 
     void hb_clear() noexcept { hb.reset(); }
 
-    lever::IntegralMO mo;
-    lever::IntegralSO so;
+    detnqs::IntegralMO mo;
+    detnqs::IntegralSO so;
     HamEval ham;
     std::unique_ptr<HeatBathTable> hb;
 };
@@ -210,16 +210,16 @@ struct IntCtx {
     return coo;
 }
 
-[[nodiscard]] inline lever::Regularization parse_reg_type(const std::string& s) {
-    if (s == "linear_shift") return lever::Regularization::LinearShift;
-    if (s == "sigma")        return lever::Regularization::Sigma;
+[[nodiscard]] inline detnqs::Regularization parse_reg_type(const std::string& s) {
+    if (s == "linear_shift") return detnqs::Regularization::LinearShift;
+    if (s == "sigma")        return detnqs::Regularization::Sigma;
     throw std::invalid_argument("invalid reg_type: " + s);
 }
 
-[[nodiscard]] inline lever::ScreenMode parse_screen_mode(const std::string& s) {
-    if (s == "none")    return lever::ScreenMode::None;
-    if (s == "static")  return lever::ScreenMode::Static;
-    if (s == "dynamic") return lever::ScreenMode::Dynamic;
+[[nodiscard]] inline detnqs::ScreenMode parse_screen_mode(const std::string& s) {
+    if (s == "none")    return detnqs::ScreenMode::None;
+    if (s == "static")  return detnqs::ScreenMode::Static;
+    if (s == "dynamic") return detnqs::ScreenMode::Dynamic;
     throw std::invalid_argument("invalid screen mode: " + s);
 }
 
@@ -227,8 +227,8 @@ struct IntCtx {
 // Module bindings
 // ============================================================================
 
-NB_MODULE(_lever_cpp, m) {
-    m.doc() = "LEVER C++ core bridge";
+NB_MODULE(_detnqs_cpp, m) {
+    m.doc() = "detnqs C++ core bridge";
     nb::set_leak_warnings(false);
 
     // ------------------------------------------------------------------------
@@ -239,7 +239,7 @@ NB_MODULE(_lever_cpp, m) {
              "fcidump_path"_a, "num_orb"_a)
         .def("get_e_nuc", &IntCtx::get_e_nuc)
         .def("hb_prepare", &IntCtx::hb_prepare,
-             "threshold"_a = lever::HEATBATH_THRESH)
+             "threshold"_a = detnqs::HEATBATH_THRESH)
         .def("hb_clear", &IntCtx::hb_clear);
 
     // ------------------------------------------------------------------------
@@ -256,11 +256,11 @@ NB_MODULE(_lever_cpp, m) {
 
     m.def("gen_excited_dets",
           [](DetArrayRO ref_dets, int n_orb) -> DetArrayOut {
-              auto dets = lever::det_space::generate_connected(
+              auto dets = detnqs::det_space::generate_connected(
                   to_det_vector(ref_dets), n_orb
               );
               return from_det_vector(
-                  lever::det_space::canonicalize(std::move(dets))
+                  detnqs::det_space::canonicalize(std::move(dets))
               );
           },
           "ref_dets"_a, "n_orb"_a,
@@ -284,8 +284,8 @@ NB_MODULE(_lever_cpp, m) {
             );
             const auto mode = parse_screen_mode(mode_str);
 
-            if (mode == lever::ScreenMode::None) {
-                auto comp = lever::det_space::generate_complement(
+            if (mode == detnqs::ScreenMode::None) {
+                auto comp = detnqs::det_space::generate_complement(
                     std::span<const Det>(S.data(), S.size()),
                     n_orb,
                     map_S,
@@ -306,7 +306,7 @@ NB_MODULE(_lever_cpp, m) {
             std::vector<double> psi_vec;
             std::span<const double> psi_span;
 
-            if (mode == lever::ScreenMode::Dynamic) {
+            if (mode == detnqs::ScreenMode::Dynamic) {
                 if (psi_S_obj.is_none()) {
                     throw std::invalid_argument("psi_S required for dynamic mode");
                 }
@@ -318,7 +318,7 @@ NB_MODULE(_lever_cpp, m) {
                 psi_span = std::span<const double>(psi_vec.data(), psi_vec.size());
             }
 
-            auto comp = lever::generate_complement_screened(
+            auto comp = detnqs::generate_complement_screened(
                 std::span<const Det>(S.data(), S.size()),
                 n_orb,
                 map_S,
@@ -367,9 +367,9 @@ NB_MODULE(_lever_cpp, m) {
             const std::size_t B = dets.shape(0);
             const int n_e = n_alpha + n_beta;
 
-            lever::Det ref_det{ref.data()[0], ref.data()[1]};
+            detnqs::Det ref_det{ref.data()[0], ref.data()[1]};
 
-            lever::det_batch::PrepareOptions opt;
+            detnqs::det_batch::PrepareOptions opt;
             opt.kmax = kmax;
             opt.need_k = need_k || need_hp;
             opt.need_phase = need_phase;
@@ -400,7 +400,7 @@ NB_MODULE(_lever_cpp, m) {
                 }
             }
 
-            lever::det_batch::prepare_det_batch(
+            detnqs::det_batch::prepare_det_batch(
                 dets.data(),
                 B,
                 ref_det,
@@ -458,7 +458,7 @@ NB_MODULE(_lever_cpp, m) {
     m.def("get_ham_diag",
           [](DetArrayRO dets, const IntCtx* ctx) -> F64VecOut {
               return from_double_vector(
-                  lever::get_ham_diag(to_det_vector(dets), ctx->ham)
+                  detnqs::get_ham_diag(to_det_vector(dets), ctx->ham)
               );
           },
           "dets"_a, "int_ctx"_a,
@@ -466,7 +466,7 @@ NB_MODULE(_lever_cpp, m) {
 
     m.def("get_ham_ss",
           [](DetArrayRO dets, const IntCtx* ctx, int n_orb) -> nb::dict {
-              auto coo = lever::get_ham_ss(
+              auto coo = detnqs::get_ham_ss(
                   to_det_vector(dets), ctx->ham, n_orb
               );
               return from_coo_matrix(coo);
@@ -492,7 +492,7 @@ NB_MODULE(_lever_cpp, m) {
                   c_span = std::span<const Det>(dets_C->data(), dets_C->size());
               }
 
-              auto blocks = lever::get_ham_block(
+              auto blocks = detnqs::get_ham_block(
                   dets_S, c_span, ctx->ham, n_orb
               );
 
@@ -525,7 +525,7 @@ NB_MODULE(_lever_cpp, m) {
                   throw std::invalid_argument("Heat-Bath table not initialized");
               }
 
-              auto blocks = lever::get_ham_conn(
+              auto blocks = detnqs::get_ham_conn(
                   to_det_vector(S),
                   ctx->ham,
                   n_orb,
@@ -566,7 +566,7 @@ NB_MODULE(_lever_cpp, m) {
                   throw std::invalid_argument("size mismatch: dets_S and psi_S");
               }
 
-              auto blocks = lever::get_ham_conn_amp(
+              auto blocks = detnqs::get_ham_conn_amp(
                   dets_S_vec,
                   psi_S_vec,
                   ctx->ham,
@@ -605,13 +605,13 @@ NB_MODULE(_lever_cpp, m) {
               const COOMatrix H_SS = to_coo_matrix(H_SS_dict);
               const COOMatrix H_SC = to_coo_matrix(H_SC_dict);
 
-              lever::HeffConfig cfg{
+              detnqs::HeffConfig cfg{
                   .reg_type   = parse_reg_type(reg_type_str),
                   .epsilon    = epsilon,
                   .upper_only = upper_only
               };
 
-              auto h_eff = lever::get_ham_eff(
+              auto h_eff = detnqs::get_ham_eff(
                   H_SS,
                   H_SC,
                   to_double_vector(h_cc_diag),
@@ -649,7 +649,7 @@ NB_MODULE(_lever_cpp, m) {
                   hb = ctx->hb.get();
               }
 
-              auto batch = lever::get_local_connections(
+              auto batch = detnqs::get_local_connections(
                   std::span<const Det>(samples_vec.data(), samples_vec.size()),
                   ctx->ham,
                   n_orb,
@@ -697,7 +697,7 @@ NB_MODULE(_lever_cpp, m) {
             );
 
             // Returns ONLY <Psi|H|Psi> (energy for normalized coeffs)
-            return lever::compute_variational_energy(
+            return detnqs::compute_variational_energy(
                 std::span<const Det>(basis_vec),
                 c_span,
                 ctx->ham,
@@ -744,7 +744,7 @@ NB_MODULE(_lever_cpp, m) {
             );
 
             // Returns ONLY e_pt2; e_ref is provided by optimizer (Python side).
-            auto res = lever::compute_pt2(
+            auto res = detnqs::compute_pt2(
                 std::span<const Det>(S_vec.data(), S_vec.size()),
                 c_span,
                 ctx->ham,

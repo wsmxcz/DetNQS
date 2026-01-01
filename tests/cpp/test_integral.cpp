@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -18,15 +18,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
-#include <lever/integral/integral_mo.hpp>
-#include <lever/integral/integral_so.hpp>
+#include <detnqs/integral/integral_mo.hpp>
+#include <detnqs/integral/integral_so.hpp>
 
 #include <array>
 #include <iostream>
 #include <memory>
 #include <vector>
 
-using namespace lever;
+using namespace detnqs;
 using Catch::Approx;
 
 /**

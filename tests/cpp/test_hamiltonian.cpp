@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -22,15 +22,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
-#include <lever/determinant/det.hpp>
-#include <lever/determinant/det_space.hpp>
-#include <lever/determinant/det_enum.hpp>
-#include <lever/integral/integral_mo.hpp>
-#include <lever/integral/integral_so.hpp>
-#include <lever/integral/hb_table.hpp>
-#include <lever/hamiltonian/ham_eval.hpp>
-#include <lever/hamiltonian/build_ham.hpp>
-#include <lever/hamiltonian/ham_eff.hpp>
+#include <detnqs/determinant/det.hpp>
+#include <detnqs/determinant/det_space.hpp>
+#include <detnqs/determinant/det_enum.hpp>
+#include <detnqs/integral/integral_mo.hpp>
+#include <detnqs/integral/integral_so.hpp>
+#include <detnqs/integral/hb_table.hpp>
+#include <detnqs/hamiltonian/ham_eval.hpp>
+#include <detnqs/hamiltonian/build_ham.hpp>
+#include <detnqs/hamiltonian/ham_eff.hpp>
 
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
@@ -41,7 +41,7 @@
 #include <random>
 #include <vector>
 
-using namespace lever;
+using namespace detnqs;
 using Catch::Approx;
 
 // ============================================================================

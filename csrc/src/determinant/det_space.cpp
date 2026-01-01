@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The detnqs Authors.
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -9,8 +9,8 @@
  * Date: November, 2025
  */
 
-#include <lever/determinant/det_space.hpp>
-#include <lever/determinant/det_ops.hpp>
+#include <detnqs/determinant/det_space.hpp>
+#include <detnqs/determinant/det_ops.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -18,7 +18,7 @@
 #include <string>
 #include <unordered_set>
 
-namespace lever {
+namespace detnqs {
 
 DetMap DetMap::from_list(std::vector<Det> dets) {
     std::sort(dets.begin(), dets.end());
@@ -255,4 +255,4 @@ std::vector<Det> generate_complement(std::span<const Det> kets,
 }
 
 } // namespace det_space
-} // namespace lever
+} // namespace detnqs

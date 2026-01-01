@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -13,15 +13,15 @@
  * Date: November, 2025
  */
 
-#include <lever/determinant/det_enum.hpp>
-#include <lever/utils/constants.hpp>
-#include <lever/utils/bit_utils.hpp>
+#include <detnqs/determinant/det_enum.hpp>
+#include <detnqs/utils/constants.hpp>
+#include <detnqs/utils/bit_utils.hpp>
 
 #include <algorithm>
 #include <format>
 #include <stdexcept>
 
-namespace lever {
+namespace detnqs {
 
 namespace {
 
@@ -246,4 +246,4 @@ RASSpace::RASSpace(const RASOrbitalPartition& p, const RASElectronConstraint& e)
     }
 }
 
-} // namespace lever
+} // namespace detnqs

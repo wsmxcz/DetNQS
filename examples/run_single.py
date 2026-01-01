@@ -1,8 +1,8 @@
-# Copyright 2025 The LEVER Authors - All rights reserved.
+# Copyright 2025 The DetNQS Authors
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Command-line interface for LEVER quantum chemistry calculations.
+Command-line interface for detnqs quantum chemistry calculations.
 
 Computational modes:
   - Variational: NQS-enhanced sCI on H_SS with optional PT2 analysis
@@ -10,7 +10,7 @@ Computational modes:
   - Proxy:       Diagonal C-block approximation on T = S ∪ C
   - Asymmetric:  VMC-style truncated estimator on S-space
 
-File: lever/examples/run_single.py
+File: detnqs/examples/run_single.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: December, 2025
 """
@@ -25,13 +25,13 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from lever import models
-from lever.analysis import CheckpointCallback, ConsoleCallback, JsonCallback
-from lever.analysis.metrics import compute_pt2, compute_variational, convergence_stats
-from lever.driver import AsymmetricDriver, EffectiveDriver, ProxyDriver, VariationalDriver
-from lever.space import DetSpace
-from lever.space.selector import TopKSelector
-from lever.system import MolecularSystem
+from detnqs import models
+from detnqs.analysis import CheckpointCallback, ConsoleCallback, JsonCallback
+from detnqs.analysis.metrics import compute_pt2, compute_variational, convergence_stats
+from detnqs.driver import AsymmetricDriver, EffectiveDriver, ProxyDriver, VariationalDriver
+from detnqs.space import DetSpace
+from detnqs.space.selector import TopKSelector, ThresholdSelector
+from detnqs.system import MolecularSystem
 
 
 # Driver registry for mode selection
@@ -46,7 +46,7 @@ _DRIVER_MAP = {
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="LEVER: Neural quantum states for selected CI",
+        description="detnqs: Neural quantum states for selected CI",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("fcidump", type=Path, help="Path to FCIDUMP file")
@@ -140,7 +140,7 @@ def run_post_analysis(
 
 
 def main() -> None:
-    """Execute LEVER workflow: load system, optimize, and analyze."""
+    """Execute detnqs workflow: load system, optimize, and analyze."""
     args = parse_args()
     configure_jax()
 
@@ -169,6 +169,7 @@ def main() -> None:
     # Configure optimizer and determinant selector
     optimizer = optax.adamw(learning_rate=5e-4)
     selector = TopKSelector(1024)
+    # selector = ThresholdSelector(1e-8)
 
     # L1: Build driver for selected mode
     driver = _DRIVER_MAP[args.mode].build(
@@ -177,7 +178,7 @@ def main() -> None:
         model=model,
         optimizer=optimizer,
         selector=selector,
-        chunk_size=None,
+        chunk_size=8192,
     )
 
     # Setup callbacks for monitoring and checkpointing

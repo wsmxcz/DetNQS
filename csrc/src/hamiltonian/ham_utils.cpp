@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -6,9 +6,9 @@
  * @brief Implementation of sparse matrix operations and shared helpers.
  */
 
-#include <lever/hamiltonian/ham_utils.hpp>
-#include <lever/hamiltonian/ham_eval.hpp>
-#include <lever/determinant/det_ops.hpp>
+#include <detnqs/hamiltonian/ham_utils.hpp>
+#include <detnqs/hamiltonian/ham_eval.hpp>
+#include <detnqs/determinant/det_ops.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
-namespace lever {
+namespace detnqs {
 
 // ============================================================================
 // COO Matrix Operations
@@ -549,4 +549,4 @@ std::vector<Det> generate_complement_screened(
     return det_space::canonicalize(std::move(out));
 }
 
-} // namespace lever
+} // namespace detnqs

@@ -1,4 +1,4 @@
-# Copyright 2025 The LEVER Authors - All rights reserved.
+# Copyright 2025 The DetNQS Authors
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -29,7 +29,7 @@ from jax import random
 
 jax.config.update("jax_enable_x64", True)
 
-from lever.models.utils import logdet_c
+from detnqs.models.utils import logdet_c
 
 
 # ============================================================================
@@ -263,9 +263,9 @@ def _bench_one(
 
 
 def test_perf_timings():
-    """Micro-benchmark enabled via LEVER_RUN_PERF=1."""
-    if os.environ.get("LEVER_RUN_PERF", "0") != "1":
-        pytest.skip("Set LEVER_RUN_PERF=1 to run performance benchmarks.")
+    """Micro-benchmark enabled via detnqs_RUN_PERF=1."""
+    if os.environ.get("detnqs_RUN_PERF", "0") != "1":
+        pytest.skip("Set detnqs_RUN_PERF=1 to run performance benchmarks.")
 
     key = random.PRNGKey(7)
     batch, n = 512, 32
@@ -293,5 +293,5 @@ if __name__ == "__main__":
     ap.add_argument("--perf", action="store_true", help="Run micro-benchmarks.")
     args = ap.parse_args()
     if args.perf:
-        os.environ["LEVER_RUN_PERF"] = "1"
+        os.environ["detnqs_RUN_PERF"] = "1"
         test_perf_timings()

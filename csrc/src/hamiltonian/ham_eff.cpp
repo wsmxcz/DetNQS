@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -12,7 +12,7 @@
  * Date: November, 2025
  */
 
-#include <lever/hamiltonian/ham_eff.hpp>
+#include <detnqs/hamiltonian/ham_eff.hpp>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -21,7 +21,7 @@
   #include <omp.h>
 #endif
 
-namespace lever {
+namespace detnqs {
 
 namespace {
 
@@ -228,4 +228,4 @@ COOMatrix get_ham_eff(
     return H_eff;
 }
 
-} // namespace lever
+} // namespace detnqs

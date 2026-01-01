@@ -1,4 +1,4 @@
-# Copyright 2025 The LEVER Authors - All rights reserved.
+# Copyright 2025 The DetNQS Authors
 # SPDX-License-Identifier: Apache-2.0
 
 # ==============================================================================
@@ -8,7 +8,7 @@
 # ==============================================================================
 
 # Test executable with source files
-add_executable(lever_cpp_tests
+add_executable(detnqs_cpp_tests
     test_determinant.cpp
     test_integral.cpp
     test_hamiltonian.cpp
@@ -31,10 +31,10 @@ foreach(TEST_FILE ${TEST_DATA_FILES})
     endif()
 
     add_custom_command(
-        TARGET lever_cpp_tests POST_BUILD
+        TARGET detnqs_cpp_tests POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
                 "${TEST_FILE}"
-                "$<TARGET_FILE_DIR:lever_cpp_tests>"
+                "$<TARGET_FILE_DIR:detnqs_cpp_tests>"
         COMMENT "Copying ${TEST_FILE}"
     )
 endforeach()
@@ -43,13 +43,13 @@ endforeach()
 # Dependencies and Includes
 # ==============================================================================
 
-target_link_libraries(lever_cpp_tests PRIVATE
-    lever::core
+target_link_libraries(detnqs_cpp_tests PRIVATE
+    detnqs::core
     Catch2::Catch2WithMain
 )
 
-target_include_directories(lever_cpp_tests PRIVATE
-    ${CMAKE_SOURCE_DIR}/csrc/lever
+target_include_directories(detnqs_cpp_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/csrc/detnqs
 )
 
 # ==============================================================================
@@ -58,7 +58,7 @@ target_include_directories(lever_cpp_tests PRIVATE
 
 include(CTest)
 include(Catch)
-catch_discover_tests(lever_cpp_tests
+catch_discover_tests(detnqs_cpp_tests
     PROPERTIES
-        WORKING_DIRECTORY "$<TARGET_FILE_DIR:lever_cpp_tests>"
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:detnqs_cpp_tests>"
 )

@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -13,9 +13,9 @@
  * matrix elements as COO triplets.
  */
 
-#include <lever/hamiltonian/build_ham.hpp>
-#include <lever/determinant/det_ops.hpp>
-#include <lever/determinant/det_space.hpp>
+#include <detnqs/hamiltonian/build_ham.hpp>
+#include <detnqs/determinant/det_ops.hpp>
+#include <detnqs/determinant/det_space.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -25,7 +25,7 @@
 #include <omp.h>
 #endif
 
-namespace lever {
+namespace detnqs {
 
 namespace {
 
@@ -605,4 +605,4 @@ HamBlocks get_ham_conn_amp(
     return out;
 }
 
-} // namespace lever
+} // namespace detnqs

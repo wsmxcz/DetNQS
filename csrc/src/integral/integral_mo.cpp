@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -12,7 +12,7 @@
  * Date: November, 2025
  */
 
-#include <lever/integral/integral_mo.hpp>
+#include <detnqs/integral/integral_mo.hpp>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -20,7 +20,7 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace lever {
+namespace detnqs {
 
 IntegralMO::IntegralMO(int num_orbitals) : n_orbs(num_orbitals) {
     if (num_orbitals <= 0 || num_orbitals > 64) {
@@ -181,4 +181,4 @@ void IntegralMO::parse_integral_line(std::string& line) {
     }
 }
 
-} // namespace lever
+} // namespace detnqs

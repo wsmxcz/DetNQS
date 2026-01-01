@@ -1,4 +1,4 @@
-# Copyright 2025 The LEVER Authors - All rights reserved.
+# Copyright 2025 The DetNQS Authors
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -17,9 +17,9 @@ import jax
 import jax.numpy as jnp
 from jax import random
 
-from lever.models.utils import logdet_c
+from detnqs.models.slogdet import slogdet
 
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", False)
 
 
 def check_correctness(name: str, mat: jnp.ndarray, verbose: bool = True):
@@ -35,8 +35,8 @@ def check_correctness(name: str, mat: jnp.ndarray, verbose: bool = True):
         print(f"\n[{name}] shape={mat.shape}, dtype={mat.dtype}")
   
     # Forward: sign and log|det|
-    s_fast, l_fast = logdet_c(mat, use_fast_kernel=True)
-    s_base, l_base = logdet_c(mat, use_fast_kernel=False)
+    s_fast, l_fast = slogdet(mat, use_fast_kernel=True)
+    s_base, l_base = slogdet(mat, use_fast_kernel=False)
   
     diff_sign = jnp.max(jnp.abs(s_fast - s_base))
     diff_logabs = jnp.max(jnp.abs(l_fast - l_base))
@@ -46,7 +46,7 @@ def check_correctness(name: str, mat: jnp.ndarray, verbose: bool = True):
   
     # Backward: gradient of log|det| (sign is non-differentiable)
     def loss_fn(use_fast, x):
-        _, logabs = logdet_c(x, use_fast_kernel=use_fast)
+        _, logabs = slogdet(x, use_fast_kernel=use_fast)
         return jnp.sum(logabs)
   
     grad_fast = jax.jit(jax.grad(loss_fn, argnums=1), static_argnums=0)(True, mat)
@@ -73,7 +73,7 @@ def run_benchmark(mat: jnp.ndarray, iters: int = 100):
         iters: Number of timing iterations
     """
     def fwd_bwd(use_fast, x):
-        return jax.grad(lambda m: jnp.sum(logdet_c(m, use_fast_kernel=use_fast)[1]))(x)
+        return jax.grad(lambda m: jnp.sum(slogdet(m, use_fast_kernel=use_fast)[1]))(x)
   
     f_fast = jax.jit(fwd_bwd, static_argnums=0)
     f_base = jax.jit(fwd_bwd, static_argnums=0)
@@ -100,12 +100,12 @@ def run_benchmark(mat: jnp.ndarray, iters: int = 100):
 
 
 def verify_hlo_ffi(mat: jnp.ndarray) -> bool:
-    """Check if compiled HLO contains custom-call to lever_fused_logdet."""
+    """Check if compiled HLO contains custom-call to detnqs_fused_logdet."""
     print("\n[HLO Verification]")
-    hlo = jax.jit(lambda x: logdet_c(x, use_fast_kernel=True)[1]).lower(mat).compiler_ir(dialect="hlo")
+    hlo = jax.jit(lambda x: slogdet(x, use_fast_kernel=True)[1]).lower(mat).compiler_ir(dialect="hlo")
     hlo_text = hlo.as_hlo_text()
   
-    has_ffi = "lever_fused_logdet" in hlo_text
+    has_ffi = "detnqs_fused_logdet" in hlo_text
     print(f"  FFI custom-call present: {has_ffi}")
   
     if not has_ffi:
@@ -128,8 +128,8 @@ def test_fallback_behavior():
     k1, key = random.split(key)
     mat_c = random.normal(k1, (16, 8, 8), dtype=jnp.complex128) + jnp.eye(8) * 8
     print("\n[Complex dtype]")
-    s_fast, l_fast = logdet_c(mat_c, use_fast_kernel=True)
-    s_base, l_base = logdet_c(mat_c, use_fast_kernel=False)
+    s_fast, l_fast = slogdet(mat_c, use_fast_kernel=True)
+    s_base, l_base = slogdet(mat_c, use_fast_kernel=False)
     diff = jnp.max(jnp.abs(l_fast - l_base))
     print(f"  Fallback OK, diff={diff:.2e}")
   
@@ -137,8 +137,8 @@ def test_fallback_behavior():
     k2, key = random.split(key)
     mat_large = random.normal(k2, (8, 80, 80), dtype=jnp.float32) + jnp.eye(80) * 80
     print("\n[Size > 64]")
-    s_fast, l_fast = logdet_c(mat_large, use_fast_kernel=True)
-    s_base, l_base = logdet_c(mat_large, use_fast_kernel=False)
+    s_fast, l_fast = slogdet(mat_large, use_fast_kernel=True)
+    s_base, l_base = slogdet(mat_large, use_fast_kernel=False)
     diff = jnp.max(jnp.abs(l_fast - l_base))
     print(f"  Fallback OK, diff={diff:.2e}")
 

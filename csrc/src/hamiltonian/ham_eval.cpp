@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -16,13 +16,13 @@
  * Date: November, 2025
  */
 
-#include <lever/hamiltonian/ham_eval.hpp>
-#include <lever/utils/bit_utils.hpp>
+#include <detnqs/hamiltonian/ham_eval.hpp>
+#include <detnqs/utils/bit_utils.hpp>
 
 #include <algorithm>
 #include <vector>
 
-namespace lever {
+namespace detnqs {
 
 HamEval::HamEval(const IntegralSO& so_ints) noexcept : so_ints_(so_ints) {}
 
@@ -146,4 +146,4 @@ double HamEval::compute_double(const ExcInfo& info) const noexcept {
     return so_ints_.get_h2e_phys(a, b, i, j);
 }
 
-} // namespace lever
+} // namespace detnqs

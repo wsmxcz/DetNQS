@@ -1,4 +1,4 @@
-// Copyright 2025 The LEVER Authors - All rights reserved.
+// Copyright 2025 The DetNQS Authors
 // SPDX-License-Identifier: Apache-2.0
 
 /**
@@ -6,11 +6,11 @@
  * @brief Implementation of local Hamiltonian connectivity (real-only).
  */
 
-#include <lever/hamiltonian/local_conn.hpp>
+#include <detnqs/hamiltonian/local_conn.hpp>
 
-#include <lever/determinant/det_ops.hpp>
-#include <lever/determinant/det_space.hpp>
-#include <lever/hamiltonian/ham_utils.hpp>
+#include <detnqs/determinant/det_ops.hpp>
+#include <detnqs/determinant/det_space.hpp>
+#include <detnqs/hamiltonian/ham_utils.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -21,7 +21,7 @@
   #include <omp.h>
 #endif
 
-namespace lever {
+namespace detnqs {
 
 // ============================================================================
 // Local connectivity (unchanged except includes)
@@ -332,4 +332,4 @@ Pt2Result compute_pt2(
     return {e_pt2, ext.size()};
 }
 
-} // namespace lever
+} // namespace detnqs

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(lever LANGUAGES CXX)
+project(detnqs LANGUAGES CXX)
 
 # ---- Global C++ standard ----
 set(CMAKE_CXX_STANDARD 20)
@@ -10,8 +10,8 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # This variable will be inherited by subdirectories.
-set(LEVER_BENCHMARK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/benchmark" CACHE PATH "Path to benchmark data")
-message(STATUS "Benchmark data directory set to: ${LEVER_BENCHMARK_DIR}")
+set(detnqs_BENCHMARK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/benchmark" CACHE PATH "Path to benchmark data")
+message(STATUS "Benchmark data directory set to: ${detnqs_BENCHMARK_DIR}")
 
 # --- Find Dependencies ---
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)

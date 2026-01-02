@@ -34,8 +34,13 @@ ls "$CONDA_PREFIX/nvidia/mathdx/25.12/include/cusolverdx_io.hpp"
 With the environment and MathDX in place, install the package in editable mode.
 
 ```bash
-pip install -e .
+pip install -e . -v --no-build-isolation \
+  -Cbuild-dir=build \
+  --config-settings=cmake.define.detnqs_CUDA_ARCHS=80 \
+  --config-settings=cmake.define.detnqs_CUSOLVERDX_SM=800
 ```
+
+
 
 ## License
 

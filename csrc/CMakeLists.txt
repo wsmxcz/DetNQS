@@ -1,17 +1,6 @@
 # Copyright 2025 The DetNQS Authors
 # SPDX-License-Identifier: Apache-2.0
 
-# CMake configuration for DetNQS C++ extensions and JAX FFI modules.
-#
-# Components:
-#   - detnqs_core: Determinant algebra, MO integrals, Hamiltonian
-#   - _detnqs_cpp: Python bindings (nanobind)
-#   - _detnqs_ffi: JAX FFI module (CUDA kernels, optional cuSolverDx)
-#
-# File: csrc/CMakeLists.txt
-# Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-# Date: December, 2025
-
 # -----------------------------------------------------------------------------
 # Build Options
 # -----------------------------------------------------------------------------
@@ -57,7 +46,7 @@ target_link_libraries(_detnqs_cpp PRIVATE detnqs::core)
 target_include_directories(_detnqs_cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/detnqs)
 
 # -----------------------------------------------------------------------------
-# JAX FFI Extension (CUDA-only; CPU uses pure JAX fallback)
+# JAX FFI Extension
 # -----------------------------------------------------------------------------
 set(FFI_SOURCES ffi/ffi_module.cpp)
 
@@ -73,23 +62,55 @@ target_include_directories(_detnqs_ffi PRIVATE
 )
 
 if(detnqs_ENABLE_CUDA)
-    # CUDA compiler setup
-    set(CMAKE_CUDA_COMPILER "$ENV{CONDA_PREFIX}/bin/nvcc" CACHE FILEPATH "" FORCE)
-    set(CUDAToolkit_ROOT "$ENV{CONDA_PREFIX}" CACHE PATH "" FORCE)
+    # -------------------------------------------------------------------------
+    # CUDA Compiler/Toolkit Setup
+    # -------------------------------------------------------------------------
+    if(NOT DEFINED CMAKE_CUDA_COMPILER)
+        if(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/bin/nvcc")
+            set(CMAKE_CUDA_COMPILER "$ENV{CONDA_PREFIX}/bin/nvcc"
+                CACHE FILEPATH "CUDA compiler" FORCE)
+        endif()
+    endif()
+
+    if(NOT DEFINED CUDAToolkit_ROOT)
+        if(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/include/cuda.h")
+            set(CUDAToolkit_ROOT "$ENV{CONDA_PREFIX}"
+                CACHE PATH "CUDA toolkit root" FORCE)
+        endif()
+    endif()
 
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    add_definitions(-Ddetnqs_WITH_CUDA=1)
+    target_compile_definitions(_detnqs_ffi PRIVATE detnqs_WITH_CUDA=1)
 
-    # Single-arch build enforcement
-    set(detnqs_CUDA_ARCHS "native" CACHE STRING "CUDA arch (80/90/120 or native)")
+    # -------------------------------------------------------------------------
+    # GPU Architecture Selection (User-Specified)
+    # -------------------------------------------------------------------------
+    set(detnqs_CUDA_ARCHS "" CACHE STRING
+        "CUDA architecture (80/90/120). Must be explicitly set.")
+
+    if(detnqs_CUDA_ARCHS STREQUAL "")
+        message(FATAL_ERROR
+            "detnqs_CUDA_ARCHS not set. Specify target arch (e.g., -Ddetnqs_CUDA_ARCHS=80).")
+    endif()
 
     if(detnqs_CUDA_ARCHS MATCHES ";")
-        message(FATAL_ERROR "detnqs_CUDA_ARCHS must be a single arch (e.g., 90) or 'native'.")
+        message(FATAL_ERROR
+            "detnqs_CUDA_ARCHS must be a single value, not a list.")
+    endif()
+
+    # -------------------------------------------------------------------------
+    # CUDA Standard: C++17 for cuSolverDx, C++20 otherwise
+    # -------------------------------------------------------------------------
+    if(detnqs_ENABLE_CUSOLVERDX)
+        # cuSolverDx requires C++17 and LTO
+        set(_cuda_std 17)
+    else()
+        set(_cuda_std 20)
     endif()
 
     set_target_properties(_detnqs_ffi PROPERTIES
-        CUDA_STANDARD 20
+        CUDA_STANDARD ${_cuda_std}
         CUDA_STANDARD_REQUIRED ON
         CUDA_ARCHITECTURES "${detnqs_CUDA_ARCHS}"
         CUDA_SEPARABLE_COMPILATION ON
@@ -102,7 +123,9 @@ if(detnqs_ENABLE_CUDA)
 
     target_link_libraries(_detnqs_ffi PRIVATE CUDA::cudart)
 
-    # cuSolverDx integration (optional fused kernels)
+    # -------------------------------------------------------------------------
+    # cuSolverDx Integration (Requires LTO)
+    # -------------------------------------------------------------------------
     if(detnqs_ENABLE_CUSOLVERDX)
         if(DEFINED ENV{CONDA_PREFIX})
             list(PREPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/nvidia/mathdx/25.12")
@@ -110,47 +133,30 @@ if(detnqs_ENABLE_CUDA)
         endif()
 
         find_package(mathdx REQUIRED COMPONENTS cusolverdx CONFIG)
-        add_definitions(-Ddetnqs_WITH_CUSOLVERDX=1)
+        target_compile_definitions(_detnqs_ffi PRIVATE detnqs_WITH_CUSOLVERDX=1)
 
-        # Determine SM code for cuSolverDx template instantiation
-        set(detnqs_CUSOLVERDX_SM "" CACHE STRING "cuSolverDx SM code (800/900/1200)")
+        # ---------------------------------------------------------------------
+        # SM Code for cuSolverDx Template Instantiation
+        # ---------------------------------------------------------------------
+        set(detnqs_CUSOLVERDX_SM "" CACHE STRING
+            "cuSolverDx SM code (800/900/1200). Must match 10x CUDA arch.")
 
         if(detnqs_CUSOLVERDX_SM STREQUAL "")
-            if(detnqs_CUDA_ARCHS STREQUAL "native")
-                # Detect local GPU SM at configure-time
-                file(WRITE "${CMAKE_BINARY_DIR}/detnqs_detect_sm.cu"
-"#include <cstdio>
-#include <cuda_runtime.h>
-int main() {
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return 1;
-    cudaDeviceProp p{};
-    if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return 2;
-    std::printf(\"%d\\n\", p.major * 100 + p.minor * 10);
-    return 0;
-}
-")
-                try_run(_RUN_RES _COMPILE_RES
-                    "${CMAKE_BINARY_DIR}"
-                    "${CMAKE_BINARY_DIR}/detnqs_detect_sm.cu"
-                    RUN_OUTPUT_VARIABLE _SM_OUT
-                )
-                if(_COMPILE_RES AND _RUN_RES EQUAL 0)
-                    string(STRIP "${_SM_OUT}" detnqs_CUSOLVERDX_SM)
-                else()
-                    message(FATAL_ERROR
-                        "Failed to detect GPU SM. "
-                        "Set -Ddetnqs_CUSOLVERDX_SM=900 or -Ddetnqs_CUDA_ARCHS=90.")
-                endif()
-            else()
-                # Map CUDA arch (e.g., 90) to SM code (900)
-                if(detnqs_CUDA_ARCHS MATCHES "^[0-9]+$")
-                    math(EXPR detnqs_CUSOLVERDX_SM "${detnqs_CUDA_ARCHS} * 10")
-                else()
-                    message(FATAL_ERROR
-                        "detnqs_CUDA_ARCHS must be numeric (80/90/120) or 'native'. "
-                        "Alternatively, set detnqs_CUSOLVERDX_SM explicitly.")
-                endif()
+            message(FATAL_ERROR
+                "detnqs_CUSOLVERDX_SM not set. Specify SM code (e.g., -Ddetnqs_CUSOLVERDX_SM=800).")
+        endif()
+
+        if(NOT detnqs_CUSOLVERDX_SM MATCHES "^[0-9]+$")
+            message(FATAL_ERROR "detnqs_CUSOLVERDX_SM must be numeric (800/900/1200).")
+        endif()
+
+        # Consistency check with CUDA_ARCHS
+        if(detnqs_CUDA_ARCHS MATCHES "^[0-9]+$")
+            math(EXPR _expected_sm "${detnqs_CUDA_ARCHS} * 10")
+            if(NOT detnqs_CUSOLVERDX_SM EQUAL _expected_sm)
+                message(WARNING
+                    "SM mismatch: detnqs_CUSOLVERDX_SM=${detnqs_CUSOLVERDX_SM}, "
+                    "expected ${_expected_sm} (10x of detnqs_CUDA_ARCHS=${detnqs_CUDA_ARCHS}).")
             endif()
         endif()
 
@@ -165,10 +171,10 @@ int main() {
             target_link_libraries(_detnqs_ffi PRIVATE mathdx::cusolverdx)
         endif()
 
-        # Enable device-side LTO for fused kernels
-        target_compile_options(_detnqs_ffi PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-dlto>
-        )
+        # Enable IPO/LTO for cuSolverDx (required for proper linking)
+        set_property(TARGET _detnqs_ffi PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+
+        # Device link with LTO
         target_link_options(_detnqs_ffi PRIVATE "$<DEVICE_LINK:-dlto>")
     endif()
 endif()

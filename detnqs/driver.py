@@ -16,6 +16,10 @@ Architecture:
   L1 (Python): Outer loop - space evolution, Hamiltonian rebuild
   L2 (JAX):    Inner loop - JIT optimization sweep
 
+Memory strategy:
+  - Variational/Effective: GPU holds only S-space batch, stream T for scoring
+  - Proxy/Asymmetric: GPU holds full T-space batch
+
 File: detnqs/driver.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: December, 2025
@@ -61,6 +65,7 @@ class BaseDriver:
 
     Subclass requirements:
       - mode_tag(): Return mode identifier string
+      - device_space(): Return "S" or "T" for GPU memory residency
       - build_hamiltonian(): Construct Hamiltonian and SpMV operator
     """
 
@@ -80,6 +85,15 @@ class BaseDriver:
     outer_patience: int = 5
 
     chunk_size: int | None = None
+
+    def device_space(self) -> str:
+        """
+        Which space is kept as State.batch on device: 'S' or 'T'.
+        
+        Variational/Effective: 'S' to minimize GPU memory
+        Proxy/Asymmetric: 'T' for full-space optimization
+        """
+        return "T"
 
     @classmethod
     def build(
@@ -159,35 +173,86 @@ class BaseDriver:
         """
         Compute norm decomposition on T-space: ||ψ_S||² and ||ψ_C||².
 
+        Uses streaming H2D if State.batch != T (Variational/Effective modes)
+        to avoid VRAM overflow when |C| >> |S|.
+
         Returns:
             (norm_s, norm_c): S-space and C-space norms
         """
         n_s = self.detspace.size_S
         n_c = self.detspace.size_C
 
-        sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
-        logabs_t = jnp.real(logabs_t)
+        # Fast path: State.batch already equals T
+        if self.state.n_det == self.detspace.size_T:
+            _sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
+            logabs_t = jnp.real(logabs_t)
+            shift = jnp.max(logabs_t) if logabs_t.size > 0 else 0.0
+            w = jnp.exp(2.0 * (logabs_t - shift))  # |psi|^2 up to common scale
+            w_s = w[:n_s]
+            w_c = w[n_s : n_s + n_c] if n_c > 0 else jnp.array([])
+            return float(jnp.sum(w_s)), float(jnp.sum(w_c)) if n_c > 0 else 0.0
 
-        shift = jnp.max(logabs_t) if logabs_t.size > 0 else 0.0
-        psi_t = sign_t * jnp.exp(logabs_t - shift)
+        # Streaming path: iterate over CPU det blocks, H2D a fixed block at a time
+        block_size = int(self.chunk_size or 8192)
 
-        psi_s = psi_t[:n_s]
-        psi_c = psi_t[n_s : n_s + n_c] if n_c > 0 else jnp.array([])
+        def scores_factory():
+            for det_blk in self.detspace.iter_T(block_size):
+                _s, la = self.state.forward_dets(det_blk, block_size=block_size, chunk_size=self.chunk_size)
+                yield np.asarray(np.real(la), dtype=np.float64), det_blk
 
-        norm_s = float(jnp.real(jnp.vdot(psi_s, psi_s)))
-        norm_c = float(jnp.real(jnp.vdot(psi_c, psi_c))) if n_c > 0 else 0.0
+        # Pass 1: global shift = max(log|psi|)
+        shift = -np.inf
+        for la_blk, _ in scores_factory():
+            if la_blk.size:
+                shift = max(shift, float(np.max(la_blk)))
+        if not np.isfinite(shift):
+            return 0.0, 0.0
+
+        # Pass 2: accumulate norms using |psi|^2 = exp(2*(log|psi|-shift))
+        norm_s = 0.0
+        norm_c = 0.0
+        seen = 0
+        for la_blk, _ in scores_factory():
+            w = np.exp(2.0 * (la_blk - shift))
+            m = int(w.shape[0])
+            if seen < n_s:
+                take_s = min(n_s - seen, m)
+                norm_s += float(np.sum(w[:take_s]))
+                if m > take_s:
+                    norm_c += float(np.sum(w[take_s:]))
+            else:
+                norm_c += float(np.sum(w))
+            seen += m
 
         return norm_s, norm_c
 
     def evolve_space(self) -> None:
-        """Update S-space via importance sampling on log|ψ_T|."""
-        sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
-        logabs_t = jnp.real(logabs_t)
-        log_amp_host = np.asarray(logabs_t, dtype=np.float64)
+        """
+        Update S-space via importance sampling on log|ψ_T|.
+        
+        Uses streaming H2D if selector.stream=True or State.batch != T
+        to avoid materializing full T in VRAM/RAM.
+        """
+        block_size = int(self.chunk_size or 8192)
+        use_stream = bool(getattr(self.selector, "stream", False)) or (self.state.n_det != self.detspace.size_T)
 
-        new_space = self.detspace.evolve(self.selector, log_amp_host)
+        if not use_stream:
+            # Fast path: State.batch already equals T
+            _sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
+            logabs_t = jnp.real(logabs_t)
+            log_amp_host = np.asarray(logabs_t, dtype=np.float64)
+            new_space = self.detspace.evolve(self.selector, log_amp_host)
+        else:
+            # Streaming path: provide factory for multi-pass selectors
+            def scores_factory():
+                for det_blk in self.detspace.iter_T(block_size):
+                    _s, la = self.state.forward_dets(det_blk, block_size=block_size, chunk_size=self.chunk_size)
+                    yield np.asarray(np.real(la), dtype=np.float64), det_blk
+
+            new_space = self.detspace.evolve(self.selector, scores_factory)
+
         self.detspace = new_space
-        self.state = self.state.update_space(new_space)
+        self.state = self.state.update_space(new_space, device_space=self.device_space())
 
     def _check_convergence(self, energy_history: list[float]) -> bool:
         """
@@ -347,6 +412,8 @@ class VariationalDriver(BaseDriver):
       2. Optimize parameters to minimize E[ψ_S]
       3. Generate complement C via Heat-Bath screening
       4. Update S ← select from T = S ∪ C
+      
+    Memory: GPU holds only S-space batch, streams T for scoring/norms
     """
 
     screening: str = "dynamic"
@@ -354,6 +421,9 @@ class VariationalDriver(BaseDriver):
 
     def mode_tag(self) -> str:
         return "variational"
+
+    def device_space(self) -> str:
+        return "S"
 
     def build_hamiltonian(self) -> tuple[Any, Any]:
         """Build H_SS with screened complement C-space."""
@@ -375,7 +445,7 @@ class VariationalDriver(BaseDriver):
             )
 
         self.detspace = DetSpace(S_dets=self.detspace.S_dets, C_dets=C_dets)
-        self.state = self.state.update_space(self.detspace)
+        self.state = self.state.update_space(self.detspace, device_space=self.device_space())
 
         ham = ham_mod.build_ss_hamiltonian(self.system, self.detspace)
         op = kern_mod.build_ss_operator(ham, jax_dtype=self.state.psi_dtype)
@@ -400,6 +470,8 @@ class EffectiveDriver(BaseDriver):
       2. Compute H_eff via Löwdin partitioning
       3. Optimize E_eff = <ψ_S|H_eff|ψ_S>
       4. Update E_ref ← last energy, S ← select from T
+      
+    Memory: GPU holds only S-space batch, streams T for scoring/norms
     """
 
     screening: str = "dynamic"
@@ -410,6 +482,9 @@ class EffectiveDriver(BaseDriver):
 
     def mode_tag(self) -> str:
         return "effective"
+
+    def device_space(self) -> str:
+        return "S"
 
     def post_inner_sweep(self, energy_trace: np.ndarray) -> None:
         """Update reference energy E_ref for next Hamiltonian rebuild."""
@@ -431,7 +506,7 @@ class EffectiveDriver(BaseDriver):
         )
 
         self.detspace = DetSpace(S_dets=self.detspace.S_dets, C_dets=C_dets)
-        self.state = self.state.update_space(self.detspace)
+        self.state = self.state.update_space(self.detspace, device_space=self.device_space())
 
         ham = ham_mod.build_effective_hamiltonian(
             system=self.system,
@@ -459,6 +534,8 @@ class ProxyDriver(BaseDriver):
       1. Build proxy H on T = S ∪ C with screening
       2. Optimize E = <ψ_T|H|ψ_T> / <ψ_T|ψ_T>
       3. Update S ← select from T
+      
+    Memory: GPU holds full T-space batch
     """
 
     screening: str = "dynamic"
@@ -484,7 +561,7 @@ class ProxyDriver(BaseDriver):
         )
 
         self.detspace = DetSpace(S_dets=self.detspace.S_dets, C_dets=C_dets)
-        self.state = self.state.update_space(self.detspace)
+        self.state = self.state.update_space(self.detspace, device_space=self.device_space())
 
         op = kern_mod.build_proxy_operator(ham, jax_dtype=self.state.psi_dtype)
 
@@ -505,6 +582,8 @@ class AsymmetricDriver(BaseDriver):
       - Uses proxy Hamiltonian H_T same as ProxyDriver
       - Inner loop minimizes asymmetric Rayleigh quotient
       - S-space evolution uses full-T amplitudes |ψ_T|
+      
+    Memory: GPU holds full T-space batch
     """
 
     screening: str = "dynamic"
@@ -528,7 +607,7 @@ class AsymmetricDriver(BaseDriver):
         )
 
         self.detspace = DetSpace(S_dets=self.detspace.S_dets, C_dets=C_dets)
-        self.state = self.state.update_space(self.detspace)
+        self.state = self.state.update_space(self.detspace, device_space=self.device_space())
 
         op = kern_mod.build_proxy_operator(ham, jax_dtype=self.state.psi_dtype)
 
@@ -542,3 +621,4 @@ __all__ = [
     "ProxyDriver",
     "AsymmetricDriver",
 ]
+

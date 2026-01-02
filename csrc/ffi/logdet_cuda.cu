@@ -211,21 +211,22 @@ __global__ void FwdKernelDx(const Scalar* __restrict__ A,
   const int nthreads = int(blockDim.x * blockDim.y * blockDim.z);
   const int block_batch0 = int(blockIdx.x) * int(BPB);
 
-  // Load A with identity padding: blockdiag(A, I)
+  // Load all BPB slots (fill invalid batches with identity to avoid garbage data)
   for (unsigned bpb = 0; bpb < BPB; ++bpb) {
     const int b = block_batch0 + int(bpb);
-    if (b >= B) break;
+    const bool valid = (b < B);
 
-    const Scalar* Ab = A + size_t(b) * size_t(N_actual) * size_t(N_actual);
+    const Scalar* Ab = valid ? (A + size_t(b) * size_t(N_actual) * size_t(N_actual)) : nullptr;
     a_t* sAb = sA + size_t(bpb) * size_t(a_elems);
 
     for (int idx = tid; idx < a_elems; idx += nthreads) {
       const int r = idx / lda;
       const int c = idx % lda;
 
-      if (r < N_actual && c < N_actual) {
+      if (valid && r < N_actual && c < N_actual) {
         sAb[idx] = a_t(Ab[r * N_actual + c]);
       } else if (r < Nb && c < Nb) {
+        // Fill with identity: valid batch gets block-diag(A, I), invalid batch gets full I
         sAb[idx] = (r == c) ? a_t(1) : a_t(0);
       } else {
         sAb[idx] = a_t(0);
@@ -239,10 +240,10 @@ __global__ void FwdKernelDx(const Scalar* __restrict__ A,
   Solver{}.execute(sA, ipiv, info);
   __syncthreads();
 
-  // Extract det(A) from LU factors
+  // Write outputs only for valid batches
   for (unsigned bpb = 0; bpb < BPB; ++bpb) {
     const int b = block_batch0 + int(bpb);
-    if (b >= B) break;
+    if (b >= B) continue;  // Skip instead of break
 
     if (tid == 0) {
       if (info[bpb] != status_t(0)) {
@@ -260,7 +261,7 @@ __global__ void FwdKernelDx(const Scalar* __restrict__ A,
         if (piv[i] == 0) { base_p = 0; break; }
       }
 
-      // Count row swaps for sign
+      // Count row swaps for sign: swap occurs when piv[i] != i + base
       int swaps_parity = 0;
       for (int i = 0; i < N_actual; ++i) {
         if (piv[i] != i + base_p) swaps_parity ^= 1;
@@ -323,12 +324,12 @@ __global__ void BwdKernelDx(const Scalar* __restrict__ A,
   const int nthreads = int(blockDim.x * blockDim.y * blockDim.z);
   const int block_batch0 = int(blockIdx.x) * int(BPB);
 
-  // Load A with padding and set RHS = I
+  // Load all BPB slots (fill invalid batches with identity)
   for (unsigned bpb = 0; bpb < BPB; ++bpb) {
     const int b = block_batch0 + int(bpb);
-    if (b >= B) break;
+    const bool valid = (b < B);
 
-    const Scalar* Ab = A + size_t(b) * size_t(N_actual) * size_t(N_actual);
+    const Scalar* Ab = valid ? (A + size_t(b) * size_t(N_actual) * size_t(N_actual)) : nullptr;
     a_t* sAb = sA + size_t(bpb) * size_t(a_elems);
     b_t* sBb = sB + size_t(bpb) * size_t(b_elems);
 
@@ -336,7 +337,7 @@ __global__ void BwdKernelDx(const Scalar* __restrict__ A,
       const int r = idx / lda;
       const int c = idx % lda;
 
-      if (r < N_actual && c < N_actual) {
+      if (valid && r < N_actual && c < N_actual) {
         sAb[idx] = a_t(Ab[r * N_actual + c]);
       } else if (r < Nb && c < Nb) {
         sAb[idx] = (r == c) ? a_t(1) : a_t(0);
@@ -345,6 +346,7 @@ __global__ void BwdKernelDx(const Scalar* __restrict__ A,
       }
     }
 
+    // RHS always identity
     for (int idx = tid; idx < b_elems; idx += nthreads) {
       const int r = idx / ldb;
       const int c = idx % ldb;
@@ -355,14 +357,14 @@ __global__ void BwdKernelDx(const Scalar* __restrict__ A,
   }
   __syncthreads();
 
-  // Solve A^T X = I
+  // Solve A^T X = I for all BPB slots
   Solver{}.execute(sA, ipiv, sB, info);
   __syncthreads();
 
-  // Compute gradient: grad = cot * X (top-left N_actual block)
+  // Write gradients only for valid batches
   for (unsigned bpb = 0; bpb < BPB; ++bpb) {
     const int b = block_batch0 + int(bpb);
-    if (b >= B) break;
+    if (b >= B) continue;  // Skip instead of break
 
     const b_t* X = sB + size_t(bpb) * size_t(b_elems);
     const Scalar scale = cot_logabs[b];
@@ -386,25 +388,13 @@ __global__ void BwdKernelDx(const Scalar* __restrict__ A,
 
 template <typename KernelT>
 static ffi::Error EnsureOptInShmem(int shmem_bytes, KernelT kernel) {
-  int dev = 0;
-  CUDA_OK(cudaGetDevice(&dev));
-
-  static int cached_dev = -1;
-  static int cached_shmem = -1;
-
-  if (dev == cached_dev && shmem_bytes == cached_shmem) {
-    return ffi::Error::Success();
-  }
-
+  // Directly opt-in without caching (negligible overhead vs. potential bugs)
   cudaError_t e = cudaFuncSetAttribute(
       kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       shmem_bytes);
 
   if (e != cudaSuccess) return InternalErr(cudaGetErrorString(e));
-
-  cached_dev = dev;
-  cached_shmem = shmem_bytes;
   return ffi::Error::Success();
 }
 

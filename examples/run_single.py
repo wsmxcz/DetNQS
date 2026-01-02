@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_jax() -> None:
-    """Configure JAX runtime: GPU priority, float32 default, suppress warnings."""
+    """Configure JAX runtime: GPU priority, float64 precision, suppress warnings."""
     jax.config.update("jax_platforms", "cuda,cpu")
     jax.config.update("jax_enable_x64", False)
     jax.config.update("jax_log_compiles", False)
@@ -166,10 +166,12 @@ def main() -> None:
         param_dtype=jnp.float64,
     )
 
-    # Configure optimizer and determinant selector
+    # Configure optimizer and determinant selector with streaming enabled
     optimizer = optax.adamw(learning_rate=5e-4)
-    selector = TopKSelector(1024)
-    # selector = ThresholdSelector(1e-8)
+    selector = TopKSelector(8192, stream=True)
+    # Alternative selectors:
+    # selector = ThresholdSelector(1e-8, stream=True, max_size=10000)
+    # selector = TopFractionSelector(0.95, max_k=2048, stream=True)
 
     # L1: Build driver for selected mode
     driver = _DRIVER_MAP[args.mode].build(

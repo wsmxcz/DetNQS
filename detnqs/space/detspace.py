@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright 2025 The DetNQS Authors
 # SPDX-License-Identifier: Apache-2.0
 
@@ -21,8 +20,9 @@ Date: December, 2025
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -99,6 +99,32 @@ class DetSpace:
             return self.S_dets
         return np.concatenate([self.S_dets, self.C_dets], axis=0)
 
+    def iter_T(self, block_size: int) -> Iterable[np.ndarray]:
+        """
+        Yield T = S ∪ C as CPU blocks without materializing full T.
+        
+        Blocks are contiguous views/slices of the underlying arrays.
+        Useful for streaming H2D when T is too large to fit in VRAM.
+        
+        Args:
+            block_size: Size of each determinant block
+            
+        Yields:
+            CPU determinant blocks [<=block_size, 2]
+        """
+        bs = int(block_size)
+        if bs <= 0:
+            raise ValueError("block_size must be positive")
+
+        # S blocks
+        for i in range(0, self.size_S, bs):
+            yield self.S_dets[i : i + bs]
+
+        # C blocks (if present)
+        if self.C_dets is not None and self.size_C > 0:
+            for i in range(0, self.size_C, bs):
+                yield self.C_dets[i : i + bs]
+
     # -------------------------------------------------------------------------
     # Initialization
     # -------------------------------------------------------------------------
@@ -139,7 +165,7 @@ class DetSpace:
     # Space evolution
     # -------------------------------------------------------------------------
 
-    def evolve(self, selector: Selector, scores_T: np.ndarray) -> "DetSpace":
+    def evolve(self, selector: Selector, scores_T: Any) -> "DetSpace":
         """
         Update S-space via scoring and selection on T = S ∪ C.
         
@@ -150,7 +176,7 @@ class DetSpace:
         
         Args:
             selector: Selection strategy (TopK/TopFraction/Threshold)
-            scores_T: Importance scores on T-space [n_T]
+            scores_T: Importance scores on T-space [n_T] or streaming factory
         
         Returns:
             New DetSpace with updated S, unbuilt C
@@ -158,7 +184,13 @@ class DetSpace:
         Notes:
             - C_dets reset to None (rebuild via Hamiltonian in next cycle)
             - Selector determines new |S| based on scores
+            - scores_T can be ndarray (legacy) or callable factory (streaming)
         """
-        T_dets = self.T_dets
-        new_S = selector.select(scores_T, T_dets) if T_dets.shape[0] > 0 else T_dets
+        if isinstance(scores_T, np.ndarray):
+            # Legacy path: materialize T on CPU
+            T_dets = self.T_dets
+            new_S = selector.select(scores_T, T_dets) if T_dets.shape[0] > 0 else T_dets
+        else:
+            # Streaming path: selector consumes (scores_block, dets_block) from factory
+            new_S = selector.select(scores_T, None)
         return DetSpace(S_dets=new_S, C_dets=None)

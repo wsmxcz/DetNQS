@@ -6,8 +6,9 @@ State management for NQS-enhanced selected CI optimization.
 
 Core components:
   - Immutable State dataclass bridging CPU determinant space to device computation
-  - Batch preparation: DetSpace.T_dets (CPU uint64) -> DetBatch (device)
+  - Batch preparation: DetSpace dets (CPU uint64) -> DetBatch (device)
   - Forward/backward passes with optional memory-efficient chunking
+  - Streaming inference: forward_dets() for block-wise H2D to reduce peak VRAM
 
 File: detnqs/state.py
 Author: Zheng (Alex) Che, wsmxcz@gmail.com
@@ -16,6 +17,7 @@ Date: December, 2025
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Callable
 
 import jax
@@ -31,6 +33,30 @@ from .utils.jax_utils import PyTree, apply_chunked, vjp_chunked
 
 ApplyFn = Callable[[PyTree, DetBatch], tuple[jnp.ndarray, jnp.ndarray]]
 VjpFn = Callable[[tuple[jnp.ndarray, jnp.ndarray]], PyTree]
+
+
+@functools.partial(jax.jit, static_argnums=(0,))
+def _apply_model(model: Any, params: PyTree, batch: DetBatch):
+    """JITed model.apply with model treated as static."""
+    batch = batch.replace(occ=batch.occ.astype(jnp.int32))
+    return model.apply({"params": params}, batch)
+
+
+def _pad_dets_last(dets: np.ndarray, target: int) -> tuple[np.ndarray, int]:
+    """
+    Pad dets to fixed size by repeating last row.
+    
+    Returns:
+        (padded_dets, n_orig): Padded array and original size
+    """
+    dets = np.asarray(dets, dtype=np.uint64)
+    n = int(dets.shape[0])
+    if n == 0:
+        return dets, 0
+    if n >= target:
+        return dets[:target], target
+    pad = np.repeat(dets[-1:], target - n, axis=0)
+    return np.concatenate([dets, pad], axis=0), n
 
 
 @struct.dataclass(eq=False)
@@ -90,20 +116,28 @@ class State:
         tmp = cls(system=system, model=model, params=params, batch=b1)
         return tmp.update_space(detspace)
 
-    def update_space(self, detspace: DetSpace) -> "State":
+    def update_space(self, detspace: DetSpace, *, device_space: str = "T") -> "State":
         """
         Rebuild device batch from new determinant space (outer-loop transition).
 
-        CPU->device transfer: DetSpace.T_dets -> prepare_batch -> device_put
+        CPU->device transfer: dets -> prepare_batch -> device_put
+        
+        Args:
+            detspace: Determinant space to build batch from
+            device_space: "S" puts only S on device; "T" puts S∪C on device
         """
-        T = np.asarray(detspace.T_dets, dtype=np.uint64)
-        if T.shape[0] == 0:
+        if device_space not in ("S", "T"):
+            raise ValueError(f"device_space must be 'S' or 'T', got {device_space}")
+
+        dets = detspace.S_dets if device_space == "S" else detspace.T_dets
+        dets = np.asarray(dets, dtype=np.uint64)
+        if dets.shape[0] == 0:
             empty = DetBatch(occ=np.zeros((0, self.system.n_elec), dtype=np.int32), aux={})
             return self.replace(batch=jax.device_put(empty))
 
         spec = get_batch_spec(self.model)
         cpu_batch = prepare_batch(
-            T,
+            dets,
             n_orb=self.system.n_orb,
             n_alpha=self.system.n_alpha,
             n_beta=self.system.n_beta,
@@ -114,8 +148,7 @@ class State:
 
     def _apply(self, p: PyTree, b: DetBatch) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Apply model: (params, batch) -> (sign, logabs)."""
-        b = b.replace(occ=b.occ.astype(jnp.int32))
-        return self.model.apply({"params": p}, b)
+        return _apply_model(self.model, p, b)
 
     @property
     def n_det(self) -> int:
@@ -129,6 +162,63 @@ class State:
         s, la = self._apply(self.params, b1)
         return s.dtype if jnp.issubdtype(s.dtype, jnp.complexfloating) else jnp.real(la).dtype
 
+    def forward_dets(
+        self,
+        dets: np.ndarray,
+        *,
+        block_size: int,
+        chunk_size: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Forward pass on arbitrary CPU determinant block via H2D streaming.
+        
+        Uses fixed block_size padding to keep shapes static (avoid recompiles).
+        Memory flow: CPU dets -> pad -> H2D -> model -> D2H -> trim
+        
+        Args:
+            dets: CPU determinants [N, 2]
+            block_size: Fixed batch size for padding (static shape)
+            chunk_size: Optional chunking within the block to reduce activation peak
+            
+        Returns:
+            (sign, logabs): Model outputs on original N samples
+        """
+        bs = int(block_size)
+        if bs <= 0:
+            raise ValueError("block_size must be positive")
+
+        dets_pad, n_orig = _pad_dets_last(dets, bs)
+        if n_orig == 0:
+            # Return correctly typed empty arrays
+            s1, la1 = self._apply(self.params, self.batch[:1])
+            return (
+                np.zeros((0,), dtype=np.asarray(s1).dtype),
+                np.zeros((0,), dtype=np.asarray(jnp.real(la1)).dtype),
+            )
+
+        spec = get_batch_spec(self.model)
+        cpu_batch = prepare_batch(
+            dets_pad,
+            n_orb=self.system.n_orb,
+            n_alpha=self.system.n_alpha,
+            n_beta=self.system.n_beta,
+            ref=self.system.hf_determinant(),
+            spec=spec,
+        )
+        b_dev = jax.device_put(cpu_batch)
+
+        if chunk_size is None:
+            sign, logabs = self._apply(self.params, b_dev)
+        else:
+            # Chunk inside the fixed-size block to reduce activation peak
+            def _fn(p, b):
+                return _apply_model(self.model, p, b)
+            sign, logabs = apply_chunked(_fn, self.params, b_dev, int(chunk_size))
+
+        # device_get blocks until ready; frees transient device buffers sooner
+        sign_h, logabs_h = jax.device_get((sign, logabs))
+        return np.asarray(sign_h)[:n_orig], np.asarray(logabs_h)[:n_orig]
+
     def forward(
         self,
         indices: jnp.ndarray | None = None,
@@ -136,7 +226,7 @@ class State:
         chunk_size: int | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Forward pass: params -> (sign, logabs).
+        Forward pass: params -> (sign, logabs) on device batch.
 
         Args:
             indices: Optional subset of batch indices
@@ -189,7 +279,7 @@ class State:
                 cot_s = cot_s.astype(outs[0].dtype)
                 cot_la = cot_la.astype(jnp.real(outs[1]).dtype)
 
-                # Repack cotangents to match the primal output pytree (e.g., SlogdetResult).
+                # Repack cotangents to match primal output pytree (e.g., SlogdetResult)
                 cot_like = jax.tree_util.tree_unflatten(
                     jax.tree_util.tree_structure(outs),
                     [cot_s, cot_la],

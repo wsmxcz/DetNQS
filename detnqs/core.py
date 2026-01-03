@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Python bindings for detnqs C++ computational backend.
+Python bindings for DetNQS C++ computational backend.
 
-Provides determinant generation, Hamiltonian construction, and integral management.
+Provides:
+  - Determinant generation (FCI, excitations, connected sets)
+  - Hamiltonian construction (variational, perturbative, effective)
+  - Integral management and energy evaluation
+
+File: lever/cpp_ext/__init__.py
+Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+Date: December, 2025
 """
 
 from __future__ import annotations
@@ -14,60 +21,84 @@ from . import _detnqs_cpp
 # --- Integral Management ---
 
 IntCtx = _detnqs_cpp.IntCtx
-"""Integral context managing electron repulsion integrals (ERIs)."""
+"""Context managing electron repulsion integrals (ERIs) and one-body terms."""
 
 # --- Determinant Generation ---
 
 gen_fci_dets = _detnqs_cpp.gen_fci_dets
-"""Generate full CI determinant space."""
+"""Generate complete Fock space for given (N_e, S_z)."""
 
-gen_excited_dets = _detnqs_cpp.gen_excited_dets
-"""Generate single and double excitations from reference determinants."""
+gen_connected_dets = _detnqs_cpp.gen_connected_dets
+"""Generate single/double excitations from reference configurations."""
 
-gen_complement_dets = _detnqs_cpp.gen_complement_dets
-"""Generate complement space from reference determinants."""
+gen_perturbative_dets = _detnqs_cpp.gen_perturbative_dets
+"""
+Construct perturbative set P from variational set V.
+Returns P = C \\ V, all configurations coupled to V via H but not in V.
+"""
 
 prepare_det_batch = _detnqs_cpp.prepare_det_batch
-"""Prepare determinant batch features on CPU."""
+"""Prepare determinant batch features for network input (CPU operation)."""
 
 # --- Hamiltonian Construction ---
 
 get_ham_diag = _detnqs_cpp.get_ham_diag
-"""Compute diagonal Hamiltonian elements <D|H|D>."""
+"""Compute diagonal matrix elements <x|H|x> for given configurations."""
 
-get_ham_ss = _detnqs_cpp.get_ham_ss
-"""Compute H_SS block only (no C-space discovery)."""
+get_ham_vv = _detnqs_cpp.get_ham_vv
+"""
+Construct H_VV block (variational-variational subspace).
+Does not discover connected space C.
+"""
 
 get_ham_block = _detnqs_cpp.get_ham_block
-"""Compute Hamiltonian blocks for predefined spaces."""
+"""
+Compute generic Hamiltonian blocks H_XY for predefined row/column spaces.
+Used for custom subspace projections.
+"""
 
 get_ham_conn = _detnqs_cpp.get_ham_conn
-"""Build Hamiltonian with static screening (heat-bath on integrals)."""
+"""
+Build target-space Hamiltonian with static heat-bath screening.
+Discovers connected set C from variational set V using integral thresholds.
+"""
 
 get_ham_conn_amp = _detnqs_cpp.get_ham_conn_amp
-"""Build Hamiltonian with dynamic amplitude screening."""
+"""
+Build target-space Hamiltonian with dynamic amplitude-based screening.
+Prunes connections using current wavefunction amplitudes.
+"""
 
 get_ham_eff = _detnqs_cpp.get_ham_eff
-"""Assemble effective Hamiltonian via perturbative correction."""
+"""
+Construct effective Hamiltonian H_eff on V via perturbative downfolding.
+Incorporates P-space effects into variational subspace.
+"""
 
 compute_variational_energy = _detnqs_cpp.compute_variational_energy
-"""Compute <Psi|H|Psi> on a fixed basis. Coeffs must be normalized in Python."""
+"""
+Evaluate <Psi|H|Psi> for normalized coefficients on fixed basis.
+Normalization must be handled in Python layer.
+"""
 
 compute_pt2 = _detnqs_cpp.compute_pt2
-"""Compute EN-PT2 correction only. Requires e_ref from optimizer (electronic energy)."""
+"""
+Compute Epstein-Nesbet PT2 correction Delta E_PT2.
+Requires electronic reference energy e_ref from variational optimization.
+"""
 
 __all__ = [
     "IntCtx",
     "gen_fci_dets",
-    "gen_excited_dets",
+    "gen_connected_dets",
+    "gen_perturbative_dets",
+    "prepare_det_batch",
     "get_ham_diag",
-    "get_ham_ss",
+    "get_ham_vv",
     "get_ham_block",
     "get_ham_conn",
     "get_ham_conn_amp",
     "get_ham_eff",
-    "get_local_conn",
-    "get_local_connections",
     "compute_variational_energy",
     "compute_pt2",
 ]

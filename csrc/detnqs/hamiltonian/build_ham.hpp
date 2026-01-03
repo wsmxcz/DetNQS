@@ -3,15 +3,17 @@
 
 /**
  * @file build_ham.hpp
- * @brief Streaming Hamiltonian builders for ⟨S|H|S⟩ and ⟨S|H|C⟩ blocks.
+ * @brief Streaming Hamiltonian construction for variational subspaces.
  *
- * Construction policies:
- *  - KnownSets:  Pre-defined S and C spaces
- *  - StaticHB:   Heat-Bath screening with fixed ε₁ cutoff
- *  - DynamicAmp: Amplitude-weighted screening τᵢ = ε₁/|ψ_S[i]|
+ * Constructs H_VV (variational-variational) and H_VP (variational-perturbative)
+ * blocks under different screening policies:
  *
- * Output: Deterministic sorted COO with merged duplicates.
- * Threading: OpenMP parallelism with thread-local sinks.
+ *  - KnownSets:  Pre-defined V and P spaces
+ *  - StaticHB:   Heat-Bath screening with fixed ε_1 cutoff
+ *  - DynamicAmp: Amplitude-weighted screening τ_i = ε_1/max(|ψ_V[i]|, δ)
+ *
+ * Output format: Deterministic sorted COO with merged duplicates.
+ * Parallelism:   OpenMP with thread-local accumulation.
  *
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
  * Date: December, 2025
@@ -31,11 +33,11 @@
 namespace detnqs {
 
 /**
- * Compute diagonal elements ⟨D|H|D⟩ for all determinants.
+ * Compute diagonal Hamiltonian elements ⟨D|H|D⟩.
  *
  * @param dets Determinant list
  * @param ham  Hamiltonian evaluator
- * @return Vector of diagonal elements aligned with input
+ * @return Diagonal elements aligned with input determinants
  */
 [[nodiscard]] std::vector<double> get_ham_diag(
     std::span<const Det> dets,
@@ -43,57 +45,59 @@ namespace detnqs {
 );
 
 /**
- * Build H_SS block via full S-space enumeration.
+ * Build H_VV via full enumeration within variational space.
  *
- * Enumerates: H_SS = diag + singles + doubles within S.
+ * Enumerates all single and double excitations within V.
  *
- * @param dets_S S determinants
+ * @param dets_V Variational determinants
  * @param ham    Hamiltonian evaluator
  * @param n_orb  Number of spatial orbitals
- * @return COO matrix for H_SS
+ * @return COO matrix for H_VV
  */
-[[nodiscard]] COOMatrix get_ham_ss(
-    std::span<const Det> dets_S,
+[[nodiscard]] COOMatrix get_ham_vv(
+    std::span<const Det> dets_V,
     const HamEval& ham,
     int n_orb
 );
 
 /**
- * Build H_SS and H_SC with pre-defined determinant spaces.
+ * Build H_VV and H_VP with pre-defined spaces.
  *
- * Policy: KnownSets - compute ⟨S|H|S⟩ and ⟨S|H|C⟩ for given C.
+ * Policy: KnownSets
+ *  - Computes ⟨V|H|V⟩ and ⟨V|H|P⟩ for given V and P spaces
+ *  - No screening applied
  *
- * @param dets_S S determinants
- * @param dets_C Optional C determinants; nullopt → empty H_SC
+ * @param dets_V Variational determinants
+ * @param dets_P Optional perturbative determinants; nullopt yields empty H_VP
  * @param ham    Hamiltonian evaluator
  * @param n_orb  Number of spatial orbitals
- * @return HamBlocks{H_SS, H_SC, C_index_map}
+ * @return HamBlocks{H_VV, H_VP, P_index_map}
  */
 [[nodiscard]] HamBlocks get_ham_block(
-    std::span<const Det> dets_S,
-    std::optional<std::span<const Det>> dets_C,
+    std::span<const Det> dets_V,
+    std::optional<std::span<const Det>> dets_P,
     const HamEval& ham,
     int n_orb
 );
 
 /**
- * Build H_SS and discover C via static Heat-Bath screening.
+ * Build H_VV and discover connected space via static Heat-Bath screening.
  *
  * Policy: StaticHB
- *  - Doubles: Keep if |⟨ij||ab⟩| ≥ ε₁ via Heat-Bath table
- *  - Singles: Post-evaluate and keep above numerical threshold
- *  - C determinants indexed lexicographically
+ *  - Doubles: Retain if |⟨ij||ab⟩| ≥ ε_1 using Heat-Bath table
+ *  - Singles: Evaluate and retain if |H_ik| ≥ 1e-12
+ *  - Returns H_VP where P = discovered connected \ V
  *
- * @param dets_S       S determinants
+ * @param dets_V       Variational determinants
  * @param ham          Hamiltonian evaluator
  * @param n_orb        Number of spatial orbitals
- * @param hb_table     Heat-Bath table (required if use_heatbath=true)
- * @param eps1         Heat-Bath cutoff threshold
+ * @param hb_table     Heat-Bath integral table (required if use_heatbath=true)
+ * @param eps1         Heat-Bath threshold ε_1
  * @param use_heatbath Enable Heat-Bath pruning
- * @return HamBlocks{H_SS, H_SC, C_index_map}
+ * @return HamBlocks{H_VV, H_VP, P_index_map}
  */
 [[nodiscard]] HamBlocks get_ham_conn(
-    std::span<const Det> dets_S,
+    std::span<const Det> dets_V,
     const HamEval& ham,
     int n_orb,
     const HeatBathTable* hb_table,
@@ -102,24 +106,24 @@ namespace detnqs {
 );
 
 /**
- * Build H_SS and discover C via dynamic amplitude-weighted screening.
+ * Build H_VV and discover connected space via amplitude-weighted screening.
  *
- * Policy: DynamicAmp - per-row adaptive cutoff
- *  - Doubles: Keep if |⟨ij||ab⟩| ≥ τᵢ where τᵢ = ε₁/max(|ψ_S[i]|, δ)
- *  - Singles: Keep if |H_ik·ψ_S[i]| ≥ ε₁
- *  - Favors important configurations with large amplitudes
+ * Policy: DynamicAmp (per-row adaptive cutoff)
+ *  - Doubles: Retain if |⟨ij||ab⟩| ≥ τ_i where τ_i = ε_1/max(|ψ_V[i]|, 1e-10)
+ *  - Singles: Retain if |H_ik · ψ_V[i]| ≥ ε_1
+ *  - Prioritizes excitations from large-amplitude configurations
  *
- * @param dets_S   S determinants
- * @param psi_S    Amplitudes aligned with dets_S
+ * @param dets_V   Variational determinants
+ * @param psi_V    Wavefunction amplitudes aligned with dets_V
  * @param ham      Hamiltonian evaluator
  * @param n_orb    Number of spatial orbitals
- * @param hb_table Heat-Bath table (required)
- * @param eps1     Amplitude criterion threshold
- * @return HamBlocks{H_SS, H_SC, C_index_map}
+ * @param hb_table Heat-Bath integral table (required)
+ * @param eps1     Amplitude criterion threshold ε_1
+ * @return HamBlocks{H_VV, H_VP, P_index_map}
  */
 [[nodiscard]] HamBlocks get_ham_conn_amp(
-    std::span<const Det> dets_S,
-    std::span<const double> psi_S,
+    std::span<const Det> dets_V,
+    std::span<const double> psi_V,
     const HamEval& ham,
     int n_orb,
     const HeatBathTable* hb_table,

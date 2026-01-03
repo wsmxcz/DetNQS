@@ -4,12 +4,12 @@
 """
 Energy functionals for deterministic NQS on selected CI spaces.
 
-Implements Rayleigh quotient energy functionals:
-  - Variational/Effective: E = <psi_S|H_SS|psi_S> / <psi_S|psi_S>
-  - Proxy: E = <psi_T|H_T|psi_T> / <psi_T|psi_T>, where T = S union C
-  - Asymmetric: E = <psi_S|(H*psi)_S> / <psi_S|psi_S>
+Implements Rayleigh quotient functionals:
+  - Variational/Effective: E = <psi_V|H_VV|psi_V> / <psi_V|psi_V>
+  - Proxy: E = <psi_T|H_T|psi_T> / <psi_T|psi_T>, where T = V union P
+  - Asymmetric: E = <psi_V|(H*psi)_V> / <psi_V|psi_V>
 
-Gradients computed via VJP with (sign, logabs) wavefunction representation.
+Gradients via VJP with (sign, logabs) wavefunction representation.
 
 File: detnqs/operator/functional.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -24,15 +24,13 @@ import jax.numpy as jnp
 
 from ..space import DetSpace
 from ..state import State
-from .hamiltonian import ProxyHamiltonian, SSHamiltonian
-from .kernel import ProxyContraction, SSContraction
+from .hamiltonian import ProxyHamiltonian, VVHamiltonian
+from .kernel import ProxyContraction, VVContraction
 
 
 def _decode_psi(sign: jnp.ndarray, logabs: jnp.ndarray):
     """
-    Decode wavefunction from (sign, logabs) representation.
-    
-    Applies global max-shift to logabs for numerical stability.
+    Decode wavefunction from (sign, logabs) to amplitude.
     
     Returns:
         psi: sign * exp(logabs - shift)
@@ -53,11 +51,11 @@ def _cotangents_from_g(
     g: jnp.ndarray,
 ):
     """
-    Compute cotangents for (sign, logabs) outputs given g = dE/d(psi*).
+    Compute VJP cotangents for (sign, logabs) given g = dE/d(psi*).
     
-    Unified Wirtinger derivative:
-      - cot_logabs = 2*Re(conj(psi)*g) for both real and complex
-      - cot_sign = amp * g for complex; zero for real (non-differentiable)
+    Wirtinger derivative:
+      cot_logabs = 2*Re(conj(psi)*g)
+      cot_sign = amp * g (complex only)
     
     Returns:
         (cot_sign, cot_logabs)
@@ -74,45 +72,44 @@ def _cotangents_from_g(
     return cot_sign, cot_logabs
 
 
-def _energy_step_s(
+def _energy_step_variational(
     state: State,
-    ham: SSHamiltonian,
-    op: Callable[[jnp.ndarray], SSContraction],
+    ham: VVHamiltonian,
+    op: Callable[[jnp.ndarray], VVContraction],
     *,
     eps: float,
     chunk_size: int | None,
 ) -> tuple[float, Any]:
     """
-    Compute energy and gradient on S-space.
+    Variational energy on V-space: E = <psi_V|H_VV|psi_V> / <psi_V|psi_V>.
     
-    Rayleigh quotient: E = <psi_S|H_SS|psi_S> / <psi_S|psi_S>
     Gradient: grad = vjp(2*(H - E)*psi / <psi|psi>)
     """
-    n_s = ham.ham_ss.shape[0]
-    indices = jnp.arange(n_s, dtype=jnp.int32)
+    n_v = ham.ham_vv.shape[0]
+    indices = jnp.arange(n_v, dtype=jnp.int32)
     
-    (sign_s, logabs_s), vjp_fn = state.value_and_vjp(indices, chunk_size=chunk_size)
-    is_complex = jnp.issubdtype(sign_s.dtype, jnp.complexfloating)
+    (sign_v, logabs_v), vjp_fn = state.value_and_vjp(indices, chunk_size=chunk_size)
+    is_complex = jnp.issubdtype(sign_v.dtype, jnp.complexfloating)
     
-    psi_s, amp_s, _ = _decode_psi(sign_s, jnp.real(logabs_s))
+    psi_v, amp_v, _ = _decode_psi(sign_v, jnp.real(logabs_v))
     
-    contr = op(psi_s)
-    h_psi_s = contr.S
+    contr = op(psi_v)
+    h_psi_v = contr.V
     
-    num = jnp.vdot(psi_s, h_psi_s)
-    den = jnp.vdot(psi_s, psi_s)
+    num = jnp.vdot(psi_v, h_psi_v)
+    den = jnp.vdot(psi_v, psi_v)
     
     if is_complex:
-        den_safe = jnp.maximum(den.real, eps).astype(psi_s.dtype)
+        den_safe = jnp.maximum(den.real, eps).astype(psi_v.dtype)
         e_elec = (num / den_safe).real
     else:
         den_safe = jnp.maximum(den, eps)
         e_elec = num / den_safe
     
-    residual = h_psi_s - e_elec * psi_s
+    residual = h_psi_v - e_elec * psi_v
     g = residual / den_safe
     
-    cot_sign, cot_logabs = _cotangents_from_g(sign_s, psi_s, amp_s, g)
+    cot_sign, cot_logabs = _cotangents_from_g(sign_v, psi_v, amp_v, g)
     grad = vjp_fn((cot_sign, cot_logabs))
     
     return e_elec, grad
@@ -128,51 +125,50 @@ def _energy_step_proxy(
     chunk_size: int | None,
 ) -> tuple[float, Any]:
     """
-    Compute energy and gradient on full T = S union C space.
+    Proxy energy on T-space: E = <psi_T|H_T|psi_T> / <psi_T|psi_T>.
     
-    Rayleigh quotient: E = <psi_T|H_T|psi_T> / <psi_T|psi_T>
-    Gradient computed on both S and C components.
+    Gradient computed on both V and P components.
     """
-    n_s = detspace.size_S
-    n_c = detspace.size_C
+    n_v = detspace.size_V
+    n_p = detspace.size_P
     
     (sign_t, logabs_t), vjp_fn = state.value_and_vjp(chunk_size=chunk_size)
     is_complex = jnp.issubdtype(sign_t.dtype, jnp.complexfloating)
     
     psi_t, amp_t, _ = _decode_psi(sign_t, jnp.real(logabs_t))
     
-    psi_s, psi_c = psi_t[:n_s], psi_t[n_s:n_s + n_c]
-    amp_s, amp_c = amp_t[:n_s], amp_t[n_s:n_s + n_c]
-    sign_s, sign_c = sign_t[:n_s], sign_t[n_s:n_s + n_c]
+    psi_v, psi_p = psi_t[:n_v], psi_t[n_v:n_v + n_p]
+    amp_v, amp_p = amp_t[:n_v], amp_t[n_v:n_v + n_p]
+    sign_v, sign_p = sign_t[:n_v], sign_t[n_v:n_v + n_p]
     
-    contr = op(psi_s, psi_c)
-    h_psi_s, h_psi_c = contr.S, contr.C
+    contr = op(psi_v, psi_p)
+    h_psi_v, h_psi_p = contr.V, contr.P
     
-    num = jnp.vdot(psi_s, h_psi_s) + jnp.vdot(psi_c, h_psi_c)
+    num = jnp.vdot(psi_v, h_psi_v) + jnp.vdot(psi_p, h_psi_p)
     
     if is_complex:
-        den = jnp.vdot(psi_s, psi_s).real + jnp.vdot(psi_c, psi_c).real
-        den_safe = jnp.maximum(den, eps).astype(psi_s.dtype)
+        den = jnp.vdot(psi_v, psi_v).real + jnp.vdot(psi_p, psi_p).real
+        den_safe = jnp.maximum(den, eps).astype(psi_v.dtype)
         e_elec = (num / den_safe).real
     else:
-        den = jnp.vdot(psi_s, psi_s) + jnp.vdot(psi_c, psi_c)
+        den = jnp.vdot(psi_v, psi_v) + jnp.vdot(psi_p, psi_p)
         den_safe = jnp.maximum(den, eps)
         e_elec = num / den_safe
     
-    g_s = (h_psi_s - e_elec * psi_s) / den_safe
-    g_c = (h_psi_c - e_elec * psi_c) / den_safe
+    g_v = (h_psi_v - e_elec * psi_v) / den_safe
+    g_p = (h_psi_p - e_elec * psi_p) / den_safe
     
-    cot_sign_s, cot_logabs_s = _cotangents_from_g(sign_s, psi_s, amp_s, g_s)
-    cot_sign_c, cot_logabs_c = _cotangents_from_g(sign_c, psi_c, amp_c, g_c)
+    cot_sign_v, cot_logabs_v = _cotangents_from_g(sign_v, psi_v, amp_v, g_v)
+    cot_sign_p, cot_logabs_p = _cotangents_from_g(sign_p, psi_p, amp_p, g_p)
     
-    cot_sign_t = jnp.concatenate([cot_sign_s, cot_sign_c], axis=0)
-    cot_logabs_t = jnp.concatenate([cot_logabs_s, cot_logabs_c], axis=0)
+    cot_sign_t = jnp.concatenate([cot_sign_v, cot_sign_p], axis=0)
+    cot_logabs_t = jnp.concatenate([cot_logabs_v, cot_logabs_p], axis=0)
     
     grad = vjp_fn((cot_sign_t, cot_logabs_t))
     return e_elec, grad
 
 
-def _energy_step_asym(
+def _energy_step_asymmetric(
     state: State,
     ham: ProxyHamiltonian,
     op: Callable[[jnp.ndarray, jnp.ndarray], ProxyContraction],
@@ -182,53 +178,52 @@ def _energy_step_asym(
     chunk_size: int | None,
 ) -> tuple[float, Any]:
     """
-    Asymmetric energy estimator with S-space metric.
+    Asymmetric energy: E = <psi_V|(H*psi)_V> / <psi_V|psi_V>.
     
-    Energy: E = <psi_S|(H*psi)_S> / <psi_S|psi_S>
-    Gradient computed only from S-space residual.
+    Gradient from V-space residual only.
     """
-    n_s = detspace.size_S
-    n_c = detspace.size_C
+    n_v = detspace.size_V
+    n_p = detspace.size_P
     
     (sign_t, logabs_t), vjp_fn = state.value_and_vjp(chunk_size=chunk_size)
     is_complex = jnp.issubdtype(sign_t.dtype, jnp.complexfloating)
     
     psi_t, amp_t, _ = _decode_psi(sign_t, jnp.real(logabs_t))
     
-    psi_s = psi_t[:n_s]
-    psi_c = psi_t[n_s:n_s + n_c]
-    amp_s = amp_t[:n_s]
-    sign_s = sign_t[:n_s]
+    psi_v = psi_t[:n_v]
+    psi_p = psi_t[n_v:n_v + n_p]
+    amp_v = amp_t[:n_v]
+    sign_v = sign_t[:n_v]
     
-    contr = op(psi_s, psi_c)
-    h_psi_s = contr.S
+    contr = op(psi_v, psi_p)
+    h_psi_v = contr.V
     
-    num = jnp.vdot(psi_s, h_psi_s)
-    den = jnp.vdot(psi_s, psi_s)
+    num = jnp.vdot(psi_v, h_psi_v)
+    den = jnp.vdot(psi_v, psi_v)
     
     if is_complex:
-        den_safe = jnp.maximum(den.real, eps).astype(psi_s.dtype)
+        den_safe = jnp.maximum(den.real, eps).astype(psi_v.dtype)
         e_elec = (num / den_safe).real
     else:
         den_safe = jnp.maximum(den, eps)
         e_elec = num / den_safe
     
-    g_s = (h_psi_s - e_elec * psi_s) / den_safe
+    g_v = (h_psi_v - e_elec * psi_v) / den_safe
     
-    cot_sign_s, cot_logabs_s = _cotangents_from_g(sign_s, psi_s, amp_s, g_s)
+    cot_sign_v, cot_logabs_v = _cotangents_from_g(sign_v, psi_v, amp_v, g_v)
     
-    cot_sign_c = jnp.zeros((n_c,), dtype=sign_t.dtype)
-    cot_logabs_c = jnp.zeros((n_c,), dtype=jnp.real(logabs_t).dtype)
+    cot_sign_p = jnp.zeros((n_p,), dtype=sign_t.dtype)
+    cot_logabs_p = jnp.zeros((n_p,), dtype=jnp.real(logabs_t).dtype)
     
-    cot_sign_t = jnp.concatenate([cot_sign_s, cot_sign_c], axis=0)
-    cot_logabs_t = jnp.concatenate([cot_logabs_s, cot_logabs_c], axis=0)
+    cot_sign_t = jnp.concatenate([cot_sign_v, cot_sign_p], axis=0)
+    cot_logabs_t = jnp.concatenate([cot_logabs_v, cot_logabs_p], axis=0)
     
     grad = vjp_fn((cot_sign_t, cot_logabs_t))
     return e_elec, grad
 
 
 def make_energy_step(
-    ham: SSHamiltonian | ProxyHamiltonian,
+    ham: VVHamiltonian | ProxyHamiltonian,
     op: Callable,
     *,
     detspace: DetSpace | None = None,
@@ -237,25 +232,24 @@ def make_energy_step(
     chunk_size: int | None = None,
 ) -> Callable[[State], tuple[float, Any]]:
     """
-    Build energy and gradient function for inner optimization sweep.
+    Build energy and gradient function for inner optimization.
     
-    Mode selection resolved at L1 (Python layer), returns JIT-compatible
-    callable for L2 (inner loop).
+    Mode selection at L1 layer, returns JIT-compatible callable for L2.
     
     Args:
-        ham: Hamiltonian operator
+        ham: Hamiltonian operator (SS or Proxy)
         op: Contraction kernel
-        detspace: Determinant space (required for ProxyHamiltonian)
-        mode: Functional mode ("variational", "proxy", "asymmetric")
-        eps: Numerical stability threshold
+        detspace: Required for ProxyHamiltonian modes
+        mode: "variational", "proxy", or "asymmetric"
+        eps: Denominator regularization
         chunk_size: Forward pass batch size
     
     Returns:
-        step: Function (state) -> (energy, gradient)
+        step: (state) -> (energy, gradient)
     """
-    if isinstance(ham, SSHamiltonian):
+    if isinstance(ham, VVHamiltonian):
         def step(state: State) -> tuple[float, Any]:
-            return _energy_step_s(state, ham, op, eps=eps, chunk_size=chunk_size)
+            return _energy_step_variational(state, ham, op, eps=eps, chunk_size=chunk_size)
         return step
     
     if detspace is None:
@@ -268,7 +262,7 @@ def make_energy_step(
     
     if mode == "asymmetric":
         def step(state: State) -> tuple[float, Any]:
-            return _energy_step_asym(state, ham, op, detspace, eps=eps, chunk_size=chunk_size)
+            return _energy_step_asymmetric(state, ham, op, detspace, eps=eps, chunk_size=chunk_size)
         return step
     
     raise ValueError(f"Unsupported mode: {mode!r}")

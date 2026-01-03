@@ -6,24 +6,24 @@ Operator layer: Hamiltonian construction, host kernels, and energy functionals.
 
 Public surface:
   - Minimal COO / space containers and Hamiltonian dataclasses
-  - S-space and proxy Hamiltonian builders
+  - V-space and proxy Hamiltonian builders
   - JAX-compatible SpMV operators with automatic dtype dispatch
   - Unified energy / gradient functional with mode-agnostic interface
 """
 
 from .hamiltonian import (
     DiagonalInfo,
-    SSHamiltonian,
+    VVHamiltonian,
     ProxyHamiltonian,
-    build_ss_hamiltonian,
+    build_vv_hamiltonian,
     build_proxy_hamiltonian,
     build_effective_hamiltonian,
 )
 
 from .kernel import (
-    SSContraction,
+    VVContraction,
     ProxyContraction,
-    build_ss_operator,
+    build_vv_operator,
     build_proxy_operator,
 )
 
@@ -34,15 +34,15 @@ from .functional import (
 __all__ = [
     # hamiltonian
     "DiagonalInfo",
-    "SSHamiltonian",
+    "VVHamiltonian",
     "ProxyHamiltonian",
-    "build_ss_hamiltonian",
+    "build_vv_hamiltonian",
     "build_proxy_hamiltonian",
     "build_effective_hamiltonian",
     # kernel
-    "SSContraction",
+    "VVContraction",
     "ProxyContraction",
-    "build_ss_operator",
+    "build_vv_operator",
     "build_proxy_operator",
     # functional
     "make_energy_step",

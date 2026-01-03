@@ -19,7 +19,7 @@ from jax import random
 
 from detnqs.models.slogdet import slogdet
 
-jax.config.update("jax_enable_x64", False)
+jax.config.update("jax_enable_x64", True)
 
 
 def check_correctness(name: str, mat: jnp.ndarray, verbose: bool = True):

@@ -2,13 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Hamiltonian constructionterminant spaces.
+Hamiltonian construction for determinant spaces.
 
-This version stores sparse blocks in SciPy CSR/CSC formats for fast CPU SpMV.
-We keep the C++ backend API unchanged, but convert COO triplets to CSR/CSC once
-per outer iteration (L1), and reuse them across inner steps (L2).
+Provides three Hamiltonian representations:
+  - VVHamiltonian: H_VV restricted to variational space V
+  - ProxyHamiltonian: Diagonal-approximated H on target space T = V + P
+  - Effective Hamiltonian: Löwdin downfolded H_eff on V via perturbative P
 
-File: detnqs/operator/hamiltonian.py
+Sparse blocks stored in CSR/CSC (SciPy) for efficient CPU SpMV.
+Built once per outer iteration (L1), reused across inner steps (L2).
+
+File: lever/operator/hamiltonian.py
+Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+Date: December, 2025
 """
 
 from __future__ import annotations
@@ -25,31 +31,40 @@ from ..space import DetSpace
 
 
 class DiagonalInfo(NamedTuple):
-    """Diagonal elements H_ii for S and C spaces."""
-    S: np.ndarray  # [n_S], float64
-    C: np.ndarray  # [n_C], float64 (empty if no C-space)
+    """Diagonal elements H_ii for variational and perturbative spaces."""
+    V: np.ndarray  # [n_V], float64
+    P: np.ndarray  # [n_P], float64 (empty if no P-space)
 
 
 @dataclass(eq=False)
-class SSHamiltonian:
-    """S-space restricted Hamiltonian H_SS (CSR)."""
-    ham_ss: sp.csr_matrix
+class VVHamiltonian:
+    """
+    Hamiltonian restricted to variational space V.
+  
+    Attributes:
+        ham_vv: CSR matrix, shape (n_V, n_V)
+        diagonals: Diagonal elements for V (and empty P)
+    """
+    ham_vv: sp.csr_matrix
     diagonals: DiagonalInfo
 
 
 @dataclass(eq=False)
 class ProxyHamiltonian:
     """
-    Proxy Hamiltonian on T = S ⊕ C.
-
-    Stored blocks:
-      - ham_ss: CSR, shape (n_S, n_S)
-      - ham_sc: CSR, shape (n_S, n_C)
-      - ham_cs: CSC, shape (n_C, n_S) = conj(ham_sc.T)
+    Proxy Hamiltonian on target space T = V ⊕ P.
+  
+    Diagonal approximation for P-space: tilde{H}_PP = diag(H_PP).
+  
+    Attributes:
+        ham_vv: H_VV block, CSR, shape (n_V, n_V)
+        ham_vp: H_VP block, CSR, shape (n_V, n_P)
+        ham_pv: H_PV block, CSC, shape (n_P, n_V), equals (H_VP)^T
+        diagonals: Diagonal elements for V and P
     """
-    ham_ss: sp.csr_matrix
-    ham_sc: sp.csr_matrix
-    ham_cs: sp.csc_matrix
+    ham_vv: sp.csr_matrix
+    ham_vp: sp.csr_matrix
+    ham_pv: sp.csc_matrix
     diagonals: DiagonalInfo
 
 
@@ -59,7 +74,7 @@ def _coo_to_csr(
     vals: np.ndarray,
     shape: Tuple[int, int],
 ) -> sp.csr_matrix:
-    """Build a CSR matrix from COO triplets (duplicates are summed)."""
+    """Convert COO triplets to CSR (duplicates summed)."""
     coo = sp.coo_matrix(
         (np.asarray(vals, dtype=np.float64),
          (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64))),
@@ -68,35 +83,35 @@ def _coo_to_csr(
     return coo.tocsr()
 
 
-def build_ss_hamiltonian(
+def build_vv_hamiltonian(
     system: MolecularSystem,
     space: DetSpace,
-) -> SSHamiltonian:
+) -> VVHamiltonian:
     """
-    Build H_SS for fixed S-space.
+    Build H_VV for fixed variational space V.
 
     Returns:
-        SSHamiltonian with CSR H_SS and diagonal elements.
+        VVHamiltonian with CSR H_VV and diagonal elements.
     """
-    S = np.ascontiguousarray(space.S_dets, dtype=np.uint64)
-    n_s = int(S.shape[0])
+    V_dets = np.ascontiguousarray(space.V_dets, dtype=np.uint64)
+    n_v = int(V_dets.shape[0])
 
-    coo_ss = core.get_ham_ss(
-        dets_S=S,
+    coo_vv = core.get_ham_vv(
+        dets_V=V_dets,
         int_ctx=system.int_ctx,
         n_orb=system.n_orb,
     )
 
-    ham_ss = _coo_to_csr(
-        rows=coo_ss["row"],
-        cols=coo_ss["col"],
-        vals=coo_ss["val"],
-        shape=(n_s, n_s),
+    ham_vv = _coo_to_csr(
+        rows=coo_vv["row"],
+        cols=coo_vv["col"],
+        vals=coo_vv["val"],
+        shape=(n_v, n_v),
     )
 
-    h_diag_s = np.asarray(ham_ss.diagonal(), dtype=np.float64)
-    diagonals = DiagonalInfo(S=h_diag_s, C=np.zeros((0,), dtype=np.float64))
-    return SSHamiltonian(ham_ss=ham_ss, diagonals=diagonals)
+    h_diag_v = np.asarray(ham_vv.diagonal(), dtype=np.float64)
+    diagonals = DiagonalInfo(V=h_diag_v, P=np.zeros((0,), dtype=np.float64))
+    return VVHamiltonian(ham_vv=ham_vv, diagonals=diagonals)
 
 
 def build_proxy_hamiltonian(
@@ -104,45 +119,58 @@ def build_proxy_hamiltonian(
     space: DetSpace,
     *,
     screening: Literal["none", "static", "dynamic"] = "static",
-    psi_s: np.ndarray | None = None,
+    psi_v: np.ndarray | None = None,
     screen_eps: float = 1e-6,
     diag_shift: float = 0.0,
 ) -> Tuple[ProxyHamiltonian, np.ndarray]:
     """
-    Build proxy Hamiltonian blocks with screening.
+    Build proxy Hamiltonian H_VV, H_VP, diag(H_PP) with optional screening.
+
+    Screening modes:
+      - "none": Full P
+      - "static": Heat-bath screening by |H_ij| > eps
+      - "dynamic": Amplitude-weighted screening by |psi_V[i] * H_ij| > eps
+
+    Args:
+        system: Molecular integrals and orbital count
+        space: Current DetSpace with V_dets
+        screening: Screening strategy
+        psi_v: Amplitudes on V for dynamic screening, shape [n_V]
+        screen_eps: Screening threshold
+        diag_shift: Shift added to diag(H_PP)
 
     Returns:
         proxy_ham: ProxyHamiltonian with CSR/CSC blocks
-        C_dets: [n_C, 2] uint64
+        P_dets: Perturbative configurations, shape [n_P, 2], dtype uint64
     """
-    S = np.ascontiguousarray(space.S_dets, dtype=np.uint64)
-    n_s = int(S.shape[0])
+    V_dets = np.ascontiguousarray(space.V_dets, dtype=np.uint64)
+    n_v = int(V_dets.shape[0])
 
     if screening == "none":
-        C = core.gen_complement_dets(S, system.n_orb, mode="none")
+        P_dets = core.gen_perturbative_dets(V_dets, system.n_orb, mode="none")
         result = core.get_ham_block(
-            bra_dets=S,
-            ket_dets=C,
+            bra_dets=V_dets,
+            ket_dets=P_dets,
             int_ctx=system.int_ctx,
             n_orb=system.n_orb,
         )
     elif screening == "static":
         result = core.get_ham_conn(
-            dets_S=S,
+            dets_V=V_dets,
             int_ctx=system.int_ctx,
             n_orb=system.n_orb,
             use_heatbath=True,
             eps1=screen_eps,
         )
     elif screening == "dynamic":
-        if psi_s is None:
-            raise ValueError("Dynamic screening requires psi_s amplitudes")
-        psi_s_arr = np.ascontiguousarray(psi_s, dtype=np.float64)
-        if psi_s_arr.shape[0] != n_s:
-            raise ValueError(f"psi_s size mismatch: {psi_s_arr.shape[0]} != n_S={n_s}")
+        if psi_v is None:
+            raise ValueError("Dynamic screening requires psi_v amplitudes on V")
+        psi_v_arr = np.ascontiguousarray(psi_v, dtype=np.float64)
+        if psi_v_arr.shape[0] != n_v:
+            raise ValueError(f"psi_v shape mismatch: {psi_v_arr.shape[0]} != n_V={n_v}")
         result = core.get_ham_conn_amp(
-            dets_S=S,
-            psi_S=psi_s_arr,
+            dets_V=V_dets,
+            psi_v=psi_v_arr,
             int_ctx=system.int_ctx,
             n_orb=system.n_orb,
             eps1=screen_eps,
@@ -150,36 +178,38 @@ def build_proxy_hamiltonian(
     else:
         raise ValueError(f"Unknown screening mode: {screening!r}")
 
-    coo_ss = result["H_SS"]
-    coo_sc = result["H_SC"]
-    C_dets = np.asarray(result["det_C"], dtype=np.uint64)
-    n_c = int(result["size_C"])
+    coo_vv = result["H_VV"]
+    coo_vp = result["H_VP"]
+    P_dets = np.asarray(result["det_P"], dtype=np.uint64)
+    n_p = int(result["size_P"])
 
-    ham_ss = _coo_to_csr(
-        rows=coo_ss["row"],
-        cols=coo_ss["col"],
-        vals=coo_ss["val"],
-        shape=(n_s, n_s),
+    ham_vv = _coo_to_csr(
+        rows=coo_vv["row"],
+        cols=coo_vv["col"],
+        vals=coo_vv["val"],
+        shape=(n_v, n_v),
     )
-    ham_sc = _coo_to_csr(
-        rows=coo_sc["row"],
-        cols=coo_sc["col"],
-        vals=coo_sc["val"],
-        shape=(n_s, n_c),
+    ham_vp = _coo_to_csr(
+        rows=coo_vp["row"],
+        cols=coo_vp["col"],
+        vals=coo_vp["val"],
+        shape=(n_v, n_p),
     )
-    # For y_cs = H_CS @ psi_S, CSC is the natural format.
-    ham_cs = ham_sc.transpose().conjugate()  # CSC matrix, shape (n_c, n_s)
+    # H_PV = (H_VP)^T in CSC for efficient y_p = H_PV @ psi_v
+    ham_pv = ham_vp.transpose().conjugate()
 
-    h_diag_s = np.asarray(ham_ss.diagonal(), dtype=np.float64)
-    if n_c > 0:
-        h_diag_c = core.get_ham_diag(dets=C_dets, int_ctx=system.int_ctx)
-        h_diag_c = np.ascontiguousarray(h_diag_c, dtype=np.float64) + float(diag_shift)
+    h_diag_v = np.asarray(ham_vv.diagonal(), dtype=np.float64)
+    if n_p > 0:
+        h_diag_p = core.get_ham_diag(dets=P_dets, int_ctx=system.int_ctx)
+        h_diag_p = np.ascontiguousarray(h_diag_p, dtype=np.float64) + float(diag_shift)
     else:
-        h_diag_c = np.zeros((0,), dtype=np.float64)
+        h_diag_p = np.zeros((0,), dtype=np.float64)
 
-    diagonals = DiagonalInfo(S=h_diag_s, C=h_diag_c)
-    ham = ProxyHamiltonian(ham_ss=ham_ss, ham_sc=ham_sc, ham_cs=ham_cs, diagonals=diagonals)
-    return ham, C_dets
+    diagonals = DiagonalInfo(V=h_diag_v, P=h_diag_p)
+    ham = ProxyHamiltonian(
+        ham_vv=ham_vv, ham_vp=ham_vp, ham_pv=ham_pv, diagonals=diagonals
+    )
+    return ham, P_dets
 
 
 def build_effective_hamiltonian(
@@ -190,34 +220,49 @@ def build_effective_hamiltonian(
     reg_type: Literal["sigma", "linear_shift"] = "sigma",
     epsilon: float = 1e-12,
     upper_only: bool = True,
-) -> SSHamiltonian:
+) -> VVHamiltonian:
     """
-    Build effective Hamiltonian via Löwdin partitioning.
+    Build effective Hamiltonian via Löwdin partitioning on V.
 
-    Note: core.get_ham_eff expects COO triplets; we convert CSR -> COO here.
+    Downfolds P-space effects into H_eff on V:
+      H_eff = H_VV + H_VP (e_ref - diag(H_PP))^{-1} H_PV
+
+    Regularization avoids division by near-zero denominators.
+
+    Args:
+        system: Molecular system (for API consistency, not used)
+        proxy_ham: Proxy Hamiltonian with H_VV, H_VP, diag(H_PP)
+        e_ref: Reference energy for perturbative denominator
+        reg_type: Regularization strategy ("sigma" or "linear_shift")
+        epsilon: Regularization parameter
+        upper_only: If True, only upper triangle is computed
+
+    Returns:
+        VVHamiltonian with effective H_eff on V
     """
-    H_SS_coo = proxy_ham.ham_ss.tocoo()
-    H_SC_coo = proxy_ham.ham_sc.tocoo()
+    # C++ backend expects COO triplets; convert CSR -> COO
+    H_VV_coo = proxy_ham.ham_vv.tocoo()
+    H_VP_coo = proxy_ham.ham_vp.tocoo()
 
-    H_SS_dict = {
-        "row": np.asarray(H_SS_coo.row, dtype=np.int64),
-        "col": np.asarray(H_SS_coo.col, dtype=np.int64),
-        "val": np.asarray(H_SS_coo.data, dtype=np.float64),
-        "shape": proxy_ham.ham_ss.shape,
+    H_VV_dict = {
+        "row": np.asarray(H_VV_coo.row, dtype=np.int64),
+        "col": np.asarray(H_VV_coo.col, dtype=np.int64),
+        "val": np.asarray(H_VV_coo.data, dtype=np.float64),
+        "shape": proxy_ham.ham_vv.shape,
     }
-    H_SC_dict = {
-        "row": np.asarray(H_SC_coo.row, dtype=np.int64),
-        "col": np.asarray(H_SC_coo.col, dtype=np.int64),
-        "val": np.asarray(H_SC_coo.data, dtype=np.float64),
-        "shape": proxy_ham.ham_sc.shape,
+    H_VP_dict = {
+        "row": np.asarray(H_VP_coo.row, dtype=np.int64),
+        "col": np.asarray(H_VP_coo.col, dtype=np.int64),
+        "val": np.asarray(H_VP_coo.data, dtype=np.float64),
+        "shape": proxy_ham.ham_vp.shape,
     }
 
-    h_cc = np.ascontiguousarray(proxy_ham.diagonals.C, dtype=np.float64)
+    h_pp_diag = np.ascontiguousarray(proxy_ham.diagonals.P, dtype=np.float64)
 
     result = core.get_ham_eff(
-        H_SS=H_SS_dict,
-        H_SC=H_SC_dict,
-        h_cc_diag=h_cc,
+        H_VV=H_VV_dict,
+        H_VP=H_VP_dict,
+        h_pp_diag=h_pp_diag,
         e_ref=float(e_ref),
         reg_type=reg_type,
         epsilon=float(epsilon),
@@ -231,16 +276,16 @@ def build_effective_hamiltonian(
         shape=tuple(result["shape"]),
     )
 
-    h_diag_s = np.asarray(ham_eff.diagonal(), dtype=np.float64)
-    diagonals = DiagonalInfo(S=h_diag_s, C=np.zeros((0,), dtype=np.float64))
-    return SSHamiltonian(ham_ss=ham_eff, diagonals=diagonals)
+    h_diag_v = np.asarray(ham_eff.diagonal(), dtype=np.float64)
+    diagonals = DiagonalInfo(V=h_diag_v, P=np.zeros((0,), dtype=np.float64))
+    return VVHamiltonian(ham_vv=ham_eff, diagonals=diagonals)
 
 
 __all__ = [
     "DiagonalInfo",
-    "SSHamiltonian",
+    "VVHamiltonian",
     "ProxyHamiltonian",
-    "build_ss_hamiltonian",
+    "build_vv_hamiltonian",
     "build_proxy_hamiltonian",
     "build_effective_hamiltonian",
 ]

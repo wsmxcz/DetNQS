@@ -2,13 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Determinant selection strategies based on importance scores.
+Determinant selection strategies for variational set refinement.
 
-Streaming support:
-  - If stream=True, selectors accept `scores` as an iterable/factory yielding:
-        (scores_block: np.ndarray [B], dets_block: np.ndarray [B,2])
-  - For multi-pass selectors (Threshold/TopFraction), `scores` MUST be a callable
-    factory that returns a fresh iterator each call.
+Provides selectors (TopK, TopFraction, Threshold) to choose the next
+variational set V_{k+1} from target set T_k based on importance scores.
+
+Streaming mode:
+  - When stream=True, scores can be an iterable/factory yielding blocks:
+    (scores_chunk: ndarray [B], dets_chunk: ndarray [B,2])
+  - Multi-pass selectors (TopFraction, Threshold) require scores as
+    a callable factory returning fresh iterators.
+
+File: lever/selectors.py
+Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+Date: December, 2025
 """
 
 from __future__ import annotations
@@ -22,18 +29,14 @@ import numpy as np
 
 
 def _blocks_factory(scores: Any) -> Callable[[], Any]:
-    """
-    Normalize input into a re-iterable factory.
-    - If `scores` is callable: assumed to be a factory returning a fresh iterator.
-    - Else: wrap by lambda: iter(scores). (Only safe for single-pass usage.)
-    """
+    """Normalize input into a re-iterable factory."""
     if callable(scores):
         return scores
     return lambda: iter(scores)
 
 
 def _logsumexp_1d(a: np.ndarray) -> float:
-    """Stable logsumexp for 1D array."""
+    """Numerically stable log(sum_i exp(a_i)) for 1D array."""
     if a.size == 0:
         return -np.inf
     m = float(np.max(a))
@@ -45,21 +48,28 @@ class Selector(Protocol):
 
     def select(self, scores: Any, dets: Any) -> np.ndarray:
         """
+        Select determinants from target set T_k for next variational set V_{k+1}.
+
         Args:
-            scores:
-              - np.ndarray [N] when stream=False
-              - iterable/factory yielding (scores_blk [B], dets_blk [B,2]) when stream=True
-            dets:
-              - np.ndarray [N,2] when stream=False
-              - ignored (can be None) when stream=True
+            scores: Importance scores (log amplitudes). When stream=False, ndarray [N].
+                   When stream=True, iterable/factory yielding (scores_chunk, dets_chunk).
+            dets: Determinant bitstrings [N,2] when stream=False; ignored when stream=True.
+
+        Returns:
+            Selected determinants as ndarray [K,2].
         """
         ...
 
 
 class TopKSelector:
-    """Select k determinants with highest scores."""
+    """Select K determinants with highest importance scores."""
 
     def __init__(self, k: int, stream: bool = False) -> None:
+        """
+        Args:
+            k: Number of determinants to select.
+            stream: Enable streaming mode for large datasets.
+        """
         self.k = int(k)
         self.stream = bool(stream)
 
@@ -73,18 +83,20 @@ class TopKSelector:
             k = min(self.k, n)
             if k <= 0:
                 return dets[:0]
+          
+            # Partial sort: O(n + k log k) instead of O(n log n)
             idx = np.argpartition(scores, -k)[-k:]
             idx = idx[np.argsort(scores[idx])[::-1]]
             return dets[idx]
 
-        # Streaming path: keep a min-heap of size k for top-k largest scores.
+        # Streaming: maintain a min-heap of top-k entries
         k = max(0, int(self.k))
         if k == 0:
             return np.zeros((0, 2), dtype=np.uint64)
 
         blocks = _blocks_factory(scores)
         heap: list[tuple[float, int, np.ndarray]] = []
-        counter = itertools.count()  # tie-breaker to avoid comparing np.ndarray
+        counter = itertools.count()  # Tie-breaker for stable sorting
 
         for s_blk, d_blk in blocks():
             if d_blk is None or len(d_blk) == 0:
@@ -105,13 +117,17 @@ class TopKSelector:
         if not heap:
             return np.zeros((0, 2), dtype=np.uint64)
 
-        # Sort by score descending (ignore counter for ranking).
         heap.sort(key=lambda x: x[0], reverse=True)
         return np.stack([d for _, _, d in heap], axis=0)
 
 
 class TopFractionSelector:
-    """Select top fraction of determinants by cumulative probability mass."""
+    """
+    Select determinants capturing a target fraction of total probability mass.
+
+    Uses normalized probabilities p_i = |psi_i|^2 / Z with Z = sum_j |psi_j|^2.
+    Selects minimal K such that sum_{i=1..K} p_i >= fraction.
+    """
 
     def __init__(
         self,
@@ -120,6 +136,13 @@ class TopFractionSelector:
         max_k: int | None = None,
         stream: bool = False,
     ) -> None:
+        """
+        Args:
+            fraction: Target cumulative probability (0 < fraction <= 1).
+            min_k: Minimum number of determinants to select.
+            max_k: Maximum allowed selections (required for stream=True).
+            stream: Enable streaming mode.
+        """
         self.fraction = float(fraction)
         self.min_k = int(min_k)
         self.max_k = int(max_k) if max_k is not None else None
@@ -132,6 +155,7 @@ class TopFractionSelector:
                 return dets
             log_amp = np.asarray(scores, dtype=np.float64)
 
+            # Compute normalized probabilities: p_i = |psi_i|^2 / sum_j |psi_j|^2
             log_prob = 2.0 * log_amp
             log_prob_max = np.max(log_prob)
             prob_unnorm = np.exp(log_prob - log_prob_max)
@@ -150,7 +174,6 @@ class TopFractionSelector:
                 return dets[:0]
             return dets[idx[:k]]
 
-        # Streaming TopFraction needs bounded candidate pool.
         if self.max_k is None:
             raise ValueError("TopFractionSelector(stream=True) requires max_k to bound memory.")
 
@@ -160,7 +183,7 @@ class TopFractionSelector:
 
         blocks = _blocks_factory(scores)
 
-        # Pass 1: global logZ = log sum_i exp(2*log|psi_i|)
+        # Pass 1: compute global log Z = log(sum_i exp(2*log|psi_i|))
         logZ = -np.inf
         for s_blk, _ in blocks():
             s_blk = np.asarray(s_blk, dtype=np.float64)
@@ -168,7 +191,7 @@ class TopFractionSelector:
 
         target_log_mass = math.log(frac)
 
-        # Adaptive candidate pool size M (starts small, doubles until enough mass or hits max_k).
+        # Adaptive candidate pool: start small, double until sufficient mass or max_k
         M = min(int(self.max_k), max(int(self.min_k), 4096))
 
         while True:
@@ -195,13 +218,13 @@ class TopFractionSelector:
             logp_cand = np.array([lp for lp, _, _ in heap], dtype=np.float64)
             dets_cand = np.stack([d for _, _, d in heap], axis=0)
 
-            # Check if candidate pool captures enough global probability mass.
+            # Check if candidate pool captures enough probability mass
             log_mass_cand = _logsumexp_1d(logp_cand)
             if log_mass_cand < target_log_mass and M < int(self.max_k):
                 M = min(int(self.max_k), M * 2)
                 continue
 
-            # Sort by logp desc and take minimal k reaching fraction.
+            # Find minimal k reaching target fraction
             order = np.argsort(logp_cand)[::-1]
             log_cum = -np.inf
             k_need = 0
@@ -222,6 +245,12 @@ class ThresholdSelector:
     """Select determinants with normalized probability above threshold."""
 
     def __init__(self, threshold: float, max_size: int | None = None, stream: bool = False) -> None:
+        """
+        Args:
+            threshold: Minimum normalized probability p_i = |psi_i|^2 / Z.
+            max_size: Maximum selections (keeps top-max_size if exceeded).
+            stream: Enable streaming mode.
+        """
         self.threshold = float(threshold)
         self.max_size = int(max_size) if max_size is not None else None
         self.stream = bool(stream)
@@ -233,6 +262,7 @@ class ThresholdSelector:
                 return dets
             log_amp = np.asarray(scores, dtype=np.float64)
 
+            # Compute normalized probabilities
             log_prob = 2.0 * log_amp
             log_prob_max = np.max(log_prob)
             prob_unnorm = np.exp(log_prob - log_prob_max)
@@ -246,6 +276,7 @@ class ThresholdSelector:
             if self.max_size is None or passed_idx.size <= self.max_size:
                 return dets[passed_idx]
 
+            # Truncate to max_size keeping highest probabilities
             local_prob = prob[passed_idx]
             k = self.max_size
             idx_local = np.argpartition(local_prob, -k)[-k:]
@@ -258,7 +289,7 @@ class ThresholdSelector:
 
         blocks = _blocks_factory(scores)
 
-        # Pass 1: global logZ
+        # Pass 1: compute global log Z
         logZ = -np.inf
         for s_blk, _ in blocks():
             s_blk = np.asarray(s_blk, dtype=np.float64)
@@ -268,7 +299,7 @@ class ThresholdSelector:
 
         kcap = self.max_size
         if kcap is not None and kcap > 0:
-            # Keep best kcap by logp using heap with tie-breaker.
+            # Maintain top-kcap by log probability
             heap: list[tuple[float, int, np.ndarray]] = []
             counter = itertools.count()
 
@@ -294,7 +325,7 @@ class ThresholdSelector:
             heap.sort(key=lambda x: x[0], reverse=True)
             return np.stack([d for _, _, d in heap], axis=0)
 
-        # No cap: may be huge if threshold too small (user responsibility).
+        # No cap: collect all passing determinants
         out: list[np.ndarray] = []
         for s_blk, d_blk in blocks():
             s_blk = np.asarray(s_blk, dtype=np.float64)

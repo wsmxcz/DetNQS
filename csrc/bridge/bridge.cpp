@@ -3,20 +3,31 @@
 
 /**
  * @file bridge.cpp
- * @brief Python-C++ nanobind bridge for detnqs quantum chemistry core.
+ * @brief Python-C++ nanobind bridge for deterministic quantum chemistry core.
  *
  * Provides Python bindings for:
- *  - Determinant space generation (FCI, excitations, screened complement)
- *  - Hamiltonian matrix construction (H_SS, H_SC, H_eff)
+ *  - Determinant space generation (FCI, excitations, perturbative complement)
+ *  - Hamiltonian matrix construction (H_VV, H_VP, H_eff)
  *  - Heat-Bath screening and amplitude-weighted connection pruning
- *  - Variational energy evaluation with optional screening
- *  - Batch determinant feature preparation for neural network input
+ *  - Variational energy evaluation and EN-PT2 correction
+ *  - Batch feature preparation for neural network forward passes
  *
- * Key concepts:
- *  - S-space: Primary selected CI space
- *  - C-space: Complement/correction space
- *  - H_eff: Effective Hamiltonian via downfolding: H_SS - H_SC·(H_CC - E_0)^{-1}·H_SC^T
- *  - Screening modes: None (combinatorial) / Static (Heat-Bath) / Dynamic (amplitude-based)
+ * Key notation:
+ *  - V: Variational set (primary selected space)
+ *  - C: Connected set (all determinants coupled to V via Hamiltonian)
+ *  - P: Perturbative set (external complement, P = C \ V)
+ *  - T: Target set for deterministic evaluation (T = V union P)
+ *
+ * Hamiltonian blocks:
+ *  - H_VV: Variational block (rows/cols in V)
+ *  - H_VP: Coupling block (rows in V, cols in P)
+ *  - H_eff: Effective Hamiltonian via downfolding
+ *           H_eff = H_VV - H_VP · (H_PP - E_ref)^{-1} · H_VP^T
+ *
+ * Screening modes:
+ *  - None: Combinatorial generation (no integral screening)
+ *  - Static: Heat-Bath threshold filtering
+ *  - Dynamic: Amplitude-weighted pruning using |psi_v|
  *
  * Author: Zheng (Alex) Che, wsmxcz@gmail.com
  * Date: December, 2025
@@ -117,13 +128,10 @@ struct IntCtx {
 };
 
 // ============================================================================
-// Python ↔ C++ conversion utilities
+// Python-C++ conversion utilities
 // ============================================================================
 
 [[nodiscard]] inline std::vector<Det> to_det_vector(DetArrayRO arr) {
-    if (arr.ndim() != 2 || arr.shape(1) != 2) {
-        throw std::invalid_argument("det array must have shape (N, 2)");
-    }
     const size_t N = arr.shape(0);
     std::vector<Det> out;
     out.reserve(N);
@@ -135,9 +143,6 @@ struct IntCtx {
 }
 
 [[nodiscard]] inline std::vector<double> to_double_vector(F64VecRO arr) {
-    if (arr.ndim() != 1) {
-        throw std::invalid_argument("expected 1D double array");
-    }
     return {arr.data(), arr.data() + arr.shape(0)};
 }
 
@@ -243,7 +248,7 @@ NB_MODULE(_detnqs_cpp, m) {
         .def("hb_clear", &IntCtx::hb_clear);
 
     // ------------------------------------------------------------------------
-    // Determinant generation
+    // Determinant space generation
     // ------------------------------------------------------------------------
     m.def("gen_fci_dets",
           [](int n_orb, int n_alpha, int n_beta) -> DetArrayOut {
@@ -254,7 +259,7 @@ NB_MODULE(_detnqs_cpp, m) {
           "n_orb"_a, "n_alpha"_a, "n_beta"_a,
           "Generate full CI determinant space.");
 
-    m.def("gen_excited_dets",
+    m.def("gen_connected_dets",
           [](DetArrayRO ref_dets, int n_orb) -> DetArrayOut {
               auto dets = detnqs::det_space::generate_connected(
                   to_det_vector(ref_dets), n_orb
@@ -264,41 +269,37 @@ NB_MODULE(_detnqs_cpp, m) {
               );
           },
           "ref_dets"_a, "n_orb"_a,
-          "Generate single/double excitations from reference determinants.");
+          "Generate connected set C via single/double excitations from reference V.");
 
     // ------------------------------------------------------------------------
-    // Screened complement C-space generation
-    // Modes: none (combinatorial), static (Heat-Bath), dynamic (amplitude)
+    // Perturbative complement P-space generation with screening
+    // P = C \ V (external determinants coupled to variational space)
     // ------------------------------------------------------------------------
-    m.def("gen_complement_dets",
+    m.def("gen_perturbative_dets",
         [](DetArrayRO ref_dets,
            int n_orb,
            nb::object int_ctx_obj,
-           nb::object psi_S_obj,
+           nb::object psi_V_obj,
            const std::string& mode_str,
            double eps1) -> DetArrayOut {
 
-            auto S = to_det_vector(ref_dets);
-            const DetMap map_S = DetMap::from_ordered(
-                {S.begin(), S.end()}, true
+            auto V = to_det_vector(ref_dets);
+            const DetMap map_V = DetMap::from_ordered(
+                {V.begin(), V.end()}, true
             );
             const auto mode = parse_screen_mode(mode_str);
 
             if (mode == detnqs::ScreenMode::None) {
                 auto comp = detnqs::det_space::generate_complement(
-                    std::span<const Det>(S.data(), S.size()),
+                    std::span<const Det>(V.data(), V.size()),
                     n_orb,
-                    map_S,
+                    map_V,
                     true
                 );
                 return from_det_vector(comp);
             }
 
-            if (int_ctx_obj.is_none()) {
-                throw std::invalid_argument("int_ctx required for screened modes");
-            }
             const IntCtx* ctx = nb::cast<const IntCtx*>(int_ctx_obj);
-
             if (!ctx->hb) {
                 throw std::invalid_argument("Heat-Bath table not initialized");
             }
@@ -307,21 +308,18 @@ NB_MODULE(_detnqs_cpp, m) {
             std::span<const double> psi_span;
 
             if (mode == detnqs::ScreenMode::Dynamic) {
-                if (psi_S_obj.is_none()) {
-                    throw std::invalid_argument("psi_S required for dynamic mode");
-                }
-                auto psi_arr = nb::cast<F64VecRO>(psi_S_obj);
+                auto psi_arr = nb::cast<F64VecRO>(psi_V_obj);
                 psi_vec = to_double_vector(psi_arr);
-                if (psi_vec.size() != S.size()) {
-                    throw std::invalid_argument("psi_S size mismatch");
+                if (psi_vec.size() != V.size()) {
+                    throw std::invalid_argument("psi_v size mismatch");
                 }
                 psi_span = std::span<const double>(psi_vec.data(), psi_vec.size());
             }
 
             auto comp = detnqs::generate_complement_screened(
-                std::span<const Det>(S.data(), S.size()),
+                std::span<const Det>(V.data(), V.size()),
                 n_orb,
-                map_S,
+                map_V,
                 ctx->ham,
                 ctx->hb.get(),
                 mode,
@@ -334,16 +332,17 @@ NB_MODULE(_detnqs_cpp, m) {
         "ref_dets"_a,
         "n_orb"_a,
         "int_ctx"_a = nb::none(),
-        "psi_S"_a = nb::none(),
+        "psi_v"_a = nb::none(),
         "mode"_a = "none",
         "eps1"_a = 1e-6,
-        "Generate complement C-space with optional screening.\n"
-        "  mode='none': combinatorial (no integrals)\n"
-        "  mode='static': Heat-Bath threshold eps1\n"
-        "  mode='dynamic': amplitude-weighted screening using |psi_S_i|");
+        "Generate perturbative complement P = C \\ V with optional screening.\n"
+        "  mode='none': combinatorial generation (no integral screening)\n"
+        "  mode='static': Heat-Bath threshold eps1 filtering\n"
+        "  mode='dynamic': amplitude-weighted pruning using |psi_V_i|");
 
     // ------------------------------------------------------------------------
-    // Batch determinant feature preparation for neural network input
+    // Batch feature preparation for neural network input
+    // Computes occupation indices, excitation rank k, phase, holes/parts
     // ------------------------------------------------------------------------
     m.def("prepare_det_batch",
         [](DetArrayRO dets,
@@ -356,13 +355,6 @@ NB_MODULE(_detnqs_cpp, m) {
            bool need_phase,
            bool need_hp,
            bool need_hp_pos) -> nb::dict {
-
-            if (ref.ndim() != 1 || ref.shape(0) != 2) {
-                throw std::invalid_argument("ref must have shape (2,)");
-            }
-            if (dets.ndim() != 2 || dets.shape(1) != 2) {
-                throw std::invalid_argument("dets must have shape (B, 2)");
-            }
 
             const std::size_t B = dets.shape(0);
             const int n_e = n_alpha + n_beta;
@@ -450,7 +442,7 @@ NB_MODULE(_detnqs_cpp, m) {
         "need_phase"_a = false,
         "need_hp"_a = false,
         "need_hp_pos"_a = false,
-        "Prepare batch features (occ, k, phase, holes/parts) for neural network input.");
+        "Prepare batch features (occ, k, phase, holes/parts) for neural network forward pass.");
 
     // ------------------------------------------------------------------------
     // Hamiltonian matrix construction
@@ -462,17 +454,17 @@ NB_MODULE(_detnqs_cpp, m) {
               );
           },
           "dets"_a, "int_ctx"_a,
-          "Compute diagonal elements <D|H|D>.");
+          "Compute diagonal elements <x|H|x>.");
 
-    m.def("get_ham_ss",
+    m.def("get_ham_vv",
           [](DetArrayRO dets, const IntCtx* ctx, int n_orb) -> nb::dict {
-              auto coo = detnqs::get_ham_ss(
+              auto coo = detnqs::get_ham_vv(
                   to_det_vector(dets), ctx->ham, n_orb
               );
               return from_coo_matrix(coo);
           },
-          "dets_S"_a, "int_ctx"_a, "n_orb"_a,
-          "Build H_SS block in COO format.");
+          "dets_V"_a, "int_ctx"_a, "n_orb"_a,
+          "Build H_VV block in COO format (variational space only).");
 
     m.def("get_ham_block",
           [](DetArrayRO bra_dets,
@@ -480,28 +472,28 @@ NB_MODULE(_detnqs_cpp, m) {
              const IntCtx* ctx,
              int n_orb) -> nb::dict {
 
-              auto dets_S = to_det_vector(bra_dets);
+              auto dets_V = to_det_vector(bra_dets);
 
-              std::optional<std::vector<Det>> dets_C;
+              std::optional<std::vector<Det>> dets_P;
               if (ket_dets.has_value()) {
-                  dets_C = to_det_vector(*ket_dets);
+                  dets_P = to_det_vector(*ket_dets);
               }
 
-              std::optional<std::span<const Det>> c_span;
-              if (dets_C.has_value()) {
-                  c_span = std::span<const Det>(dets_C->data(), dets_C->size());
+              std::optional<std::span<const Det>> p_span;
+              if (dets_P.has_value()) {
+                  p_span = std::span<const Det>(dets_P->data(), dets_P->size());
               }
 
               auto blocks = detnqs::get_ham_block(
-                  dets_S, c_span, ctx->ham, n_orb
+                  dets_V, p_span, ctx->ham, n_orb
               );
 
               nb::dict out;
-              out["H_SS"] = from_coo_matrix(blocks.H_SS);
-              out["H_SC"] = from_coo_matrix(blocks.H_SC);
-              if (blocks.map_C.size() > 0) {
-                  out["det_C"]  = from_det_vector(blocks.map_C.all_dets());
-                  out["size_C"] = nb::int_(blocks.map_C.size());
+              out["H_VV"] = from_coo_matrix(blocks.H_VV);
+              out["H_VP"] = from_coo_matrix(blocks.H_VP);
+              if (blocks.map_P.size() > 0) {
+                  out["det_P"]  = from_det_vector(blocks.map_P.all_dets());
+                  out["size_P"] = nb::int_(blocks.map_P.size());
               }
               return out;
           },
@@ -509,13 +501,13 @@ NB_MODULE(_detnqs_cpp, m) {
           "ket_dets"_a = nb::none(),
           "int_ctx"_a,
           "n_orb"_a,
-          "Build H_SS and H_SC with explicit or auto-generated C-space.");
+          "Build H_VV and H_VP with explicit or auto-generated perturbative space P.");
 
     // ------------------------------------------------------------------------
-    // Hamiltonian construction with screening
+    // Hamiltonian construction with static Heat-Bath screening
     // ------------------------------------------------------------------------
     m.def("get_ham_conn",
-          [](DetArrayRO S,
+          [](DetArrayRO V,
              const IntCtx* ctx,
              int n_orb,
              bool use_heatbath,
@@ -526,7 +518,7 @@ NB_MODULE(_detnqs_cpp, m) {
               }
 
               auto blocks = detnqs::get_ham_conn(
-                  to_det_vector(S),
+                  to_det_vector(V),
                   ctx->ham,
                   n_orb,
                   ctx->hb.get(),
@@ -535,22 +527,26 @@ NB_MODULE(_detnqs_cpp, m) {
               );
 
               nb::dict out;
-              out["H_SS"]   = from_coo_matrix(blocks.H_SS);
-              out["H_SC"]   = from_coo_matrix(blocks.H_SC);
-              out["det_C"]  = from_det_vector(blocks.map_C.all_dets());
-              out["size_C"] = nb::int_(blocks.map_C.size());
+              out["H_VV"]   = from_coo_matrix(blocks.H_VV);
+              out["H_VP"]   = from_coo_matrix(blocks.H_VP);
+              out["det_P"]  = from_det_vector(blocks.map_P.all_dets());
+              out["size_P"] = nb::int_(blocks.map_P.size());
               return out;
           },
-          "dets_S"_a,
+          "dets_V"_a,
           "int_ctx"_a,
           "n_orb"_a,
           "use_heatbath"_a = false,
           "eps1"_a = 1e-6,
-          "Build H_SS/H_SC with static Heat-Bath screening.");
+          "Build H_VV/H_VP with static Heat-Bath screening (threshold eps1).");
 
+    // ------------------------------------------------------------------------
+    // Hamiltonian construction with dynamic amplitude-weighted screening
+    // Prunes connections where |psi_V_i| * |H_ij| < eps1
+    // ------------------------------------------------------------------------
     m.def("get_ham_conn_amp",
-          [](DetArrayRO S,
-             F64VecRO psi_S,
+          [](DetArrayRO V,
+             F64VecRO psi_v,
              const IntCtx* ctx,
              int n_orb,
              double eps1) -> nb::dict {
@@ -559,16 +555,16 @@ NB_MODULE(_detnqs_cpp, m) {
                   throw std::invalid_argument("Heat-Bath table not initialized");
               }
 
-              auto dets_S_vec = to_det_vector(S);
-              auto psi_S_vec  = to_double_vector(psi_S);
+              auto dets_V_vec = to_det_vector(V);
+              auto psi_V_vec  = to_double_vector(psi_v);
 
-              if (dets_S_vec.size() != psi_S_vec.size()) {
-                  throw std::invalid_argument("size mismatch: dets_S and psi_S");
+              if (dets_V_vec.size() != psi_V_vec.size()) {
+                  throw std::invalid_argument("size mismatch: dets_V and psi_v");
               }
 
               auto blocks = detnqs::get_ham_conn_amp(
-                  dets_S_vec,
-                  psi_S_vec,
+                  dets_V_vec,
+                  psi_V_vec,
                   ctx->ham,
                   n_orb,
                   ctx->hb.get(),
@@ -576,34 +572,35 @@ NB_MODULE(_detnqs_cpp, m) {
               );
 
               nb::dict out;
-              out["H_SS"]   = from_coo_matrix(blocks.H_SS);
-              out["H_SC"]   = from_coo_matrix(blocks.H_SC);
-              out["det_C"]  = from_det_vector(blocks.map_C.all_dets());
-              out["size_C"] = nb::int_(blocks.map_C.size());
+              out["H_VV"]   = from_coo_matrix(blocks.H_VV);
+              out["H_VP"]   = from_coo_matrix(blocks.H_VP);
+              out["det_P"]  = from_det_vector(blocks.map_P.all_dets());
+              out["size_P"] = nb::int_(blocks.map_P.size());
               return out;
           },
-          "dets_S"_a,
-          "psi_S"_a,
+          "dets_V"_a,
+          "psi_v"_a,
           "int_ctx"_a,
           "n_orb"_a,
           "eps1"_a = 1e-6,
-          "Build H_SS/H_SC with dynamic amplitude-weighted screening.");
+          "Build H_VV/H_VP with dynamic amplitude-weighted screening (|psi_V_i| * |H_ij| > eps1).");
 
     // ------------------------------------------------------------------------
     // Effective Hamiltonian via downfolding
-    // H_eff = H_SS - H_SC · (H_CC - E_ref)^{-1} · H_SC^T
+    // H_eff = H_VV - H_VP · (H_PP - E_ref)^{-1} · H_VP^T
+    // Regularization handles near-singular (H_PP - E_ref) inversions
     // ------------------------------------------------------------------------
     m.def("get_ham_eff",
-          [](const nb::dict& H_SS_dict,
-             const nb::dict& H_SC_dict,
-             F64VecRO h_cc_diag,
+          [](const nb::dict& H_VV_dict,
+             const nb::dict& H_VP_dict,
+             F64VecRO h_pp_diag,
              double e_ref,
              const std::string& reg_type_str,
              double epsilon,
              bool upper_only) -> nb::dict {
 
-              const COOMatrix H_SS = to_coo_matrix(H_SS_dict);
-              const COOMatrix H_SC = to_coo_matrix(H_SC_dict);
+              const COOMatrix H_VV = to_coo_matrix(H_VV_dict);
+              const COOMatrix H_VP = to_coo_matrix(H_VP_dict);
 
               detnqs::HeffConfig cfg{
                   .reg_type   = parse_reg_type(reg_type_str),
@@ -612,25 +609,28 @@ NB_MODULE(_detnqs_cpp, m) {
               };
 
               auto h_eff = detnqs::get_ham_eff(
-                  H_SS,
-                  H_SC,
-                  to_double_vector(h_cc_diag),
+                  H_VV,
+                  H_VP,
+                  to_double_vector(h_pp_diag),
                   e_ref,
                   cfg
               );
               return from_coo_matrix(h_eff);
           },
-          "H_SS"_a,
-          "H_SC"_a,
-          "h_cc_diag"_a,
+          "H_VV"_a,
+          "H_VP"_a,
+          "h_pp_diag"_a,
           "e_ref"_a,
           "reg_type"_a = "sigma",
           "epsilon"_a = 1e-12,
           "upper_only"_a = true,
-          "Compute effective Hamiltonian via downfolding: H_eff = H_SS - H_SC·(H_CC - E_0)^{-1}·H_SC^T.");
+          "Compute effective Hamiltonian via downfolding:\n"
+          "  H_eff = H_VV - H_VP · (H_PP - E_ref)^{-1} · H_VP^T\n"
+          "Regularization options: 'linear_shift' or 'sigma'.");
 
     // ------------------------------------------------------------------------
-    // Local connections for batch processing
+    // Local connections for batch SpMV operations
+    // Returns CSR-like structure: offsets, connected dets, matrix elements
     // ------------------------------------------------------------------------
     m.def("get_local_connections",
           [](DetArrayRO dets,
@@ -669,15 +669,17 @@ NB_MODULE(_detnqs_cpp, m) {
           "n_orb"_a,
           "use_heatbath"_a = false,
           "eps1"_a = 1e-6,
-          "Compute local Hamiltonian connections for batch processing.");
+          "Compute local Hamiltonian connections for batch SpMV.\n"
+          "Returns CSR-like structure with offsets, connected determinants, and matrix elements.");
 
     // ------------------------------------------------------------------------
     // Variational energy evaluation
     // E = <Psi|H|Psi> / <Psi|Psi>
+    // Assumes normalized coefficients (Python side handles normalization)
     // ------------------------------------------------------------------------
     m.def("compute_variational_energy",
         [](DetArrayRO dets,
-            F64VecRO coeffs,              // real-only, normalized in Python
+            F64VecRO coeffs,
             const IntCtx* ctx,
             int n_orb,
             bool use_heatbath,
@@ -685,18 +687,14 @@ NB_MODULE(_detnqs_cpp, m) {
 
             auto basis_vec = to_det_vector(dets);
 
-            if (coeffs.ndim() != 1) {
-                throw std::invalid_argument("coeffs must be 1D");
-            }
             if (static_cast<size_t>(coeffs.shape(0)) != basis_vec.size()) {
-                throw std::invalid_argument("coeff size mismatch");
+                throw std::invalid_argument("coefficient size mismatch");
             }
 
             std::span<const double> c_span(
                 coeffs.data(), static_cast<size_t>(coeffs.shape(0))
             );
 
-            // Returns ONLY <Psi|H|Psi> (energy for normalized coeffs)
             return detnqs::compute_variational_energy(
                 std::span<const Det>(basis_vec),
                 c_span,
@@ -713,26 +711,25 @@ NB_MODULE(_detnqs_cpp, m) {
         "n_orb"_a,
         "use_heatbath"_a = false,
         "eps1"_a = 1e-6,
-        "Compute <Psi|H|Psi> (coeffs must be normalized in Python).");
+        "Compute variational energy <Psi|H|Psi> (coefficients must be normalized).");
 
     // ------------------------------------------------------------------------
-    // EN-PT2 correction
+    // EN-PT2 correction: Delta E_PT2
+    // Computes second-order perturbative energy correction from external space P
+    // E_total = E_ref + Delta E_PT2
     // ------------------------------------------------------------------------
     m.def("compute_pt2",
         [](DetArrayRO dets,
-            F64VecRO coeffs,              // real-only, normalized in Python
+            F64VecRO coeffs,
             const IntCtx* ctx,
             int n_orb,
-            double e_ref,                 // <-- NEW: optimized reference energy (electronic)
+            double e_ref,
             bool use_heatbath,
             double eps1) -> double {
 
-            if (coeffs.ndim() != 1) {
-                throw std::invalid_argument("coeffs must be 1D");
-            }
-            const auto S_vec = to_det_vector(dets);
-            if (static_cast<std::size_t>(coeffs.shape(0)) != S_vec.size()) {
-                throw std::invalid_argument("coeff size mismatch");
+            const auto V_vec = to_det_vector(dets);
+            if (static_cast<std::size_t>(coeffs.shape(0)) != V_vec.size()) {
+                throw std::invalid_argument("coefficient size mismatch");
             }
 
             if (use_heatbath && !ctx->hb) {
@@ -743,9 +740,8 @@ NB_MODULE(_detnqs_cpp, m) {
                 coeffs.data(), static_cast<std::size_t>(coeffs.shape(0))
             );
 
-            // Returns ONLY e_pt2; e_ref is provided by optimizer (Python side).
             auto res = detnqs::compute_pt2(
-                std::span<const Det>(S_vec.data(), S_vec.size()),
+                std::span<const Det>(V_vec.data(), V_vec.size()),
                 c_span,
                 ctx->ham,
                 n_orb,
@@ -757,12 +753,15 @@ NB_MODULE(_detnqs_cpp, m) {
 
             return res.e_pt2;
         },
-        "dets_S"_a,
-        "coeffs_S"_a,
+        "dets_V"_a,
+        "coeffs_V"_a,
         "int_ctx"_a,
         "n_orb"_a,
-        "e_ref"_a,                        // <-- NEW arg
+        "e_ref"_a,
         "use_heatbath"_a = false,
         "eps1"_a = 1e-6,
-        "Compute EN-PT2 correction only (coeffs normalized in Python; e_ref from optimizer).");
+        "Compute EN-PT2 correction Delta E_PT2 from perturbative space P.\n"
+        "  E_total = E_ref + Delta E_PT2\n"
+        "  e_ref: electronic energy from variational optimization (normalized coeffs).");
 }
+

@@ -3,14 +3,20 @@
 
 /**
  * @file build_ham.cpp
- * @brief Hamiltonian matrix assembly for ASCI variational subspace.
+ * @brief Hamiltonian matrix construction for variational subspace iterations.
  *
- * Implements parallel streaming construction of H_SS and H_SC blocks
- * with optional Heat-Bath screening and amplitude-based selection.
+ * Assembles H_VV and H_VP blocks via parallel streaming over |V> determinants.
+ * Supports:
+ *   - Pre-defined V and P spaces (variational mode)
+ *   - Dynamic connection generation with Heat-Bath screening
+ *   - Amplitude-weighted perturbative selection
  *
- * Core algorithm: For each |S⟩ determinant, enumerate connections
- * via singles/doubles, classify into S/C spaces, and accumulate
- * matrix elements as COO triplets.
+ * Algorithm: For each |i> in V, enumerate singles/doubles excitations,
+ * compute matrix elements h_ij = <i|H|j>, and route to appropriate blocks
+ * based on whether |j> belongs to V or external space P.
+ *
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: December, 2025
  */
 
 #include <detnqs/hamiltonian/build_ham.hpp>
@@ -30,12 +36,12 @@ namespace detnqs {
 namespace {
 
 // ============================================================================
-// Internal data structures
+// Internal structures
 // ============================================================================
 
 /**
- * Matrix entry with determinant key (for deferred C-space indexing).
- * Used when column index is unknown until all C determinants collected.
+ * Matrix entry with determinant key for deferred indexing.
+ * Used when column space is determined after collecting all connections.
  */
 struct KeyedEntry {
     u32    row;
@@ -44,47 +50,44 @@ struct KeyedEntry {
 };
 
 /**
- * Classification of generated ket determinant.
+ * Classification of generated determinant |j>.
  * 
- * SS:      In S-space, index known → H_SS
- * SC_IDX:  In C-space, index known → H_SC (pre-indexed)
- * SC_KEY:  In C-space, index TBD   → deferred queue
- * DROP:    Outside S∪C, discard
+ * VV:       In variational space V, index known → H_VV
+ * VP_IDX:   In external space, index pre-known → H_VP (indexed)
+ * VP_KEY:   In external space, index deferred → queue for later mapping
+ * DROP:     Outside target set, discard
  */
 struct Classify {
-    enum Kind : std::uint8_t { SS, SC_IDX, SC_KEY, DROP } kind = DROP;
+    enum Kind : std::uint8_t { VV, VP_IDX, VP_KEY, DROP } kind = DROP;
     u32 idx = 0;
     Det key{};
 };
 
 // ============================================================================
-// Assembly policies (strategy pattern for different screening modes)
+// Assembly policies
 // ============================================================================
 
 /**
- * Policy: Pre-defined S and C spaces (variational mode).
+ * Policy: Pre-defined variational and external spaces.
  *
+ * Use case: Variational mode where both V_k and external set are fixed.
  * - Full double enumeration (no Heat-Bath)
- * - All singles accepted
- * - Classify: S → SS, C → SC_IDX, else DROP
+ * - All singles accepted above threshold
+ * - Routing: V → VV, external → VP_IDX, else DROP
  */
 struct PolicyKnownSets {
-    const DetMap& map_S;
-    const DetMap& map_C;
+    const DetMap& map_V;
+    const DetMap& map_ext;
 
     template<class Visitor>
     void enumerate_doubles(
         const Det& bra,
         int n_orb,
-        const HeatBathTable* hb_ptr,
+        const HeatBathTable*,
         u32,
         Visitor&& visit
     ) const {
-        (void)hb_ptr; // unused
-        det_ops::for_each_double(
-            bra, n_orb,
-            std::forward<Visitor>(visit)
-        );
+        det_ops::for_each_double(bra, n_orb, std::forward<Visitor>(visit));
     }
 
     inline bool accept_single(u32, double, double) const {
@@ -92,25 +95,28 @@ struct PolicyKnownSets {
     }
 
     inline Classify classify(const Det& ket) const {
-        if (auto jS = map_S.get_idx(ket)) {
-            return {Classify::SS, *jS, {}};
+        if (auto j = map_V.get_idx(ket)) {
+            return {Classify::VV, *j, {}};
         }
-        if (auto jC = map_C.get_idx(ket)) {
-            return {Classify::SC_IDX, *jC, {}};
+        if (auto j = map_ext.get_idx(ket)) {
+            return {Classify::VP_IDX, *j, {}};
         }
         return {Classify::DROP, 0, {}};
     }
 };
 
 /**
- * Policy: Static Heat-Bath screening (connection generation mode).
+ * Policy: Static Heat-Bath screening for connection generation.
  *
- * - Heat-Bath doubles with fixed cutoff ε₁
- * - All singles accepted (above numerical threshold)
- * - Classify: S → SS, else → SC_KEY (deferred indexing)
+ * Use case: Build connected set C_k from V_k with fixed threshold eps1.
+ * - Heat-Bath doubles with cutoff tau = eps1
+ * - All singles accepted (no amplitude weighting)
+ * - Routing: V → VV, new connections → VP_KEY (deferred indexing)
+ *
+ * Returns P_k = {|j> in C_k | |j> not in V_k} via deferred mapping.
  */
 struct PolicyStaticHB {
-    const DetMap&        map_S;
+    const DetMap&        map_V;
     const HeatBathTable* hb;
     double               eps1;
     bool                 use_hb;
@@ -124,18 +130,9 @@ struct PolicyStaticHB {
         Visitor&& visit
     ) const {
         if (use_hb && hb_ptr) {
-            for_each_double_hb(
-                bra,
-                n_orb,
-                *hb_ptr,
-                eps1,
-                std::forward<Visitor>(visit)
-            );
+            for_each_double_hb(bra, n_orb, *hb_ptr, eps1, std::forward<Visitor>(visit));
         } else {
-            det_ops::for_each_double(
-                bra, n_orb,
-                std::forward<Visitor>(visit)
-            );
+            det_ops::for_each_double(bra, n_orb, std::forward<Visitor>(visit));
         }
     }
 
@@ -144,24 +141,27 @@ struct PolicyStaticHB {
     }
 
     inline Classify classify(const Det& ket) const {
-        if (auto jS = map_S.get_idx(ket)) {
-            return {Classify::SS, *jS, {}};
+        if (auto j = map_V.get_idx(ket)) {
+            return {Classify::VV, *j, {}};
         }
-        return {Classify::SC_KEY, 0, ket};
+        return {Classify::VP_KEY, 0, ket};
     }
 };
 
 /**
- * Policy: Amplitude-weighted dynamic Heat-Bath (perturbative selection).
+ * Policy: Amplitude-weighted dynamic Heat-Bath screening.
  *
- * - Heat-Bath cutoff τᵢ = ε₁/max(|ψᵢ|, δ) adapts per row
- * - Singles filtered: |hᵢⱼ·ψᵢ| ≥ ε₁
- * - Classify: S → SS, else → SC_KEY
+ * Use case: Perturbative selection with adaptive thresholds.
+ * - Doubles: Heat-Bath cutoff tau_i = eps1 / max(|psi_i|, delta)
+ * - Singles: Accept if |h_ij * psi_i| >= eps1
+ * - Routing: V → VV, new → VP_KEY
+ *
+ * Implements energy-driven selection: |<j|H|i> psi_i| ~ eps1.
  */
 struct PolicyDynamicAmp {
-    const DetMap&            map_S;
+    const DetMap&            map_V;
     const HeatBathTable*     hb;
-    std::span<const double>  psi_S;
+    std::span<const double>  psi_V;
     double                   eps1;
     double                   delta = 1e-12;
 
@@ -174,75 +174,63 @@ struct PolicyDynamicAmp {
         Visitor&& visit
     ) const {
         if (!hb_ptr) {
-            det_ops::for_each_double(
-                bra, n_orb,
-                std::forward<Visitor>(visit)
-            );
+            det_ops::for_each_double(bra, n_orb, std::forward<Visitor>(visit));
             return;
         }
 
-        const double amp = std::max(std::abs(psi_S[row_i]), delta);
+        const double amp = std::max(std::abs(psi_V[row_i]), delta);
         const double tau = eps1 / amp;
-
-        for_each_double_hb(
-            bra,
-            n_orb,
-            *hb_ptr,
-            tau,
-            std::forward<Visitor>(visit)
-        );
+        for_each_double_hb(bra, n_orb, *hb_ptr, tau, std::forward<Visitor>(visit));
     }
 
     inline bool accept_single(u32 row_i, double h, double) const {
-        const double w = std::abs(h * psi_S[row_i]);
-        return (w >= eps1);
+        return (std::abs(h * psi_V[row_i]) >= eps1);
     }
 
     inline Classify classify(const Det& ket) const {
-        if (auto jS = map_S.get_idx(ket)) {
-            return {Classify::SS, *jS, {}};
+        if (auto j = map_V.get_idx(ket)) {
+            return {Classify::VV, *j, {}};
         }
-        return {Classify::SC_KEY, 0, ket};
+        return {Classify::VP_KEY, 0, ket};
     }
 };
 
 // ============================================================================
-// Parallel streaming kernel
+// Core streaming kernel
 // ============================================================================
 
 /**
- * Core assembly kernel with pluggable screening policy.
+ * Parallel Hamiltonian assembly with pluggable screening policy.
  *
  * Algorithm:
- *   1. Parallel loop over S determinants (dynamic scheduling)
- *   2. For each |i⟩ ∈ S:
- *      a. Add diagonal hᵢᵢ → H_SS
- *      b. Enumerate singles/doubles via policy
- *      c. Compute matrix elements hᵢⱼ
- *      d. Classify and route to thread-local buffers
- *   3. Merge thread-local COO matrices
+ *   For each |i> in V (parallel, dynamic scheduling):
+ *     1. Compute diagonal h_ii → H_VV
+ *     2. Enumerate singles: h_ij via deterministic iteration
+ *     3. Enumerate doubles: h_ij via policy (Heat-Bath or full)
+ *     4. Classify |j>: route to thread-local VV/VP buffers
+ *   Merge thread-local COO matrices
  */
 template<class Policy>
 void stream_build(
-    std::span<const Det> S,
+    std::span<const Det> V,
     const HamEval& ham,
     int n_orb,
     const HeatBathTable* hb,
     const Policy& policy,
-    std::vector<COOMatrix>& tl_ss,
-    std::vector<COOMatrix>& tl_sc_idx,
-    std::vector<std::vector<KeyedEntry>>& tl_sc_key
+    std::vector<COOMatrix>& tl_vv,
+    std::vector<COOMatrix>& tl_vp_idx,
+    std::vector<std::vector<KeyedEntry>>& tl_vp_key
 ) {
-    const size_t n = S.size();
+    const size_t n = V.size();
 
     int n_threads = 1;
 #ifdef _OPENMP
     n_threads = omp_get_max_threads();
 #endif
 
-    tl_ss.resize(n_threads);
-    tl_sc_idx.resize(n_threads);
-    tl_sc_key.resize(n_threads);
+    tl_vv.resize(n_threads);
+    tl_vp_idx.resize(n_threads);
+    tl_vp_key.resize(n_threads);
 
 #pragma omp parallel for schedule(dynamic)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
@@ -252,24 +240,24 @@ void stream_build(
 #endif
 
         const u32 row = static_cast<u32>(i);
-        const Det& bra = S[i];
+        const Det& bra = V[i];
 
-        auto& ss   = tl_ss[tid];
-        auto& sc_i = tl_sc_idx[tid];
-        auto& sc_k = tl_sc_key[tid];
+        auto& vv   = tl_vv[tid];
+        auto& vp_i = tl_vp_idx[tid];
+        auto& vp_k = tl_vp_key[tid];
 
-        if (ss.nnz() == 0) {
+        if (vv.nnz() == 0) {
             const size_t cap = est_conn_cap(n_orb);
-            ss.reserve(cap);
-            sc_i.reserve(cap / 2);
-            sc_k.reserve(cap / 2);
+            vv.reserve(cap);
+            vp_i.reserve(cap / 2);
+            vp_k.reserve(cap / 2);
         }
 
-        // Diagonal element always in H_SS
+        // Diagonal: h_ii always in H_VV
         {
             const double h = ham.compute_diagonal(bra);
             if (std::abs(h) > MAT_ELEMENT_THRESH) {
-                ss.push_back(row, row, h);
+                vv.push_back(row, row, h);
             }
         }
 
@@ -283,26 +271,23 @@ void stream_build(
             if (!policy.accept_single(row, h, 0.0)) return;
 
             switch (c.kind) {
-                case Classify::SS:
-                    ss.push_back(row, c.idx, h);
+                case Classify::VV:
+                    vv.push_back(row, c.idx, h);
                     break;
-                case Classify::SC_IDX:
-                    sc_i.push_back(row, c.idx, h);
+                case Classify::VP_IDX:
+                    vp_i.push_back(row, c.idx, h);
                     break;
-                case Classify::SC_KEY:
-                    sc_k.push_back({row, ket, h});
+                case Classify::VP_KEY:
+                    vp_k.push_back({row, ket, h});
                     break;
                 default:
                     break;
             }
         });
 
-        // Double excitations (policy-driven enumeration)
+        // Double excitations (policy-controlled enumeration)
         policy.enumerate_doubles(
-            bra,
-            n_orb,
-            hb,
-            row,
+            bra, n_orb, hb, row,
             [&](const Det& ket) {
                 const Classify c = policy.classify(ket);
                 if (c.kind == Classify::DROP) return;
@@ -311,14 +296,14 @@ void stream_build(
                 if (std::abs(h) <= MAT_ELEMENT_THRESH) return;
 
                 switch (c.kind) {
-                    case Classify::SS:
-                        ss.push_back(row, c.idx, h);
+                    case Classify::VV:
+                        vv.push_back(row, c.idx, h);
                         break;
-                    case Classify::SC_IDX:
-                        sc_i.push_back(row, c.idx, h);
+                    case Classify::VP_IDX:
+                        vp_i.push_back(row, c.idx, h);
                         break;
-                    case Classify::SC_KEY:
-                        sc_k.push_back({row, ket, h});
+                    case Classify::VP_KEY:
+                        vp_k.push_back({row, ket, h});
                         break;
                     default:
                         break;
@@ -330,7 +315,7 @@ void stream_build(
 
 /**
  * Merge thread-local COO buffers into unified matrix.
- * Concatenates all entries and performs sort-merge deduplication.
+ * Concatenates and performs sort-merge deduplication.
  */
 inline void merge_thread_local(
     std::vector<COOMatrix>& tl,
@@ -338,7 +323,6 @@ inline void merge_thread_local(
 ) {
     size_t total = 0;
     for (auto& m : tl) total += m.nnz();
-
     out.reserve(total);
 
     for (auto& m : tl) {
@@ -351,25 +335,25 @@ inline void merge_thread_local(
 }
 
 /**
- * Finalize H_SC with deferred C-space indexing.
+ * Finalize H_VP with deferred perturbative space indexing.
  *
  * Algorithm:
- *   1. Collect all unique C determinants from keyed entries
- *   2. Sort lexicographically and build DetMap
+ *   1. Collect all unique determinants from keyed entries
+ *   2. Sort lexicographically and build DetMap for P space
  *   3. Remap keyed entries to column indices
  *   4. Sort and merge final COO matrix
  */
-inline void finalize_sc_deferred(
-    std::vector<std::vector<KeyedEntry>>& tl_sc_key,
-    COOMatrix& coo_SC,
-    DetMap& map_C
+inline void finalize_vp_deferred(
+    std::vector<std::vector<KeyedEntry>>& tl_vp_key,
+    COOMatrix& coo_VP,
+    DetMap& map_P
 ) {
     std::vector<Det> keys;
     size_t total = 0;
-    for (auto& v : tl_sc_key) total += v.size();
+    for (auto& v : tl_vp_key) total += v.size();
     keys.reserve(total);
 
-    for (auto& v : tl_sc_key) {
+    for (auto& v : tl_vp_key) {
         for (auto& x : v) {
             keys.push_back(x.key);
         }
@@ -380,20 +364,19 @@ inline void finalize_sc_deferred(
         keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
     }
 
-    map_C = DetMap::from_list(std::move(keys));
+    map_P = DetMap::from_list(std::move(keys));
 
-    coo_SC.reserve(total);
-
-    for (auto& v : tl_sc_key) {
+    coo_VP.reserve(total);
+    for (auto& v : tl_vp_key) {
         for (auto& x : v) {
-            auto j = map_C.get_idx(x.key);
+            auto j = map_P.get_idx(x.key);
             if (j) {
-                coo_SC.push_back(x.row, *j, x.val);
+                coo_VP.push_back(x.row, *j, x.val);
             }
         }
     }
 
-    sort_and_merge_coo(coo_SC);
+    sort_and_merge_coo(coo_VP);
 }
 
 } // anonymous namespace
@@ -416,96 +399,68 @@ std::vector<double> get_ham_diag(
     return diag;
 }
 
-COOMatrix get_ham_ss(
-    std::span<const Det> dets_S,
+COOMatrix get_ham_vv(
+    std::span<const Det> dets_V,
     const HamEval& ham,
     int n_orb
 ) {
     COOMatrix out;
-    if (dets_S.empty()) return out;
+    if (dets_V.empty()) return out;
 
-    const auto map_S = DetMap::from_ordered(
-        {dets_S.begin(), dets_S.end()},
-        true
-    );
+    const auto map_V = DetMap::from_ordered({dets_V.begin(), dets_V.end()}, true);
+    PolicyKnownSets policy{map_V, DetMap{}};
 
-    PolicyKnownSets policy{map_S, DetMap{}};
+    std::vector<COOMatrix> tl_vv, tl_vp_idx;
+    std::vector<std::vector<KeyedEntry>> tl_vp_key;
 
-    std::vector<COOMatrix> tl_ss, tl_sc_idx;
-    std::vector<std::vector<KeyedEntry>> tl_sc_key;
+    stream_build(dets_V, ham, n_orb, nullptr, policy, tl_vv, tl_vp_idx, tl_vp_key);
 
-    stream_build(
-        dets_S,
-        ham,
-        n_orb,
-        nullptr,
-        policy,
-        tl_ss,
-        tl_sc_idx,
-        tl_sc_key
-    );
-
-    merge_thread_local(tl_ss, out);
-    out.n_rows = out.n_cols = static_cast<u32>(dets_S.size());
+    merge_thread_local(tl_vv, out);
+    out.n_rows = out.n_cols = static_cast<u32>(dets_V.size());
 
     return out;
 }
 
 HamBlocks get_ham_block(
-    std::span<const Det> dets_S,
-    std::optional<std::span<const Det>> dets_C,
+    std::span<const Det> dets_V,
+    std::optional<std::span<const Det>> dets_ext,
     const HamEval& ham,
     int n_orb
 ) {
     HamBlocks out;
-    if (dets_S.empty()) return out;
+    if (dets_V.empty()) return out;
 
-    const auto map_S = DetMap::from_ordered(
-        {dets_S.begin(), dets_S.end()},
-        true
-    );
+    const auto map_V = DetMap::from_ordered({dets_V.begin(), dets_V.end()}, true);
 
-    DetMap map_C_known;
-    const bool has_C = dets_C.has_value() && !dets_C->empty();
+    DetMap map_ext;
+    const bool has_ext = dets_ext.has_value() && !dets_ext->empty();
 
-    if (has_C) {
-        map_C_known = DetMap::from_ordered(
-            {dets_C->begin(), dets_C->end()},
-            true
-        );
+    if (has_ext) {
+        map_ext = DetMap::from_ordered({dets_ext->begin(), dets_ext->end()}, true);
     }
 
-    PolicyKnownSets policy{map_S, map_C_known};
+    PolicyKnownSets policy{map_V, map_ext};
 
-    std::vector<COOMatrix> tl_ss, tl_sc_idx;
-    std::vector<std::vector<KeyedEntry>> tl_sc_key;
+    std::vector<COOMatrix> tl_vv, tl_vp_idx;
+    std::vector<std::vector<KeyedEntry>> tl_vp_key;
 
-    stream_build(
-        dets_S,
-        ham,
-        n_orb,
-        nullptr,
-        policy,
-        tl_ss,
-        tl_sc_idx,
-        tl_sc_key
-    );
+    stream_build(dets_V, ham, n_orb, nullptr, policy, tl_vv, tl_vp_idx, tl_vp_key);
 
-    merge_thread_local(tl_ss, out.H_SS);
-    out.H_SS.n_rows = out.H_SS.n_cols = static_cast<u32>(dets_S.size());
+    merge_thread_local(tl_vv, out.H_VV);
+    out.H_VV.n_rows = out.H_VV.n_cols = static_cast<u32>(dets_V.size());
 
-    if (has_C) {
-        merge_thread_local(tl_sc_idx, out.H_SC);
-        out.H_SC.n_rows = static_cast<u32>(dets_S.size());
-        out.H_SC.n_cols = static_cast<u32>(dets_C->size());
-        out.map_C = std::move(map_C_known);
+    if (has_ext) {
+        merge_thread_local(tl_vp_idx, out.H_VP);
+        out.H_VP.n_rows = static_cast<u32>(dets_V.size());
+        out.H_VP.n_cols = static_cast<u32>(dets_ext->size());
+        out.map_P = std::move(map_ext);
     }
 
     return out;
 }
 
 HamBlocks get_ham_conn(
-    std::span<const Det> dets_S,
+    std::span<const Det> dets_V,
     const HamEval& ham,
     int n_orb,
     const HeatBathTable* hb_table,
@@ -519,42 +474,29 @@ HamBlocks get_ham_conn(
     }
 
     HamBlocks out;
-    if (dets_S.empty()) return out;
+    if (dets_V.empty()) return out;
 
-    const auto map_S = DetMap::from_ordered(
-        {dets_S.begin(), dets_S.end()},
-        true
-    );
+    const auto map_V = DetMap::from_ordered({dets_V.begin(), dets_V.end()}, true);
+    PolicyStaticHB policy{map_V, hb_table, eps1, use_heatbath};
 
-    PolicyStaticHB policy{map_S, hb_table, eps1, use_heatbath};
+    std::vector<COOMatrix> tl_vv, tl_vp_idx;
+    std::vector<std::vector<KeyedEntry>> tl_vp_key;
 
-    std::vector<COOMatrix> tl_ss, tl_sc_idx;
-    std::vector<std::vector<KeyedEntry>> tl_sc_key;
+    stream_build(dets_V, ham, n_orb, hb_table, policy, tl_vv, tl_vp_idx, tl_vp_key);
 
-    stream_build(
-        dets_S,
-        ham,
-        n_orb,
-        hb_table,
-        policy,
-        tl_ss,
-        tl_sc_idx,
-        tl_sc_key
-    );
+    merge_thread_local(tl_vv, out.H_VV);
+    out.H_VV.n_rows = out.H_VV.n_cols = static_cast<u32>(dets_V.size());
 
-    merge_thread_local(tl_ss, out.H_SS);
-    out.H_SS.n_rows = out.H_SS.n_cols = static_cast<u32>(dets_S.size());
-
-    finalize_sc_deferred(tl_sc_key, out.H_SC, out.map_C);
-    out.H_SC.n_rows = static_cast<u32>(dets_S.size());
-    out.H_SC.n_cols = static_cast<u32>(out.map_C.size());
+    finalize_vp_deferred(tl_vp_key, out.H_VP, out.map_P);
+    out.H_VP.n_rows = static_cast<u32>(dets_V.size());
+    out.H_VP.n_cols = static_cast<u32>(out.map_P.size());
 
     return out;
 }
 
 HamBlocks get_ham_conn_amp(
-    std::span<const Det> dets_S,
-    std::span<const double> psi_S,
+    std::span<const Det> dets_V,
+    std::span<const double> psi_V,
     const HamEval& ham,
     int n_orb,
     const HeatBathTable* hb_table,
@@ -565,42 +507,29 @@ HamBlocks get_ham_conn_amp(
             "get_ham_conn_amp: Heat-Bath table is required"
         );
     }
-    if (psi_S.size() != dets_S.size()) {
+    if (psi_V.size() != dets_V.size()) {
         throw std::invalid_argument(
-            "get_ham_conn_amp: psi_S size must match |S|"
+            "get_ham_conn_amp: psi_V size must match |V|"
         );
     }
 
     HamBlocks out;
-    if (dets_S.empty()) return out;
+    if (dets_V.empty()) return out;
 
-    const auto map_S = DetMap::from_ordered(
-        {dets_S.begin(), dets_S.end()},
-        true
-    );
+    const auto map_V = DetMap::from_ordered({dets_V.begin(), dets_V.end()}, true);
+    PolicyDynamicAmp policy{map_V, hb_table, psi_V, eps1};
 
-    PolicyDynamicAmp policy{map_S, hb_table, psi_S, eps1};
+    std::vector<COOMatrix> tl_vv, tl_vp_idx;
+    std::vector<std::vector<KeyedEntry>> tl_vp_key;
 
-    std::vector<COOMatrix> tl_ss, tl_sc_idx;
-    std::vector<std::vector<KeyedEntry>> tl_sc_key;
+    stream_build(dets_V, ham, n_orb, hb_table, policy, tl_vv, tl_vp_idx, tl_vp_key);
 
-    stream_build(
-        dets_S,
-        ham,
-        n_orb,
-        hb_table,
-        policy,
-        tl_ss,
-        tl_sc_idx,
-        tl_sc_key
-    );
+    merge_thread_local(tl_vv, out.H_VV);
+    out.H_VV.n_rows = out.H_VV.n_cols = static_cast<u32>(dets_V.size());
 
-    merge_thread_local(tl_ss, out.H_SS);
-    out.H_SS.n_rows = out.H_SS.n_cols = static_cast<u32>(dets_S.size());
-
-    finalize_sc_deferred(tl_sc_key, out.H_SC, out.map_C);
-    out.H_SC.n_rows = static_cast<u32>(dets_S.size());
-    out.H_SC.n_cols = static_cast<u32>(out.map_C.size());
+    finalize_vp_deferred(tl_vp_key, out.H_VP, out.map_P);
+    out.H_VP.n_rows = static_cast<u32>(dets_V.size());
+    out.H_VP.n_cols = static_cast<u32>(out.map_P.size());
 
     return out;
 }

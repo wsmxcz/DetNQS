@@ -5,13 +5,13 @@
 Determinant subspace management for variational calculations.
 
 Manages two determinant spaces:
-  - S: Selected space (variational optimization)
-  - C: Connected space (perturbative corrections)
+  - V (Variational space)
+  - P (Perturbative space)
 
 Evolution workflow:
-  1. Score all determinants in T = S ∪ C
-  2. Select top-scored configurations as new S
-  3. Rebuild C via Hamiltonian connections
+  1. Score all determinants in T = V ∪ P
+  2. Select top-scored configurations as new V
+  3. Rebuild P via Hamiltonian connections
 
 File: detnqs/space/detspace.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -32,98 +32,98 @@ from .selector import Selector
 @dataclass(eq=False)
 class DetSpace:
     """
-    Determinant subspace container for S ∪ C.
-    
+    Determinant subspace container for target space T_k = V_k ∪ P_k.
+  
     Attributes:
-        S_dets: Selected determinants [n_S, 2], uint64 bitstrings
-        C_dets: Connected determinants [n_C, 2], None if not built
-    
+        V_dets: Variational determinants [n_V, 2], uint64 bitstrings
+        P_dets: Perturbative determinants [n_P, 2], None if not built
+  
     Invariants:
-        - S_dets.shape = (n_S, 2)
-        - C_dets.shape = (n_C, 2) or None
-        - T = S ∪ C (disjoint union)
+        - V_dets.shape = (n_V, 2), n_V >= 1
+        - P_dets.shape = (n_P, 2) or None
+        - V and P are disjoint
     """
 
-    S_dets: np.ndarray
-    C_dets: Optional[np.ndarray] = field(default=None, repr=False)
+    V_dets: np.ndarray
+    P_dets: Optional[np.ndarray] = field(default=None, repr=False)
 
     # -------------------------------------------------------------------------
     # Space dimensions
     # -------------------------------------------------------------------------
 
     @property
-    def size_S(self) -> int:
-        """Dimension of S-space: |S|."""
-        return int(self.S_dets.shape[0])
+    def size_V(self) -> int:
+        """Dimension of variational space |V_k|."""
+        return int(self.V_dets.shape[0])
 
     @property
-    def size_C(self) -> int:
-        """Dimension of C-space: |C| (zero if unbuilt)."""
-        if self.C_dets is None:
+    def size_P(self) -> int:
+        """Dimension of perturbative space |P_k| (zero if unbuilt)."""
+        if self.P_dets is None:
             return 0
-        return int(self.C_dets.shape[0])
+        return int(self.P_dets.shape[0])
 
     @property
     def size_T(self) -> int:
-        """Total dimension: |T| = |S| + |C|."""
-        return self.size_S + self.size_C
+        """Total dimension |T_k| = |V_k| + |P_k|."""
+        return self.size_V + self.size_P
 
     @property
-    def has_C(self) -> bool:
-        """Check if C-space exists."""
-        return self.C_dets is not None and self.size_C > 0
+    def has_P(self) -> bool:
+        """Check if perturbative space exists."""
+        return self.P_dets is not None and self.size_P > 0
 
     # -------------------------------------------------------------------------
     # Index ranges
     # -------------------------------------------------------------------------
 
     @property
-    def S_indices(self) -> np.ndarray:
-        """S-space index range: [0, n_S)."""
-        return np.arange(self.size_S, dtype=np.int32)
+    def V_indices(self) -> np.ndarray:
+        """Index range [0, n_V) for V-space within T."""
+        return np.arange(self.size_V, dtype=np.int32)
 
     @property
-    def C_indices(self) -> np.ndarray:
-        """C-space index range in T: [n_S, n_S + n_C)."""
-        return np.arange(self.size_S, self.size_T, dtype=np.int32)
+    def P_indices(self) -> np.ndarray:
+        """Index range [n_V, n_V + n_P) for P-space within T."""
+        return np.arange(self.size_V, self.size_T, dtype=np.int32)
 
     @property
     def T_dets(self) -> np.ndarray:
         """
-        Full T-space determinants: [S_dets; C_dets].
-        
+        Full target space T_k = V_k ∪ P_k.
+      
         Returns:
-            Concatenated array [n_T, 2] if C exists, else S_dets
+            Concatenated array [n_T, 2] if P exists, else V_dets
         """
-        if self.C_dets is None or self.C_dets.size == 0:
-            return self.S_dets
-        return np.concatenate([self.S_dets, self.C_dets], axis=0)
+        if self.P_dets is None or self.P_dets.size == 0:
+            return self.V_dets
+        return np.concatenate([self.V_dets, self.P_dets], axis=0)
 
     def iter_T(self, block_size: int) -> Iterable[np.ndarray]:
         """
-        Yield T = S ∪ C as CPU blocks without materializing full T.
-        
-        Blocks are contiguous views/slices of the underlying arrays.
-        Useful for streaming H2D when T is too large to fit in VRAM.
-        
+        Yield T_k as CPU blocks without materializing full array.
+      
+        Useful for streaming H2D transfers when T is too large for VRAM.
+        Blocks are contiguous views/slices of underlying arrays.
+      
         Args:
-            block_size: Size of each determinant block
-            
+            block_size: Maximum size of each determinant block
+          
         Yields:
-            CPU determinant blocks [<=block_size, 2]
+            Determinant blocks [<=block_size, 2] in uint64 format
         """
         bs = int(block_size)
         if bs <= 0:
             raise ValueError("block_size must be positive")
 
-        # S blocks
-        for i in range(0, self.size_S, bs):
-            yield self.S_dets[i : i + bs]
+        # Yield V blocks
+        for i in range(0, self.size_V, bs):
+            yield self.V_dets[i : i + bs]
 
-        # C blocks (if present)
-        if self.C_dets is not None and self.size_C > 0:
-            for i in range(0, self.size_C, bs):
-                yield self.C_dets[i : i + bs]
+        # Yield P blocks if present
+        if self.P_dets is not None and self.size_P > 0:
+            for i in range(0, self.size_P, bs):
+                yield self.P_dets[i : i + bs]
 
     # -------------------------------------------------------------------------
     # Initialization
@@ -132,34 +132,30 @@ class DetSpace:
     @classmethod
     def initialize(cls, dets: np.ndarray) -> "DetSpace":
         """
-        Create initial space from determinant(s).
-        
+        Create initial space from seed determinant(s).
+      
         Args:
             dets: Single determinant [2] or batch [n, 2]
-        
+      
         Returns:
-            DetSpace with S_dets = dets, C_dets = None
-        
+            DetSpace with V_dets = dets, P_dets = None
+      
         Raises:
-            ValueError: Invalid shape
+            ValueError: If shape is invalid
         """
         arr = np.asarray(dets, dtype=np.uint64)
 
         if arr.ndim == 1:
             if arr.shape[0] != 2:
-                raise ValueError(
-                    f"Single determinant requires shape (2,), got {arr.shape}"
-                )
+                raise ValueError(f"Expected shape (2,), got {arr.shape}")
             arr = arr[None, :]
         elif arr.ndim == 2:
             if arr.shape[1] != 2:
-                raise ValueError(
-                    f"Batch determinants require shape (n, 2), got {arr.shape}"
-                )
+                raise ValueError(f"Expected shape (n, 2), got {arr.shape}")
         else:
             raise ValueError(f"Expected 1D or 2D array, got {arr.ndim}D")
 
-        return cls(S_dets=arr, C_dets=None)
+        return cls(V_dets=arr, P_dets=None)
 
     # -------------------------------------------------------------------------
     # Space evolution
@@ -167,30 +163,30 @@ class DetSpace:
 
     def evolve(self, selector: Selector, scores_T: Any) -> "DetSpace":
         """
-        Update S-space via scoring and selection on T = S ∪ C.
-        
+        Update variational space via scoring and selection on T_k.
+      
         Algorithm:
-          1. Concatenate T_dets = [S_dets; C_dets]
-          2. Select S_new ⊂ T via selector(scores_T, T_dets)
-          3. Return DetSpace(S_new, C_dets=None)
-        
+          1. Compute scores w(x) for all x in T_k = V_k ∪ P_k
+          2. Select V_{k+1} ⊂ T_k via selector strategy
+          3. Return DetSpace(V_{k+1}, P=None) for next outer iteration
+      
         Args:
             selector: Selection strategy (TopK/TopFraction/Threshold)
-            scores_T: Importance scores on T-space [n_T] or streaming factory
-        
+            scores_T: Importance scores on T_k [n_T] or streaming factory
+      
         Returns:
-            New DetSpace with updated S, unbuilt C
-        
+            New DetSpace with updated V, unbuilt P (rebuild via H in next cycle)
+      
         Notes:
-            - C_dets reset to None (rebuild via Hamiltonian in next cycle)
-            - Selector determines new |S| based on scores
+            - P_dets reset to None; must rebuild via Hamiltonian connections
             - scores_T can be ndarray (legacy) or callable factory (streaming)
+            - Selector determines new |V_{k+1}| based on score distribution
         """
         if isinstance(scores_T, np.ndarray):
             # Legacy path: materialize T on CPU
             T_dets = self.T_dets
-            new_S = selector.select(scores_T, T_dets) if T_dets.shape[0] > 0 else T_dets
+            new_V = selector.select(scores_T, T_dets) if T_dets.shape[0] > 0 else T_dets
         else:
             # Streaming path: selector consumes (scores_block, dets_block) from factory
-            new_S = selector.select(scores_T, None)
-        return DetSpace(S_dets=new_S, C_dets=None)
+            new_V = selector.select(scores_T, None)
+        return DetSpace(V_dets=new_V, P_dets=None)

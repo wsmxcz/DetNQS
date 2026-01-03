@@ -5,7 +5,7 @@
 Determinant-space utilities for detnqs.
 
 This module defines:
-  - DetSpace: manages S/C determinant sets and their evolution.
+  - DetSpace: manages V/P determinant sets and their evolution.
   - Basic selection strategies on scored determinants.
 """
 

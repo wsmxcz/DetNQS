@@ -6,7 +6,7 @@ GPU-accelerated sparse matrix operations using JAX BCOO format.
 
 Provides:
   - COO to BCOO conversion with duplicate merging
-  - S-space SpMV: y_S = H_SS @ ψ_S
+  - Variational-space SpMV: y_V = H_VV @ ψ_V
   - Block SpMV for proxy mode
 
 File: detnqs/engine/kernel_gpu.py
@@ -21,8 +21,8 @@ from typing import Callable
 import jax.numpy as jnp
 from jax.experimental import sparse as jsp
 
-from .hamiltonian import ProxyHamiltonian, SSHamiltonian
-from .kernel import ProxyContraction, SSContraction
+from .hamiltonian import ProxyHamiltonian, VVHamiltonian
+from .kernel import ProxyContraction, VVContraction
 
 
 def _coo_to_bcoo(
@@ -32,7 +32,7 @@ def _coo_to_bcoo(
     shape: tuple[int, int],
 ) -> jsp.BCOO:
     """
-    Convert COO format to BCOO with duplicate summation.
+    Convert COO triplet to BCOO with duplicate summation.
 
     Args:
         rows, cols, vals: COO triplet arrays
@@ -59,31 +59,31 @@ def _coo_to_bcoo(
     return mat.sum_duplicates()
 
 
-def build_ss_operator_gpu(
-    ham: SSHamiltonian,
+def build_vv_operator_gpu(
+    ham: VVHamiltonian,
     *,
     jax_dtype: jnp.dtype,
-) -> Callable[[jnp.ndarray], SSContraction]:
+) -> Callable[[jnp.ndarray], VVContraction]:
     """
-    Build S-space operator y_S = H_SS @ ψ_S for GPU.
+    Build variational-space operator y_V = H_VV @ ψ_V for GPU.
 
     Args:
-        ham: Effective Hamiltonian with COO blocks
+        ham: Variational Hamiltonian with COO blocks
         jax_dtype: Target dtype (complex64/complex128)
 
     Returns:
-        Function mapping ψ_S to SSContraction(S=y_S)
+        Function mapping ψ_V to VVContraction(V=y_V)
     """
-    H_ss = _coo_to_bcoo(
-        rows=jnp.asarray(ham.ham_ss.rows),
-        cols=jnp.asarray(ham.ham_ss.cols),
-        vals=jnp.asarray(ham.ham_ss.vals),
-        shape=ham.ham_ss.shape,
+    H_vv = _coo_to_bcoo(
+        rows=jnp.asarray(ham.ham_vv.rows),
+        cols=jnp.asarray(ham.ham_vv.cols),
+        vals=jnp.asarray(ham.ham_vv.vals),
+        shape=ham.ham_vv.shape,
     )
 
-    def operator(psi_s: jnp.ndarray) -> SSContraction:
-        y_s = H_ss @ psi_s
-        return SSContraction(S=y_s.astype(jax_dtype))
+    def operator(psi_v: jnp.ndarray) -> VVContraction:
+        y_v = H_vv @ psi_v
+        return VVContraction(V=y_v.astype(jax_dtype))
 
     return operator
 
@@ -96,52 +96,52 @@ def build_proxy_operator_gpu(
     """
     Build block operator for proxy mode on GPU:
 
-        y_S = H_SS @ ψ_S + H_SC @ ψ_C
-        y_C = H_CS @ ψ_S + H_CC_d @ ψ_C
+        y_V = H_VV @ ψ_V + H_VP @ ψ_P
+        y_P = H_PV @ ψ_V + H_PP_diag @ ψ_P
 
-    where H_CC is diagonal and H_CS = H_SC^T.
+    where H_PP is diagonal and H_PV = H_VP^T.
 
     Args:
         ham: Proxy Hamiltonian with block structure
         jax_dtype: Target dtype (complex64/complex128)
 
     Returns:
-        Function mapping (ψ_S, ψ_C) to ProxyContraction(S=y_S, C=y_C)
+        Function mapping (ψ_V, ψ_P) to ProxyContraction(V=y_V, P=y_P)
     """
-    H_ss = _coo_to_bcoo(
-        rows=jnp.asarray(ham.ham_ss.rows),
-        cols=jnp.asarray(ham.ham_ss.cols),
-        vals=jnp.asarray(ham.ham_ss.vals),
-        shape=ham.ham_ss.shape,
+    H_vv = _coo_to_bcoo(
+        rows=jnp.asarray(ham.ham_vv.rows),
+        cols=jnp.asarray(ham.ham_vv.cols),
+        vals=jnp.asarray(ham.ham_vv.vals),
+        shape=ham.ham_vv.shape,
     )
 
-    H_sc = _coo_to_bcoo(
-        rows=jnp.asarray(ham.ham_sc.rows),
-        cols=jnp.asarray(ham.ham_sc.cols),
-        vals=jnp.asarray(ham.ham_sc.vals),
-        shape=ham.ham_sc.shape,
+    H_vp = _coo_to_bcoo(
+        rows=jnp.asarray(ham.ham_vp.rows),
+        cols=jnp.asarray(ham.ham_vp.cols),
+        vals=jnp.asarray(ham.ham_vp.vals),
+        shape=ham.ham_vp.shape,
     )
-    H_cs = H_sc.transpose()  # H_CS = H_SC^T
+    H_pv = H_vp.transpose()  # H_PV = H_VP^T
 
-    h_diag_c = jnp.asarray(ham.diagonals.C, dtype=jnp.float64)
-    n_c = h_diag_c.shape[0]
+    h_diag_p = jnp.asarray(ham.diagonals.P, dtype=jnp.float64)
+    n_p = h_diag_p.shape[0]
 
-    def operator(psi_s: jnp.ndarray, psi_c: jnp.ndarray) -> ProxyContraction:
-        y_s = H_ss @ psi_s
-        if n_c > 0:
-            y_s += H_sc @ psi_c
+    def operator(psi_v: jnp.ndarray, psi_p: jnp.ndarray) -> ProxyContraction:
+        y_v = H_vv @ psi_v
+        if n_p > 0:
+            y_v += H_vp @ psi_p
 
-        if n_c > 0:
-            y_c = H_cs @ psi_s + h_diag_c * psi_c
+        if n_p > 0:
+            y_p = H_pv @ psi_v + h_diag_p * psi_p
         else:
-            y_c = jnp.zeros_like(psi_c, dtype=jax_dtype)
+            y_p = jnp.zeros_like(psi_p, dtype=jax_dtype)
 
         return ProxyContraction(
-            S=y_s.astype(jax_dtype),
-            C=y_c.astype(jax_dtype),
+            V=y_v.astype(jax_dtype),
+            P=y_p.astype(jax_dtype),
         )
 
     return operator
 
 
-__all__ = ["build_ss_operator_gpu", "build_proxy_operator_gpu"]
+__all__ = ["build_vv_operator_gpu", "build_proxy_operator_gpu"]

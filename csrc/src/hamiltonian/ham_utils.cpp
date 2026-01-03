@@ -3,7 +3,14 @@
 
 /**
  * @file ham_utils.cpp
- * @brief Implementation of sparse matrix operations and shared helpers.
+ * @brief Sparse matrix utilities and Hamiltonian construction helpers.
+ * 
+ * Provides COO/CSR/CSC format conversions, matrix arithmetic, and
+ * screened perturbative set generation for selected-CI frameworks.
+ * Implements efficient merge algorithms and format transformations.
+ * 
+ * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
+ * Date: December, 2025
  */
 
 #include <detnqs/hamiltonian/ham_utils.hpp>
@@ -22,12 +29,18 @@ namespace detnqs {
 // COO Matrix Operations
 // ============================================================================
 
+/**
+ * @brief Sort COO entries and merge duplicates in-place.
+ * 
+ * Uses indirect sorting followed by a single-pass merge.
+ * Returns maximum absolute value after merging.
+ */
 double sort_and_merge_coo(COOMatrix& coo) {
     if (coo.empty()) return 0.0;
 
     const size_t n = coo.nnz();
 
-    // Indirect sort: create index permutation
+    // Indirect sort by (row, col)
     std::vector<size_t> idx(n);
     std::iota(idx.begin(), idx.end(), size_t{0});
 
@@ -36,7 +49,7 @@ double sort_and_merge_coo(COOMatrix& coo) {
         return coo.cols[a] < coo.cols[b];
     });
 
-    // Merge duplicates: single pass over sorted indices
+    // Single-pass merge: accumulate consecutive duplicates
     COOMatrix merged;
     merged.reserve(n);
     merged.n_rows = coo.n_rows;
@@ -51,7 +64,6 @@ double sort_and_merge_coo(COOMatrix& coo) {
         double val = coo.vals[k];
         ++i;
 
-        // Accumulate duplicates
         while (i < n) {
             const size_t k2 = idx[i];
             if (coo.rows[k2] != row || coo.cols[k2] != col) break;
@@ -70,6 +82,11 @@ double sort_and_merge_coo(COOMatrix& coo) {
     return max_abs;
 }
 
+/**
+ * @brief Add two sorted COO matrices via two-pointer merge.
+ * 
+ * Assumes A and B are sorted. Drops entries below threshold.
+ */
 COOMatrix coo_add(const COOMatrix& A, const COOMatrix& B, double thresh) {
     COOMatrix C;
     C.reserve(A.nnz() + B.nnz());
@@ -80,7 +97,6 @@ COOMatrix coo_add(const COOMatrix& A, const COOMatrix& B, double thresh) {
     const size_t m = A.nnz();
     const size_t n = B.nnz();
 
-    // Two-pointer merge
     while (i < m && j < n) {
         const u32 ra = A.rows[i], ca = A.cols[i];
         const u32 rb = B.rows[j], cb = B.cols[j];
@@ -122,6 +138,9 @@ COOMatrix coo_add(const COOMatrix& A, const COOMatrix& B, double thresh) {
     return C;
 }
 
+/**
+ * @brief Mirror upper-triangular COO to symmetric full matrix.
+ */
 COOMatrix mirror_upper_to_full(const COOMatrix& upper) {
     COOMatrix full;
     full.reserve(2 * upper.nnz());
@@ -142,6 +161,9 @@ COOMatrix mirror_upper_to_full(const COOMatrix& upper) {
     return full;
 }
 
+/**
+ * @brief Infer number of rows from maximum row index.
+ */
 u32 infer_n_rows(const COOMatrix& coo) noexcept {
     if (coo.empty()) return 0;
     return std::ranges::max(coo.rows) + 1;
@@ -151,6 +173,11 @@ u32 infer_n_rows(const COOMatrix& coo) noexcept {
 // Format Conversions
 // ============================================================================
 
+/**
+ * @brief Convert COO to CSC via column-wise bucket sort.
+ * 
+ * Merges duplicates within each column. O(nnz + n_cols).
+ */
 CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
     CSCMatrix csc;
     csc.n_rows = n_rows;
@@ -159,7 +186,6 @@ CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
 
     if (coo.empty()) return csc;
 
-    // Bucket sort by column
     std::vector<std::vector<std::pair<u32, double>>> buckets(n_cols);
     for (size_t k = 0; k < coo.nnz(); ++k) {
         const u32 c = coo.cols[k];
@@ -181,6 +207,7 @@ CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
             return a.first < b.first;
         });
 
+        // Merge duplicates
         u32 last_row = bucket[0].first;
         double acc = bucket[0].second;
 
@@ -210,6 +237,9 @@ CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
     return csc;
 }
 
+/**
+ * @brief Convert COO to CSR via row-wise bucket sort.
+ */
 CSRMatrix coo_to_csr(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
     CSRMatrix csr;
     csr.n_rows = n_rows;
@@ -218,7 +248,6 @@ CSRMatrix coo_to_csr(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
 
     if (coo.empty()) return csr;
 
-    // Bucket sort by row
     std::vector<std::vector<std::pair<u32, double>>> buckets(n_rows);
     for (size_t k = 0; k < coo.nnz(); ++k) {
         const u32 r = coo.rows[k];
@@ -269,6 +298,9 @@ CSRMatrix coo_to_csr(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
     return csr;
 }
 
+/**
+ * @brief Convert CSR to COO format.
+ */
 COOMatrix csr_to_coo(const CSRMatrix& csr) {
     COOMatrix coo;
     coo.n_rows = csr.n_rows;
@@ -287,9 +319,12 @@ COOMatrix csr_to_coo(const CSRMatrix& csr) {
     return coo;
 }
 
+/**
+ * @brief Add two CSR matrices via row-wise two-pointer merge.
+ */
 CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     if (A.n_rows != B.n_rows || A.n_cols != B.n_cols) {
-        throw std::invalid_argument("csr_add: matrix dimensions must match");
+        throw std::invalid_argument("csr_add: dimension mismatch");
     }
 
     CSRMatrix C;
@@ -298,6 +333,7 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     C.row_ptrs.resize(C.n_rows + 1);
     C.row_ptrs[0] = 0;
 
+    // First pass: compute row_ptrs
     size_t total_nnz = 0;
     for (u32 i = 0; i < C.n_rows; ++i) {
         size_t row_nnz = 0;
@@ -339,6 +375,7 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     C.col_indices.resize(total_nnz);
     C.values.resize(total_nnz);
 
+    // Second pass: fill data
     for (u32 i = 0; i < C.n_rows; ++i) {
         size_t write_pos = C.row_ptrs[i];
 
@@ -402,9 +439,15 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
 }
 
 // ============================================================================
-// Determinant / SO helpers
+// Spin-orbital helpers
 // ============================================================================
 
+/**
+ * @brief Extract occupied spin-orbital indices from determinant.
+ * 
+ * Returns list of SO indices: alpha orbitals map to even indices,
+ * beta orbitals to odd indices.
+ */
 std::vector<int> get_occ_so(const Det& d) {
     std::vector<int> occ;
     occ.reserve(popcount(d.alpha) + popcount(d.beta));
@@ -419,6 +462,9 @@ std::vector<int> get_occ_so(const Det& d) {
     return occ;
 }
 
+/**
+ * @brief Check if spin-orbital is occupied in determinant.
+ */
 bool is_occ_so(const Det& d, int so_idx, int n_orb) {
     const int mo = mo_from_so(so_idx);
     if (mo < 0 || mo >= n_orb) return true;
@@ -430,6 +476,9 @@ bool is_occ_so(const Det& d, int so_idx, int n_orb) {
     return (d.beta & bit) != 0;
 }
 
+/**
+ * @brief Apply double excitation (i_so, j_so) -> (a_so, b_so) to ket.
+ */
 Det exc2_so(const Det& ket, int i_so, int j_so, int a_so, int b_so) {
     Det out = ket;
 
@@ -454,59 +503,82 @@ Det exc2_so(const Det& ket, int i_so, int j_so, int a_so, int b_so) {
     return out;
 }
 
+/**
+ * @brief Estimate connected space capacity: 1 + 2*n_orb + 0.1*n_orb^2.
+ */
 size_t est_conn_cap(int n_orb) {
-    // 1 diagonal + O(n_orb) singles + ~10% of n_orb^2 doubles
     if (n_orb <= 0) return 1;
     const size_t n = static_cast<size_t>(n_orb);
     return static_cast<size_t>(1 + 2 * n + (n * n) / 10);
 }
 
 // ============================================================================
-// Screened complement
+// Perturbative set generation
 // ============================================================================
 
+/**
+ * @brief Generate screened perturbative set P_k from variational set V_k.
+ * 
+ * Constructs connected space C_k = {x' in B : exists x in V_k, <x'|H|x> != 0},
+ * then extracts P_k = C_k \ V_k. Screening modes:
+ * 
+ *   - None: no screening, returns full combinatorial complement.
+ *   - Static: drops matrix elements below numerical threshold.
+ *   - Dynamic: also screens by |H_ij * psi_V[i]| < eps1.
+ * 
+ * Heat-Bath table accelerates double excitation enumeration.
+ * 
+ * @param V            Variational set V_k
+ * @param n_orb        Number of spatial orbitals
+ * @param exclude      Determinants to skip (typically V_k union previous T_k)
+ * @param ham          Hamiltonian evaluator
+ * @param hb_table     Heat-Bath integral table (required if mode != None)
+ * @param mode         Screening mode
+ * @param psi_V        Amplitudes on V_k (required for Dynamic mode)
+ * @param eps1         Screening threshold
+ * @return             Canonical-ordered perturbative set P_k
+ */
 std::vector<Det> generate_complement_screened(
-    std::span<const Det> S,
+    std::span<const Det> V,
     int n_orb,
     const DetMap& exclude,
     const HamEval& ham,
     const HeatBathTable* hb_table,
     ScreenMode mode,
-    std::span<const double> psi_S,
+    std::span<const double> psi_V,
     double eps1
 ) {
-    if (S.empty()) return {};
+    if (V.empty()) return {};
 
-    // No screening: defer to pure combinatorial generator.
     if (mode == ScreenMode::None) {
-        return det_space::generate_complement(S, n_orb, exclude, true);
+        return det_space::generate_complement(V, n_orb, exclude, true);
     }
 
     if (!hb_table) {
         throw std::invalid_argument(
-            "generate_complement_screened: Heat-Bath table is required "
+            "generate_complement_screened: Heat-Bath table required "
             "for screened modes"
         );
     }
 
-    if (mode == ScreenMode::Dynamic && psi_S.size() != S.size()) {
+    if (mode == ScreenMode::Dynamic && psi_V.size() != V.size()) {
         throw std::invalid_argument(
-            "generate_complement_screened: psi_S size must match |S| "
+            "generate_complement_screened: psi_V size must match |V| "
             "for dynamic screening"
         );
     }
 
     std::unordered_set<Det> uniq;
-    uniq.reserve(S.size() * 16);
+    uniq.reserve(V.size() * 16);
 
     const double num_thresh = MAT_ELEMENT_THRESH;
     const double delta = 1e-12;
 
-    const size_t n_S = S.size();
-    for (size_t i = 0; i < n_S; ++i) {
-        const Det& bra = S[i];
+    const size_t n_V = V.size();
+    for (size_t i = 0; i < n_V; ++i) {
+        const Det& bra = V[i];
 
-        // --- Singles ---
+        // Singles: H * |bra> generates singly-excited states
         det_ops::for_each_single(bra, n_orb, [&](const Det& ket) {
             if (exclude.contains(ket)) return;
 
@@ -514,18 +586,17 @@ std::vector<Det> generate_complement_screened(
             if (std::abs(h) <= num_thresh) return;
 
             if (mode == ScreenMode::Dynamic) {
-                const double c = psi_S[i];
+                const double c = psi_V[i];
                 const double w = std::abs(h * c);
                 if (w < eps1) return;
             }
-            // Static mode keeps all singles above numerical threshold.
             uniq.insert(ket);
         });
 
-        // --- Doubles (Heat-Bath) ---
+        // Doubles: use Heat-Bath screening
         double cutoff = eps1;
         if (mode == ScreenMode::Dynamic) {
-            const double amp = std::max(std::abs(psi_S[i]), delta);
+            const double amp = std::max(std::abs(psi_V[i]), delta);
             cutoff = eps1 / amp;
         }
 

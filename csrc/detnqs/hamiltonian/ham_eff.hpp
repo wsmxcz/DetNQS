@@ -3,13 +3,14 @@
 
 /**
  * @file ham_eff.hpp
- * @brief Effective Hamiltonian assembly via Gustavson SpGEMM.
+ * @brief Effective Hamiltonian assembly for EFFECTIVE mode.
  *
- * Computes H_eff = H_SS + H_SC·D⁻¹·H_CS where D_jj = E_ref - H_CC[j,j].
- * Uses CSR×CSC row-wise accumulation for efficient sparse multiplication.
+ * Computes H_eff = H_VV + H_VP·D^{-1}·H_PV, where D_jj = E_ref - H_PP[j,j].
+ * The perturbative space P contribution is down-folded into the variational 
+ * space V via Gustavson's CSR×CSC SpGEMM with row-wise accumulation.
  *
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: November, 2025
+ * Date: December, 2025
  */
 
 #pragma once
@@ -21,10 +22,10 @@
 namespace detnqs {
 
 /**
- * Denominator regularization strategies.
+ * Denominator regularization for D_jj = E_ref - H_PP[j,j].
  *
- * LinearShift: 1/(d + ε·sgn(d))  - Sharp cutoff
- * Sigma:       d/(d² + ε²)       - Smooth Tikhonov regularization
+ * LinearShift: 1/(d + ε·sgn(d))  - Sharp cutoff near zero
+ * Sigma:       d/(d² + ε²)       - Smooth Tikhonov-style stabilization
  */
 enum class Regularization : uint8_t {
     LinearShift,
@@ -32,35 +33,35 @@ enum class Regularization : uint8_t {
 };
 
 /**
- * Effective Hamiltonian assembly configuration.
+ * Configuration for effective Hamiltonian assembly.
  */
 struct HeffConfig {
     Regularization reg_type = Regularization::Sigma;
     double epsilon = 1e-12;       // Regularization parameter ε
-    bool upper_only = false;      // Reserved for compatibility (unused)
+    bool upper_only = false;      // Compatibility placeholder (unused)
 };
 
 /**
- * Assemble effective Hamiltonian H_eff = H_SS + H_SC·D⁻¹·H_CS.
+ * Assemble H_eff = H_VV + H_VP·D^{-1}·H_PV for the variational subspace.
  *
  * Algorithm: Two-phase Gustavson SpGEMM
- *   Phase 1 - Symbolic: Pattern discovery via sparse accumulator (SPA)
- *   Phase 2 - Numeric:  Row-wise accumulation with column screening
+ *   Phase 1 (Symbolic): Discover nonzero pattern via sparse accumulator
+ *   Phase 2 (Numeric):  Compute values using CSR×CSC row-wise accumulation
  *
  * Input requirements:
- *   - H_SS:      ⟨S|H|S⟩ block (can be unsorted COO)
- *   - H_SC:      ⟨S|H|C⟩ block (can be unsorted COO)
- *   - h_cc_diag: Diagonal elements H_CC[j,j]
- *   - e_ref:     Reference energy for D_jj = E_ref - H_CC[j,j]
+ *   - H_VV:      Hamiltonian block ⟨V|H|V⟩ (unsorted COO acceptable)
+ *   - H_VP:      Hamiltonian block ⟨V|H|P⟩ (unsorted COO acceptable)
+ *   - h_pp_diag: Diagonal elements H_PP[j,j] of perturbative block
+ *   - e_ref:     Reference energy for denominator construction
  *
- * Threading: OpenMP parallelized over S-space rows with guided scheduling.
+ * Threading: OpenMP parallelized over V-space rows (guided scheduling).
  *
- * @return H_eff in COO format (full matrix, deduped, sorted)
+ * @return H_eff in COO format (full matrix, deduplicated, sorted by row/col)
  */
 [[nodiscard]] COOMatrix get_ham_eff(
-    const COOMatrix& H_SS,
-    const COOMatrix& H_SC,
-    std::span<const double> h_cc_diag,
+    const COOMatrix& H_VV,
+    const COOMatrix& H_VP,
+    std::span<const double> h_pp_diag,
     double e_ref,
     const HeffConfig& config = {}
 );

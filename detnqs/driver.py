@@ -54,7 +54,7 @@ class BaseDriver:
       1. Build Hamiltonian for current V/P spaces
       2. Execute JIT-compiled inner optimization loop
       3. Compute norm decomposition ||ψ_V||² and ||ψ_P||² on T-space
-      4. Trigger callbacks with diagnostic statistics
+      4. Trigger callbacks with diagnostic statistics (total energies)
       5. Update V-space via amplitude-based selection
       6. Check convergence on energy delta
 
@@ -76,13 +76,13 @@ class BaseDriver:
     opt_state: optax.OptState
     selector: Selector
 
-    max_outer: int = 10
+    max_outer: int = 30
     max_inner: int = 500
 
-    inner_tol: float = 1e-8
-    inner_patience: int = 100
+    inner_tol: float = 1e-7
+    inner_patience: int = 30
     outer_tol: float = 1e-6
-    outer_patience: int = 5
+    outer_patience: int = 3
 
     chunk_size: int | None = None
 
@@ -192,7 +192,7 @@ class BaseDriver:
             w_p = w[n_v : n_v + n_p] if n_p > 0 else jnp.array([])
             return float(jnp.sum(w_v)), float(jnp.sum(w_p)) if n_p > 0 else 0.0
 
-        # Streaming path: iterate over CPU det blocks, H2D a fixed block at a time
+        # Streaming path: iterate over CPU det blocks
         block_size = int(self.chunk_size or 8192)
 
         def scores_factory():
@@ -208,7 +208,7 @@ class BaseDriver:
         if not np.isfinite(shift):
             return 0.0, 0.0
 
-        # Pass 2: accumulate norms using |psi|^2 = exp(2*(log|psi|-shift))
+        # Pass 2: accumulate norms
         norm_v = 0.0
         norm_p = 0.0
         seen = 0
@@ -259,7 +259,7 @@ class BaseDriver:
         Check outer convergence via sliding window.
 
         Args:
-            energy_history: Energy sequence from consecutive outer steps
+            energy_history: Total energy sequence from consecutive outer steps
 
         Returns:
             True if max(|ΔE|) < tol over patience consecutive steps
@@ -341,9 +341,10 @@ class BaseDriver:
                     - on_run_start(driver)
                     - on_outer_end(step, stats, driver)
                     - on_run_end(driver)
-      
+    
         Note:
-            Final detspace retains both V and P for post-analysis.
+            All energies in stats are total energies (E_total = E_elec + E_nuc)
+            Final detspace retains both V and P for post-analysis
         """
         callbacks = callbacks or []
         start_time = time.perf_counter()
@@ -353,47 +354,59 @@ class BaseDriver:
                 cb.on_run_start(self)
 
         energy_history = []
+        self._last_outer_step = -1
+        self._last_stats = {}
 
         for outer in range(self.max_outer):
+            self._last_outer_step = outer  # Track current step
+            
             # L1: Rebuild Hamiltonian for current space
             ham, op = self.build_hamiltonian()
             inner_sweep = self._build_sweep(ham, op)
 
-            # L2: JIT-compiled inner loop
-            self.state, self.opt_state, energy_trace = inner_sweep(
+            # L2: JIT-compiled inner loop (returns electronic energies)
+            inner_start = time.perf_counter()
+            self.state, self.opt_state, energy_trace_elec = inner_sweep(
                 self.state, self.opt_state
             )
+            inner_elapsed = time.perf_counter() - inner_start
 
-            self.post_inner_sweep(energy_trace)
+            self.post_inner_sweep(energy_trace_elec)
+
+            # Convert to total energies
+            energy_trace_total = energy_trace_elec + self.system.e_nuc
 
             # Compute diagnostics
             norm_v, norm_p = self._compute_norms()
 
-            if len(energy_trace) > 0:
-                last_e = float(energy_trace[-1])
-                elapsed = time.perf_counter() - start_time
+            if len(energy_trace_total) > 0:
+                last_e = float(energy_trace_total[-1])
+                total_elapsed = time.perf_counter() - start_time
 
                 stats = {
                     "outer_step": outer,
-                    "energy": last_e,
+                    "energy": last_e,  # Total energy
                     "norm_v": norm_v,
                     "norm_p": norm_p,
                     "size_v": self.detspace.size_V,
                     "size_p": self.detspace.size_P,
-                    "timestamp": elapsed,
-                    "inner_steps": len(energy_trace),
-                    "inner_trace": energy_trace.tolist(),
+                    "inner_steps": len(energy_trace_total),
+                    "inner_trace": energy_trace_total.tolist(),
+                    "inner_time": inner_elapsed,
+                    "total_time": total_elapsed,
                 }
+                
+                self._last_stats = stats  # Save for final checkpoint
 
                 for cb in callbacks:
                     cb.on_outer_end(outer, stats, self)
 
                 energy_history.append(last_e)
-              
+            
                 if self._check_convergence(energy_history):
                     break
 
-            # Update V-space for next outer step
+            # Update V-space for next outer step (unless last iteration)
             if outer < self.max_outer - 1:
                 self.evolve_space()
 
@@ -468,7 +481,7 @@ class EffectiveDriver(BaseDriver):
       1. Build proxy H and complement P
       2. Compute H_eff via Löwdin partitioning
       3. Optimize E_eff = <ψ_V|H_eff|ψ_V>
-      4. Update E_ref ← last energy, V ← select from T
+      4. Update E_ref ← last electronic energy, V ← select from T
     
     Memory: GPU holds only V-space batch, streams T for scoring/norms
     """
@@ -477,7 +490,7 @@ class EffectiveDriver(BaseDriver):
     screen_eps: float = 1e-6
     reg_type: str = "sigma"
     epsilon: float = 1e-12
-    e_ref: float = 0.0
+    e_ref: float = 0.0  # Electronic energy reference
 
     def mode_tag(self) -> str:
         return "effective"
@@ -485,10 +498,10 @@ class EffectiveDriver(BaseDriver):
     def device_space(self) -> str:
         return "V"
 
-    def post_inner_sweep(self, energy_trace: np.ndarray) -> None:
-        """Update reference energy E_ref for next Hamiltonian rebuild."""
-        if len(energy_trace) > 0:
-            self.e_ref = float(energy_trace[-1])
+    def post_inner_sweep(self, energy_trace_elec: np.ndarray) -> None:
+        """Update reference electronic energy for next Hamiltonian rebuild."""
+        if len(energy_trace_elec) > 0:
+            self.e_ref = float(energy_trace_elec[-1])
 
     def build_hamiltonian(self) -> tuple[Any, Any]:
         """Build H_eff via Löwdin downfolding."""

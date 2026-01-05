@@ -9,6 +9,8 @@ Provides callback hooks at outer loop boundaries:
   - JsonCallback: Line-delimited JSON streaming
   - JupyterCallback: Dynamic inline visualization
 
+Note: All energy values in stats are total energies (E_total = E_elec + E_nuc)
+
 File: detnqs/analysis/callbacks.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
 Date: December, 2025
@@ -45,23 +47,24 @@ class BaseCallback(ABC):
 
 
 class ConsoleCallback(BaseCallback):
-    """Stdout progress table with energy and wave function norms."""
+    """Stdout progress table with total energy and wave function norms."""
 
     def __init__(self, every: int = 1):
         """
         Args:
-            every: Print interval in outer steps.
+            every: Print interval in outer steps
         """
         self.every = every
         self._header_printed = False
 
     def _print_header(self) -> None:
         """Print formatted table header."""
-        sep = "=" * 95
+        sep = "=" * 105
         print(f"\n{sep}")
         print(
             f"{'Outer':>6} | {'|V|':>8} | {'|P|':>8} | "
-            f"{'Energy':>18} | {'||ψ_V||²':>10} | {'||ψ_P||²':>10} | {'Time':>10}"
+            f"{'E_total':>18} | {'||ψ_V||²':>10} | {'||ψ_P||²':>10} | "
+            f"{'Inner':>6} | {'Time':>10}"
         )
         print(sep)
 
@@ -74,6 +77,9 @@ class ConsoleCallback(BaseCallback):
             self._print_header()
             self._header_printed = True
 
+        # Extract total energy (already includes E_nuc)
+        e_total = stats['energy']
+
         # Extract wave function norms
         norm_v = stats["norm_v"]
         norm_p = stats["norm_p"]
@@ -85,22 +91,22 @@ class ConsoleCallback(BaseCallback):
 
         print(
             f"{step:6d} | {stats['size_v']:8d} | {stats['size_p']:8d} | "
-            f"{stats['energy']:18.10f} | {frac_v:10.6f} | {frac_p:10.6f} | "
-            f"{stats['timestamp']:10.2f}s"
+            f"{e_total:18.10f} | {frac_v:10.6f} | {frac_p:10.6f} | "
+            f"{stats['inner_steps']:6d} | {stats['total_time']:10.2f}s"
         )
 
     def on_run_end(self, driver: BaseDriver) -> None:
         """Print footer separator."""
-        print("=" * 95)
+        print("=" * 105)
 
 
 class JsonCallback(BaseCallback):
-    """Stream stats to line-delimited JSON file for post-analysis."""
+    """Stream stats to line-delimited JSON file (all energies are total)."""
 
     def __init__(self, path: str | Path):
         """
         Args:
-            path: Output file path.
+            path: Output file path
         """
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,13 +131,13 @@ class JsonCallback(BaseCallback):
 
 
 class JupyterCallback(BaseCallback):
-    """Live energy convergence plot for interactive notebooks."""
+    """Live total energy convergence plot for interactive notebooks."""
 
     def __init__(self, plot_interval: int = 1, figsize: tuple[int, int] = (8, 5)):
         """
         Args:
-            plot_interval: Update plot every N outer steps.
-            figsize: Matplotlib figure dimensions.
+            plot_interval: Update plot every N outer steps
+            figsize: Matplotlib figure dimensions
         """
         self.plot_interval = plot_interval
         self.energies: list[float] = []
@@ -149,18 +155,21 @@ class JupyterCallback(BaseCallback):
             raise RuntimeError("JupyterCallback requires IPython and matplotlib") from e
 
     def on_outer_end(self, step: int, stats: dict, driver: BaseDriver) -> None:
-        """Update convergence plot."""
+        """Update convergence plot with total energy."""
         if step % self.plot_interval != 0:
             return
 
+        # Extract total energy (already includes E_nuc)
+        e_total = stats["energy"]
+    
         self.steps.append(step)
-        self.energies.append(stats["energy"])
+        self.energies.append(e_total)
 
         self.clear_output(wait=True)
         self.ax.clear()
         self.ax.plot(self.steps, self.energies, marker="o", linestyle="-")
         self.ax.set_xlabel("Outer Step")
-        self.ax.set_ylabel("Energy (Ha)")
+        self.ax.set_ylabel("Total Energy (Ha)")
         self.ax.set_title("Energy Convergence")
         self.ax.grid(alpha=0.3)
         self.display(self.fig)

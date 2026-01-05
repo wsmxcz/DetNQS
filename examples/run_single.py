@@ -18,6 +18,7 @@ Date: December, 2025
 from __future__ import annotations
 
 import argparse
+import time
 import warnings
 from pathlib import Path
 
@@ -30,7 +31,7 @@ from detnqs.analysis import CheckpointCallback, ConsoleCallback, JsonCallback
 from detnqs.analysis.metrics import compute_pt2, compute_variational, convergence_stats
 from detnqs.driver import AsymmetricDriver, EffectiveDriver, ProxyDriver, VariationalDriver
 from detnqs.space import DetSpace
-from detnqs.space.selector import TopKSelector, ThresholdSelector
+from detnqs.space.selector import TopKSelector
 from detnqs.system import MolecularSystem
 
 
@@ -69,9 +70,7 @@ def configure_jax() -> None:
     jax.config.update("jax_log_compiles", False)
     jax.config.update("jax_debug_nans", False)
 
-    warnings.filterwarnings(
-        "ignore", message="Explicitly requested dtype.*is not available"
-    )
+    warnings.filterwarnings("ignore", message="Explicitly requested dtype.*is not available")
 
     print(f"JAX devices: {jax.devices()}")
 
@@ -79,7 +78,8 @@ def configure_jax() -> None:
 def print_summary(
     system: MolecularSystem,
     mode: str,
-    stats: dict,
+    e_total: float,
+    runtime: float,
     output_dir: Path | None = None,
 ) -> None:
     """Print final energy and system metadata."""
@@ -87,56 +87,51 @@ def print_summary(
     print(f"System: N_o={system.n_orb}, N_e={system.n_elec}, MS2={system.ms2}")
     print(f"Mode: {mode.upper()}")
     print(f"E_nuc:       {system.e_nuc:>18.8f} Ha")
-    print(f"E_elec:      {stats['final_energy']:>18.8f} Ha")
-    print(f"E_total:     {stats['final_energy'] + system.e_nuc:>18.8f} Ha")
-    print(f"Runtime:     {stats['total_time']:>18.2f} s")
+    print(f"E_total:     {e_total:>18.8f} Ha")
+    print(f"Runtime:     {runtime:>18.2f} s")
     if output_dir:
         print(f"Output:      {output_dir.resolve()}")
     print("=" * 60)
 
 
-def run_post_analysis(
-    driver,
-    e_ref_elec: float,
-    mode: str,
-) -> None:
+def run_post_analysis(driver, e_ref: float, mode: str) -> None:
     """
-    Execute mode-specific post-processing.
+    Execute mode-specific post-processing with timing.
 
     - Variational: Compute PT2 correction over P-space
     - Proxy: Evaluate variational energies on V and T
 
     Args:
         driver: Optimized driver with final detspace
-        e_ref_elec: Electronic energy from optimization
+        e_ref: Reference total energy from optimization (Ha)
         mode: Computational mode identifier
     """
-    print("\nPost-processing analysis...")
-
     if mode == "variational":
-        # PT2 from P-space: E_total = E_var + Delta E_PT2
+        print("\nComputing PT2 correction...")
+        t_start = time.time()
         e_pt2 = compute_pt2(
             state=driver.state,
             detspace=driver.detspace,
             system=driver.system,
-            e_ref_elec=e_ref_elec,
+            e_ref=e_ref,
         )
+        t_pt2 = time.time() - t_start
+      
         if e_pt2 is not None:
-            e_var_total = e_ref_elec + driver.system.e_nuc
-            e_total = e_var_total + e_pt2
-            print("\nPT2 correction:")
-            print(f"  E_var:   {e_var_total:>18.8f} Ha")
-            print(f"  E_PT2:   {e_pt2:>18.8f} Ha")
-            print(f"  E_total: {e_total:>18.8f} Ha")
+            e_total_pt2 = e_ref + e_pt2
+            print(f"\nPT2 results (computed in {t_pt2:.2f}s):")
+            print(f"  E_var:       {e_ref:>18.8f} Ha")
+            print(f"  ΔE_PT2:      {e_pt2:>18.8f} Ha")
+            print(f"  E_total(PT2): {e_total_pt2:>18.8f} Ha")
 
     elif mode == "proxy":
-        # Variational energies on V and T spaces
+        print("\nComputing variational energies...")
         var_result = compute_variational(
             state=driver.state,
             detspace=driver.detspace,
             system=driver.system,
         )
-        if var_result is not None:
+        if var_result:
             print("\nVariational energy analysis:")
             print(f"  E_var(V): {var_result['e_var_v']:>18.8f} Ha")
             if "e_var_t" in var_result:
@@ -148,16 +143,16 @@ def main() -> None:
     args = parse_args()
     configure_jax()
 
-    # L0: Load molecular system and initialize Hartree-Fock reference
+    # L0: Load molecular system and initialize HF reference
     system = MolecularSystem.from_fcidump(args.fcidump)
     hf_det = system.hf_determinant()
     detspace = DetSpace.initialize(hf_det)
 
-    # Build neural ansatz: MLP parametrizer + Slater2nd architecture
+    # Build neural ansatz with MLP parametrizer
     parametrizer = models.parametrizers.MLP(
         n_so=system.n_so,
         dim=256,
-        depth=1,
+        depth=2,
         param_dtype=jnp.float64,
     )
 
@@ -170,8 +165,9 @@ def main() -> None:
     )
 
     # Configure optimizer and determinant selector
-    optimizer = optax.adamw(learning_rate=5e-4)
-    selector = TopKSelector(40, stream=True)
+    schedule = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=400, alpha=0.1)
+    optimizer = optax.adamw(learning_rate=schedule)
+    selector = TopKSelector(8192, stream=True)
 
     # L1: Instantiate driver for selected computational mode
     driver = _DRIVER_MAP[args.mode].build(
@@ -185,34 +181,29 @@ def main() -> None:
 
     # Register callbacks for monitoring and checkpointing
     callbacks = [ConsoleCallback(every=1)]
-    if args.output is not None:
+    if args.output:
         args.output.mkdir(parents=True, exist_ok=True)
-        callbacks.extend(
-            [
-                JsonCallback(args.output / "trace.jsonl"),
-                CheckpointCallback(
-                    args.output / "checkpoints", interval=5, keep_last=5
-                ),
-            ]
-        )
+        callbacks.extend([
+            JsonCallback(args.output / "trace.jsonl"),
+            CheckpointCallback(args.output / "checkpoints", interval=5, keep_last=5),
+        ])
 
     # L2: Run outer loop (detspace evolution) + inner loop (parameter updates)
+    t_start = time.time()
     driver.run(callbacks=callbacks)
+    runtime = time.time() - t_start
 
     # Extract convergence statistics and post-process
-    if args.output is not None:
-        trace_file = args.output / "trace.jsonl"
-        stats = convergence_stats(trace_file)
+    if args.output:
+        stats = convergence_stats(args.output / "trace.jsonl")
         if stats:
-            print_summary(system, args.mode, stats, args.output)
-            run_post_analysis(
-                driver=driver,
-                e_ref_elec=stats["final_energy"],
-                mode=args.mode,
-            )
+            e_total = stats["final_energy"]  # Already includes E_nuc
+            print_summary(system, args.mode, e_total, runtime, args.output)
+            run_post_analysis(driver, e_total, args.mode)
     else:
-        print("\nOptimization completed (no trace file for summary).")
+        print(f"\nOptimization completed in {runtime:.2f}s (no trace file for summary).")
 
 
 if __name__ == "__main__":
     main()
+

@@ -9,8 +9,9 @@ Provides optional analysis functions:
   - PT2 correction via C++ kernel (Epstein-Nesbet)
   - Variational energy evaluation on V-space and T-space
 
-Note: These functions are independent of the runtime driver loop
-      and designed for delayed execution after optimization.
+Note: All energies returned are total energies (E_total = E_elec + E_nuc)
+      unless explicitly documented otherwise.
+      These functions are independent of the runtime driver loop.
 
 File: detnqs/analysis/metrics.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
@@ -38,7 +39,12 @@ def convergence_stats(trace_path: str | Path) -> dict[str, float]:
         trace_path: Path to .jsonl trace file
 
     Returns:
-        Dict containing mean_delta, max_delta, final_energy, n_outers, total_time
+        Dict containing:
+          - mean_delta: Mean absolute energy change
+          - max_delta: Maximum absolute energy change
+          - final_energy: Final total energy (Ha)
+          - n_outers: Number of outer iterations
+          - total_time: Total runtime (s)
     """
     trace_path = Path(trace_path)
     if not trace_path.exists():
@@ -51,8 +57,8 @@ def convergence_stats(trace_path: str | Path) -> dict[str, float]:
         for line in f:
             if line.strip():
                 record = json.loads(line)
-                energies.append(record["energy"])
-                timestamps.append(record["timestamp"])
+                energies.append(record["energy"])  # Total energy
+                timestamps.append(record["total_time"])
 
     if not energies:
         return {}
@@ -80,26 +86,30 @@ def compute_pt2(
     detspace: DetSpace,
     system: MolecularSystem,
     *,
-    e_ref_elec: float,
+    e_ref: float,
     screening: str = "heatbath",
     eps1: float = 1e-6,
 ) -> float | None:
     """
-    Compute Epstein-Nesbet PT2 correction on P-space (electronic part only).
+    Compute Epstein-Nesbet PT2 correction on P-space.
 
     The PT2 energy correction is computed as:
-        Delta E_PT2 = sum_{x in P} |<x|H|psi_V>|^2 / (E_0 - H_{xx})
+        ΔE_PT2 = Σ_k |<D_k|(H - E_0)|Ψ_0>|² / (E_0 - H_kk)
 
     Args:
         state: Optimized network state
         detspace: Determinant space containing V and P
         system: Molecular system
-        e_ref_elec: Reference electronic energy from variational optimization
+        e_ref: Reference total energy (Ha) from variational optimization
         screening: Screening method ("heatbath" or "none")
         eps1: Screening threshold for heat-bath
 
     Returns:
-        PT2 correction (electronic part), or None if C++ kernel unavailable
+        PT2 correction ΔE_PT2 (Ha), or None if C++ kernel unavailable
+    
+    Note:
+        The returned PT2 correction should be added to e_ref to get
+        the final total energy: E_total = e_ref + ΔE_PT2
     """
     try:
         from .. import core
@@ -120,6 +130,9 @@ def compute_pt2(
     psi_v = sign_v * jnp.exp(logabs_v - shift)
     psi_v = np.asarray(psi_v, dtype=np.float64)
     psi_v = psi_v / np.linalg.norm(psi_v)
+
+    # C++ kernel expects electronic energy reference
+    e_ref_elec = e_ref - system.e_nuc
 
     use_heatbath = screening == "heatbath"
 
@@ -148,8 +161,8 @@ def compute_variational(
     Compute variational energies on V-space and optionally T-space.
 
     Workflow:
-      1. Always compute E_var_V = <psi_V|H_VV|psi_V> on V-space
-      2. If P-space exists, compute E_var_T = <psi_T|H|psi_T> on full T-space
+      1. Always compute E_var_V = <ψ_V|H_VV|ψ_V> on V-space
+      2. If P-space exists, compute E_var_T = <ψ_T|H|ψ_T> on full T-space
 
     Args:
         state: Optimized network state
@@ -160,10 +173,10 @@ def compute_variational(
 
     Returns:
         Dict with 'e_var_v' (always) and 'e_var_t' (if P-space exists),
-        both including nuclear repulsion
+        both are total energies (Ha)
 
     Note:
-        C++ kernel computes only <psi|H|psi>; normalization handled in Python.
+        C++ kernel computes only <ψ|H|ψ>; normalization handled in Python.
     """
     try:
         from .. import core
@@ -194,7 +207,7 @@ def compute_variational(
         use_heatbath=use_heatbath,
         eps1=eps1,
     )
-    result["e_var_v"] = float(e_elec_v) + system.e_nuc
+    result["e_var_v"] = float(e_elec_v) + system.e_nuc  # Total energy
 
     # Optionally compute E_var_T on full T-space if P exists
     if detspace.has_P:
@@ -215,7 +228,7 @@ def compute_variational(
             use_heatbath=use_heatbath,
             eps1=eps1,
         )
-        result["e_var_t"] = float(e_elec_t) + system.e_nuc
+        result["e_var_t"] = float(e_elec_t) + system.e_nuc  # Total energy
 
     return result
 
@@ -225,7 +238,7 @@ def extract_norms(trace_path: str | Path) -> dict[str, np.ndarray]:
     Extract norm evolution from JSONL trace.
 
     Computes normalized fractions:
-        f_V = ||psi_V||^2 / (||psi_V||^2 + ||psi_P||^2)
+        f_V = ||ψ_V||² / (||ψ_V||² + ||ψ_P||²)
 
     Args:
         trace_path: Path to .jsonl trace file

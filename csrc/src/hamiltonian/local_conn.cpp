@@ -229,10 +229,14 @@ double compute_variational_energy(
 }
 
 // ============================================================================
-// PT2 correction: Delta E_PT2 via Epstein-Nesbet partition
-//
-// Delta E_PT2 = sum_{a in P_k} |<a|H|Psi_V>|^2 / (E_ref - H_aa)
-// where P_k = C_k \ V_k (perturbative set, external to variational space)
+// Second-order Epstein–Nesbet / sPT correction for a non-linear reference |Psi0>.
+
+// DeltaE2 = sum_k | <D_k|(H - E0)|Psi0> |^2 / (E0 - H_kk),
+// where H_kk = <D_k|H|D_k>.
+
+// If |Psi0> is an eigenvector of H restricted to the variational subspace (selected-CI case),
+// the residual on V vanishes and the formula reduces to the usual external-space EN-PT2:
+// DeltaE2 = sum_{a∉V} |<D_a|H|Psi0>|^2 / (E0 - H_aa).
 // ============================================================================
 
 Pt2Result compute_pt2(
@@ -258,7 +262,7 @@ Pt2Result compute_pt2(
         );
     }
 
-    // Build index map for V_k membership test
+    // Map for fast "is ket in V?" and index lookup
     std::vector<Det> basis_vec(var_basis.begin(), var_basis.end());
     const DetMap map_var = DetMap::from_ordered(std::move(basis_vec), false);
 
@@ -268,8 +272,9 @@ Pt2Result compute_pt2(
         : num_thresh;
 
     constexpr double coeff_skip = 1e-24;
+    constexpr double denom_eps  = 1e-12;
 
-    // Thread-local accumulation of v(a) = <a|H|Psi_V>
+    // Thread-local accumulation of v(a) = <a|H|Psi0> for external determinants a ∉ V
     int n_threads = 1;
 #ifdef _OPENMP
     n_threads = omp_get_max_threads();
@@ -278,6 +283,9 @@ Pt2Result compute_pt2(
     using ExtMap = std::unordered_map<Det, double>;
     std::vector<ExtMap> thread_maps(static_cast<std::size_t>(n_threads));
     for (auto& m : thread_maps) m.reserve(N_var * 8);
+
+    // Thread-local accumulation of the "internal residual" term on V
+    std::vector<double> thread_internal(static_cast<std::size_t>(n_threads), 0.0);
 
 #pragma omp parallel for schedule(dynamic, 32) if(N_var > 128)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(N_var); ++i) {
@@ -293,20 +301,35 @@ Pt2Result compute_pt2(
 
         if (c_bra * c_bra < coeff_skip) continue;
 
-        // Single excitations (only external to V_k)
+        // sigma_i = <D_i|H|Psi0> restricted to V coefficients
+        double sigma_i = 0.0;
+
+        // Diagonal (always needed for denom and contributes to sigma_i)
+        const double h_ii = ham.compute_diagonal(bra);
+        sigma_i += h_ii * c_bra;
+
+        // Single excitations: contribute either to sigma_i (if ket in V) or v(a) (if ket ∉ V)
         det_ops::for_each_single(bra, n_orb, [&](const Det& ket) {
-            if (map_var.get_idx(ket)) return;  // Skip if ket in V_k
             const double h = ham.compute_elem(bra, ket);
             if (std::abs(h) <= single_thresh) return;
-            ext_acc[ket] += h * c_bra;
+
+            if (auto idx = map_var.get_idx(ket)) {
+                sigma_i += h * coeffs_var[*idx];
+            } else {
+                ext_acc[ket] += h * c_bra;
+            }
         });
 
-        // Double excitations (only external to V_k)
+        // Double excitations (with optional Heat-Bath generation)
         auto visit_double = [&](const Det& ket) {
-            if (map_var.get_idx(ket)) return;
             const double h = ham.compute_elem(bra, ket);
             if (std::abs(h) <= num_thresh) return;
-            ext_acc[ket] += h * c_bra;
+
+            if (auto idx = map_var.get_idx(ket)) {
+                sigma_i += h * coeffs_var[*idx];
+            } else {
+                ext_acc[ket] += h * c_bra;
+            }
         };
 
         if (use_heatbath && hb_table) {
@@ -314,9 +337,21 @@ Pt2Result compute_pt2(
         } else {
             det_ops::for_each_double(bra, n_orb, visit_double);
         }
+
+        // Internal (V-space) residual contribution:
+        //   r_i = <D_i|(H - E0)|Psi0> = sigma_i - E0 * c_i
+        //   DeltaE2_int += r_i^2 / (E0 - H_ii)
+        const double r_i = sigma_i - e_ref * c_bra;
+
+        double denom = e_ref - h_ii;
+        if (std::abs(denom) < denom_eps) {
+            denom = (denom >= 0.0) ? denom_eps : -denom_eps;
+        }
+
+        thread_internal[static_cast<std::size_t>(tid)] += (r_i * r_i) / denom;
     }
 
-    // Merge thread-local maps into P_k (perturbative set)
+    // Merge external maps into a single perturbative set P_k (a ∉ V)
     ExtMap perturb_set;
     perturb_set.reserve(N_var * 32);
     for (auto& m : thread_maps) {
@@ -325,23 +360,24 @@ Pt2Result compute_pt2(
         }
     }
 
-    // Compute PT2 correction
-    double delta_e_pt2 = 0.0;
-    constexpr double denom_eps = 1e-12;
+    // Sum internal term across threads
+    double delta_int = 0.0;
+    for (double x : thread_internal) delta_int += x;
 
+    // External EN-PT2 term: sum_{a∉V} v(a)^2 / (E0 - H_aa)
+    double delta_ext = 0.0;
     for (const auto& [a, v_a] : perturb_set) {
         const double h_aa = ham.compute_diagonal(a);
-        double denom = e_ref - h_aa;
 
-        // Regularize near-zero denominators
+        double denom = e_ref - h_aa;
         if (std::abs(denom) < denom_eps) {
             denom = (denom >= 0.0) ? denom_eps : -denom_eps;
         }
 
-        delta_e_pt2 += (v_a * v_a) / denom;
+        delta_ext += (v_a * v_a) / denom;
     }
 
-    return {delta_e_pt2, perturb_set.size()};
+    return {delta_int + delta_ext, perturb_set.size()};
 }
 
 } // namespace detnqs

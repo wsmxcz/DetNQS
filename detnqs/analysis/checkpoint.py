@@ -8,7 +8,7 @@ Storage design:
   - V_dets (uint64): Variational set V_k determinants
   - params (msgpack): Network parameters via Flax serialization
   - opt_state (msgpack): Optimizer state
-  - metadata (JSON): Mode, energy, timestamp
+  - metadata (JSON): Mode, total energy, timestamp
 
 The perturbative set P_k is deterministically rebuilt from
 V_k and system.int_ctx to ensure reproducibility.
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 
 class CheckpointCallback(BaseCallback):
-    """Periodic checkpoint with automatic cleanup."""
+    """Periodic checkpoint with automatic cleanup and guaranteed final save."""
 
     def __init__(
         self,
@@ -55,6 +55,7 @@ class CheckpointCallback(BaseCallback):
         self.interval = interval
         self.keep_last = keep_last
         self.directory.mkdir(parents=True, exist_ok=True)
+        self._last_saved_step = -1
 
     def on_outer_end(self, step: int, stats: dict, driver: BaseDriver) -> None:
         """Save checkpoint at multiples of interval."""
@@ -63,11 +64,30 @@ class CheckpointCallback(BaseCallback):
 
         ckpt_path = self.directory / f"step_{step:06d}.npz"
         CheckpointManager.save(ckpt_path, driver, stats)
+        self._last_saved_step = step
         self._cleanup_old()
 
+    def on_run_end(self, driver: BaseDriver) -> None:
+        """Ensure final step is always saved."""
+        # Check if driver has valid final step info
+        if not hasattr(driver, '_last_outer_step') or driver._last_outer_step < 0:
+            return
+        
+        final_step = driver._last_outer_step
+        
+        # Only save if not already saved in on_outer_end
+        if final_step != self._last_saved_step:
+            ckpt_path = self.directory / f"step_{final_step:06d}_final.npz"
+            
+            # Use saved stats or create minimal version
+            stats = getattr(driver, '_last_stats', {"outer_step": final_step})
+            
+            CheckpointManager.save(ckpt_path, driver, stats)
+            print(f"Saved final checkpoint: {ckpt_path.name}")
+
     def _cleanup_old(self) -> None:
-        """Remove checkpoints beyond keep_last limit."""
-        all_ckpts = sorted(self.directory.glob("step_*.npz"))
+        """Remove checkpoints beyond keep_last limit (excluding final checkpoints)."""
+        all_ckpts = sorted([p for p in self.directory.glob("step_*.npz") if "_final" not in p.name])
         if len(all_ckpts) > self.keep_last:
             for old_ckpt in all_ckpts[: -self.keep_last]:
                 old_ckpt.unlink()
@@ -82,6 +102,7 @@ class CheckpointManager:
         Atomic checkpoint save via temporary file.
 
         Serializes variational set, network params, optimizer state, and metadata.
+        All energies stored are total energies (E_total = E_elec + E_nuc).
         Uses atomic swap to prevent corruption during concurrent writes.
         """
         path = Path(path)
@@ -92,18 +113,18 @@ class CheckpointManager:
         params_bytes = serialization.to_bytes(driver.state.params)
         opt_state_bytes = serialization.to_bytes(driver.opt_state)
 
-        # Build metadata
+        # Build metadata (all energies are total energies)
         metadata = {
             "outer_step": stats.get("outer_step", 0) if stats else 0,
             "mode": driver.mode_tag(),
             "fcidump_path": str(driver.system.fcidump_path.absolute()),
-            "energy": stats.get("energy") if stats else None,
+            "energy": stats.get("energy") if stats else None,  # Total energy
             "timestamp": datetime.now().isoformat(),
         }
 
-        # Mode-specific fields (e.g., Effective Hamiltonian reference energy)
+        # Mode-specific fields (store electronic energy for Effective mode reference)
         if hasattr(driver, "e_ref"):
-            metadata["energy_ref"] = float(driver.e_ref)
+            metadata["e_ref_elec"] = float(driver.e_ref)  # Electronic energy reference
 
         np.savez_compressed(
             tmp_path,
@@ -207,9 +228,9 @@ class CheckpointManager:
             **override_kwargs,
         )
 
-        # Restore mode-specific fields
-        if "energy_ref" in meta and hasattr(driver, "e_ref"):
-            driver.e_ref = float(meta["energy_ref"])
+        # Restore mode-specific fields (electronic energy reference)
+        if "e_ref_elec" in meta and hasattr(driver, "e_ref"):
+            driver.e_ref = float(meta["e_ref_elec"])
 
         return driver
 

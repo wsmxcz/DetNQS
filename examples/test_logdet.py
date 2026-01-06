@@ -13,6 +13,8 @@ Date: December, 2025
 """
 
 import time
+import warnings
+
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -20,7 +22,7 @@ from jax import random
 from detnqs.models.slogdet import slogdet
 
 jax.config.update("jax_enable_x64", True)
-
+warnings.filterwarnings("ignore", message="Explicitly requested dtype.*is not available")
 
 def check_correctness(name: str, mat: jnp.ndarray, verbose: bool = True):
     """
@@ -206,8 +208,8 @@ def run_performance_tests():
       
         # Large matrices
         k3, key = random.split(key)
-        mat_large = random.normal(k3, (8192, 64, 64), dtype=dtype) + jnp.eye(64) * 64
-        print(f"\n(8192, 64, 64):")
+        mat_large = random.normal(k3, (8192, 48, 48), dtype=dtype) + jnp.eye(48) * 48
+        print(f"\n(8192, 48, 48):")
         run_benchmark(mat_large, iters=50)
 
 

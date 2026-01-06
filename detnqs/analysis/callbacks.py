@@ -58,18 +58,18 @@ class ConsoleCallback(BaseCallback):
         self._header_printed = False
 
     def _print_header(self) -> None:
-        """Print formatted table header."""
-        sep = "=" * 105
+        """Print formatted table header with timing breakdown."""
+        sep = "=" * 130
         print(f"\n{sep}")
         print(
             f"{'Outer':>6} | {'|V|':>8} | {'|P|':>8} | "
-            f"{'E_total':>18} | {'||ψ_V||²':>10} | {'||ψ_P||²':>10} | "
-            f"{'Inner':>6} | {'Time':>10}"
+            f"{'Energy (Ha)':>18} | {'||ψ_V||²':>10} | {'||ψ_P||²':>10} | "
+            f"{'Inner':>6} | {'Timing (s)':>25}"
         )
         print(sep)
 
     def on_outer_end(self, step: int, stats: dict, driver: BaseDriver) -> None:
-        """Print current iteration stats."""
+        """Print iteration stats with detailed timing breakdown."""
         if step % self.every != 0:
             return
 
@@ -77,27 +77,38 @@ class ConsoleCallback(BaseCallback):
             self._print_header()
             self._header_printed = True
 
-        # Extract total energy (already includes E_nuc)
         e_total = stats['energy']
-
-        # Extract wave function norms
-        norm_v = stats["norm_v"]
-        norm_p = stats["norm_p"]
+        norm_v = stats.get("norm_v", 0.0)
+        norm_p = stats.get("norm_p", 0.0)
         norm_tot = norm_v + norm_p
 
-        # Compute normalized fractions
-        frac_v = norm_v / norm_tot if norm_tot > 1e-14 else 1.0
-        frac_p = norm_p / norm_tot if norm_tot > 1e-14 else 0.0
+        # Format norm fractions
+        if norm_tot > 1e-14:
+            frac_v = norm_v / norm_tot
+            frac_p = norm_p / norm_tot
+            frac_v_str = f"{frac_v:10.6f}"
+            frac_p_str = f"{frac_p:10.6f}"
+        else:
+            frac_v_str = "    N/A   "
+            frac_p_str = "    N/A   "
+
+        # Timing breakdown: total (compile + inner + overhead)
+        timing_str = (
+            f"total={stats['total_time']:7.2f} "
+            f"(c={stats['compile_time']:5.2f} + "
+            f"i={stats['inner_time']:5.2f} + "
+            f"o={stats['overhead_time']:5.2f})"
+        )
 
         print(
             f"{step:6d} | {stats['size_v']:8d} | {stats['size_p']:8d} | "
-            f"{e_total:18.10f} | {frac_v:10.6f} | {frac_p:10.6f} | "
-            f"{stats['inner_steps']:6d} | {stats['total_time']:10.2f}s"
+            f"{e_total:18.10f} | {frac_v_str} | {frac_p_str} | "
+            f"{stats['inner_steps']:6d} | {timing_str}"
         )
 
     def on_run_end(self, driver: BaseDriver) -> None:
         """Print footer separator."""
-        print("=" * 105)
+        print("=" * 130)
 
 
 class JsonCallback(BaseCallback):

@@ -14,7 +14,7 @@
  *             Computed via solving A^T X = I using GESV.
  *
  * Supports batched input of shape (..., N, N) with N in [2, 64].
- * Uses identity padding to bucket matrix sizes to {2,4,8,12,16,24,32,64}.
+ * Uses identity padding to bucket matrix sizes to {2,4,8,12,16,24,32,48,64}.
  *
  * File: lever/jax/fused_logdet_cuda.cc
  * Author: Zheng (Alex) Che, wsmxcz@gmail.com
@@ -71,7 +71,7 @@ __device__ __forceinline__ double SignOf(T x) {
 
 // ========================== Host Utilities ==========================
 
-// Bucket matrix size N to {2, 4, 8, 12, 16, 24, 32, 64} for compile-time instantiation.
+// Bucket matrix size N to {2, 4, 8, 12, 16, 24, 32, 48, 64} for compile-time instantiation.
 static inline int BucketN(int N) {
   if (N <= 2)  return 2;
   if (N <= 4)  return 4;
@@ -80,6 +80,7 @@ static inline int BucketN(int N) {
   if (N <= 16) return 16;
   if (N <= 24) return 24;
   if (N <= 32) return 32;
+  if (N <= 48) return 48;
   return 64;
 }
 
@@ -467,6 +468,7 @@ static ffi::Error DispatchFwd(cudaStream_t stream,
     case 16: return LaunchFwd<Scalar,16>(stream, A, sign, logabs, B, N_actual);
     case 24: return LaunchFwd<Scalar,24>(stream, A, sign, logabs, B, N_actual);
     case 32: return LaunchFwd<Scalar,32>(stream, A, sign, logabs, B, N_actual);
+    case 48: return LaunchFwd<Scalar,48>(stream, A, sign, logabs, B, N_actual);
     case 64: return LaunchFwd<Scalar,64>(stream, A, sign, logabs, B, N_actual);
     default: return InvalidArg("Invalid matrix bucket size");
   }
@@ -485,6 +487,7 @@ static ffi::Error DispatchBwd(cudaStream_t stream,
     case 16: return LaunchBwd<Scalar,16>(stream, A, cot, grad, B, N_actual);
     case 24: return LaunchBwd<Scalar,24>(stream, A, cot, grad, B, N_actual);
     case 32: return LaunchBwd<Scalar,32>(stream, A, cot, grad, B, N_actual);
+    case 48: return LaunchBwd<Scalar,48>(stream, A, cot, grad, B, N_actual);
     case 64: return LaunchBwd<Scalar,64>(stream, A, cot, grad, B, N_actual);
     default: return InvalidArg("Invalid matrix bucket size");
   }

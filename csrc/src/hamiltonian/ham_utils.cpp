@@ -3,14 +3,13 @@
 
 /**
  * @file ham_utils.cpp
- * @brief Sparse matrix utilities and Hamiltonian construction helpers.
+ * @brief Sparse matrix utilities and screened perturbative set generation.
  * 
- * Provides COO/CSR/CSC format conversions, matrix arithmetic, and
- * screened perturbative set generation for selected-CI frameworks.
- * Implements efficient merge algorithms and format transformations.
+ * Provides COO/CSR/CSC format conversions, matrix arithmetic operations,
+ * and deterministic P_k construction via Heat-Bath screening for selected-CI.
  * 
  * Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
- * Date: December, 2025
+ * Date: January, 2026
  */
 
 #include <detnqs/hamiltonian/ham_utils.hpp>
@@ -23,6 +22,10 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace detnqs {
 
 // ============================================================================
@@ -30,17 +33,15 @@ namespace detnqs {
 // ============================================================================
 
 /**
- * @brief Sort COO entries and merge duplicates in-place.
+ * @brief Sort and merge duplicate COO entries in-place.
  * 
- * Uses indirect sorting followed by a single-pass merge.
- * Returns maximum absolute value after merging.
+ * Algorithm: Indirect sort by (row, col), then single-pass accumulation.
+ * Returns max|value| after merging.
  */
 double sort_and_merge_coo(COOMatrix& coo) {
     if (coo.empty()) return 0.0;
 
     const size_t n = coo.nnz();
-
-    // Indirect sort by (row, col)
     std::vector<size_t> idx(n);
     std::iota(idx.begin(), idx.end(), size_t{0});
 
@@ -49,7 +50,6 @@ double sort_and_merge_coo(COOMatrix& coo) {
         return coo.cols[a] < coo.cols[b];
     });
 
-    // Single-pass merge: accumulate consecutive duplicates
     COOMatrix merged;
     merged.reserve(n);
     merged.n_rows = coo.n_rows;
@@ -85,7 +85,7 @@ double sort_and_merge_coo(COOMatrix& coo) {
 /**
  * @brief Add two sorted COO matrices via two-pointer merge.
  * 
- * Assumes A and B are sorted. Drops entries below threshold.
+ * Assumes A and B are sorted. Drops entries with |value| <= thresh.
  */
 COOMatrix coo_add(const COOMatrix& A, const COOMatrix& B, double thresh) {
     COOMatrix C;
@@ -140,6 +140,8 @@ COOMatrix coo_add(const COOMatrix& A, const COOMatrix& B, double thresh) {
 
 /**
  * @brief Mirror upper-triangular COO to symmetric full matrix.
+ * 
+ * For each (i,j): add (j,i) if i != j.
  */
 COOMatrix mirror_upper_to_full(const COOMatrix& upper) {
     COOMatrix full;
@@ -176,7 +178,7 @@ u32 infer_n_rows(const COOMatrix& coo) noexcept {
 /**
  * @brief Convert COO to CSC via column-wise bucket sort.
  * 
- * Merges duplicates within each column. O(nnz + n_cols).
+ * O(nnz + n_cols) complexity. Merges duplicates within each column.
  */
 CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
     CSCMatrix csc;
@@ -207,7 +209,6 @@ CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
             return a.first < b.first;
         });
 
-        // Merge duplicates
         u32 last_row = bucket[0].first;
         double acc = bucket[0].second;
 
@@ -239,6 +240,8 @@ CSCMatrix coo_to_csc(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
 
 /**
  * @brief Convert COO to CSR via row-wise bucket sort.
+ * 
+ * O(nnz + n_rows) complexity. Merges duplicates within each row.
  */
 CSRMatrix coo_to_csr(const COOMatrix& coo, u32 n_rows, u32 n_cols) {
     CSRMatrix csr;
@@ -321,6 +324,8 @@ COOMatrix csr_to_coo(const CSRMatrix& csr) {
 
 /**
  * @brief Add two CSR matrices via row-wise two-pointer merge.
+ * 
+ * Two-pass algorithm: compute row_ptrs, then fill values.
  */
 CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     if (A.n_rows != B.n_rows || A.n_cols != B.n_cols) {
@@ -333,7 +338,6 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     C.row_ptrs.resize(C.n_rows + 1);
     C.row_ptrs[0] = 0;
 
-    // First pass: compute row_ptrs
     size_t total_nnz = 0;
     for (u32 i = 0; i < C.n_rows; ++i) {
         size_t row_nnz = 0;
@@ -375,7 +379,6 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
     C.col_indices.resize(total_nnz);
     C.values.resize(total_nnz);
 
-    // Second pass: fill data
     for (u32 i = 0; i < C.n_rows; ++i) {
         size_t write_pos = C.row_ptrs[i];
 
@@ -439,14 +442,13 @@ CSRMatrix csr_add(const CSRMatrix& A, const CSRMatrix& B, double thresh) {
 }
 
 // ============================================================================
-// Spin-orbital helpers
+// Spin-orbital Utilities
 // ============================================================================
 
 /**
  * @brief Extract occupied spin-orbital indices from determinant.
  * 
- * Returns list of SO indices: alpha orbitals map to even indices,
- * beta orbitals to odd indices.
+ * Alpha orbitals map to even indices (2*mo), beta to odd (2*mo+1).
  */
 std::vector<int> get_occ_so(const Det& d) {
     std::vector<int> occ;
@@ -477,7 +479,7 @@ bool is_occ_so(const Det& d, int so_idx, int n_orb) {
 }
 
 /**
- * @brief Apply double excitation (i_so, j_so) -> (a_so, b_so) to ket.
+ * @brief Apply double excitation (i_so, j_so) -> (a_so, b_so).
  */
 Det exc2_so(const Det& ket, int i_so, int j_so, int a_so, int b_so) {
     Det out = ket;
@@ -505,6 +507,8 @@ Det exc2_so(const Det& ket, int i_so, int j_so, int a_so, int b_so) {
 
 /**
  * @brief Estimate connected space capacity: 1 + 2*n_orb + 0.1*n_orb^2.
+ * 
+ * Empirical formula balancing singles and partial doubles coverage.
  */
 size_t est_conn_cap(int n_orb) {
     if (n_orb <= 0) return 1;
@@ -513,20 +517,21 @@ size_t est_conn_cap(int n_orb) {
 }
 
 // ============================================================================
-// Perturbative set generation
+// Perturbative Set Generation
 // ============================================================================
 
 /**
  * @brief Generate screened perturbative set P_k from variational set V_k.
  * 
- * Constructs connected space C_k = {x' in B : exists x in V_k, <x'|H|x> != 0},
+ * Constructs connected set C_k = {x' in B : exists x in V_k, <x'|H|x> != 0},
  * then extracts P_k = C_k \ V_k. Screening modes:
  * 
- *   - None: no screening, returns full combinatorial complement.
- *   - Static: drops matrix elements below numerical threshold.
- *   - Dynamic: also screens by |H_ij * psi_V[i]| < eps1.
+ *   - None: full combinatorial complement (no screening).
+ *   - Static: drop |H_ij| < MAT_ELEMENT_THRESH.
+ *   - Dynamic: additionally require |H_ij * psi_V[i]| >= eps1.
  * 
- * Heat-Bath table accelerates double excitation enumeration.
+ * Heat-Bath table accelerates double excitation enumeration by integral
+ * magnitude ranking, enabling aggressive truncation in Static/Dynamic modes.
  * 
  * @param V            Variational set V_k
  * @param n_orb        Number of spatial orbitals
@@ -551,73 +556,148 @@ std::vector<Det> generate_complement_screened(
     if (V.empty()) return {};
 
     if (mode == ScreenMode::None) {
-        return det_space::generate_complement(V, n_orb, exclude, true);
+        return det_space::generate_complement(V, n_orb, exclude, /*sorted=*/true);
     }
 
     if (!hb_table) {
         throw std::invalid_argument(
-            "generate_complement_screened: Heat-Bath table required "
-            "for screened modes"
+            "generate_complement_screened: Heat-Bath table required for screened modes"
         );
     }
 
     if (mode == ScreenMode::Dynamic && psi_V.size() != V.size()) {
         throw std::invalid_argument(
-            "generate_complement_screened: psi_V size must match |V| "
-            "for dynamic screening"
+            "generate_complement_screened: psi_V size must match |V_k| for dynamic screening"
         );
     }
-
-    std::unordered_set<Det> uniq;
-    uniq.reserve(V.size() * 16);
 
     const double num_thresh = MAT_ELEMENT_THRESH;
     const double delta = 1e-12;
+    const std::size_t n_V = V.size();
 
-    const size_t n_V = V.size();
-    for (size_t i = 0; i < n_V; ++i) {
-        const Det& bra = V[i];
+    int n_threads = 1;
+#ifdef _OPENMP
+    n_threads = omp_get_max_threads();
+#endif
 
-        // Singles: H * |bra> generates singly-excited states
-        det_ops::for_each_single(bra, n_orb, [&](const Det& ket) {
-            if (exclude.contains(ket)) return;
+    std::vector<std::vector<Det>> tl(static_cast<std::size_t>(n_threads));
 
-            const double h = ham.compute_elem(bra, ket);
-            if (std::abs(h) <= num_thresh) return;
+#pragma omp parallel
+    {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        auto& buf = tl[static_cast<std::size_t>(tid)];
 
+        // Conservative reserve: helps reduce realloc churn without assuming |P|/|V|.
+        // Feel free to scale this if you have a better estimate per system.
+        buf.reserve((n_V / static_cast<std::size_t>(n_threads) + 1) * 256);
+
+#pragma omp for schedule(guided)
+        for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n_V); ++i) {
+            const std::size_t ui = static_cast<std::size_t>(i);
+            const Det& bra = V[ui];
+
+            // Singles: must evaluate H_ij; screening is independent of exclude.
+            det_ops::for_each_single(bra, n_orb, [&](const Det& ket) {
+                const double h = ham.compute_elem(bra, ket);
+                if (std::abs(h) <= num_thresh) return;
+
+                if (mode == ScreenMode::Dynamic) {
+                    if (std::abs(h * psi_V[ui]) < eps1) return;
+                }
+                buf.push_back(ket);
+            });
+
+            // Doubles: Heat-Bath enumeration; screening independent of exclude.
+            double cutoff = eps1;
             if (mode == ScreenMode::Dynamic) {
-                const double c = psi_V[i];
-                const double w = std::abs(h * c);
-                if (w < eps1) return;
+                const double amp = std::max(std::abs(psi_V[ui]), delta);
+                cutoff = eps1 / amp;
             }
-            uniq.insert(ket);
-        });
 
-        // Doubles: use Heat-Bath screening
-        double cutoff = eps1;
-        if (mode == ScreenMode::Dynamic) {
-            const double amp = std::max(std::abs(psi_V[i]), delta);
-            cutoff = eps1 / amp;
+            for_each_double_hb(
+                bra,
+                n_orb,
+                *hb_table,
+                cutoff,
+                [&](const Det& ket) {
+                    buf.push_back(ket);
+                }
+            );
         }
 
-        for_each_double_hb(
-            bra,
-            n_orb,
-            *hb_table,
-            cutoff,
-            [&](const Det& ket) {
-                if (exclude.contains(ket)) return;
-                uniq.insert(ket);
-            }
-        );
+        // Local canonicalization (sorted + unique per thread).
+        std::sort(buf.begin(), buf.end());
+        buf.erase(std::unique(buf.begin(), buf.end()), buf.end());
     }
 
-    std::vector<Det> out;
-    out.reserve(uniq.size());
-    for (const auto& d : uniq) {
-        out.push_back(d);
+    // Collect non-empty lists.
+    std::vector<std::vector<Det>> lists;
+    lists.reserve(tl.size());
+    for (auto& v : tl) {
+        if (!v.empty()) lists.push_back(std::move(v));
     }
-    return det_space::canonicalize(std::move(out));
+    if (lists.empty()) return {};
+    if (lists.size() == 1) {
+        // Filter exclude once at the end (see below).
+    } else {
+        // Merge-tree using set_union (merge + unique in one pass).
+        while (lists.size() > 1) {
+            std::vector<std::vector<Det>> next;
+            next.reserve((lists.size() + 1) / 2);
+
+            for (std::size_t i = 0; i < lists.size(); i += 2) {
+                if (i + 1 >= lists.size()) {
+                    next.push_back(std::move(lists[i]));
+                    break;
+                }
+
+                auto& a = lists[i];
+                auto& b = lists[i + 1];
+
+                std::vector<Det> merged;
+                merged.reserve(a.size() + b.size());
+
+                std::set_union(
+                    a.begin(), a.end(),
+                    b.begin(), b.end(),
+                    std::back_inserter(merged)
+                );
+
+                next.push_back(std::move(merged));
+            }
+
+            lists.swap(next);
+        }
+    }
+
+    std::vector<Det> out = std::move(lists[0]);
+    if (out.empty()) return out;
+
+    // Final exclude filtering:
+    // Fast path: if exclude's determinant list is sorted, use set_difference (linear).
+    // Fallback: hash-based contains (still only once per unique candidate).
+    const auto& excl = exclude.all_dets();
+    if (!excl.empty() && std::is_sorted(excl.begin(), excl.end())) {
+        std::vector<Det> filtered;
+        filtered.reserve(out.size());
+
+        std::set_difference(
+            out.begin(), out.end(),
+            excl.begin(), excl.end(),
+            std::back_inserter(filtered)
+        );
+        return filtered;
+    }
+
+    out.erase(
+        std::remove_if(out.begin(), out.end(),
+                       [&](const Det& d) { return exclude.contains(d); }),
+        out.end()
+    );
+    return out;
 }
 
 } // namespace detnqs

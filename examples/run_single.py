@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 def configure_jax() -> None:
     """Set JAX runtime: GPU priority, float64, suppress compile warnings."""
     jax.config.update("jax_platforms", "cuda,cpu")
-    jax.config.update("jax_enable_x64", False)
+    jax.config.update("jax_enable_x64", True)
     jax.config.update("jax_log_compiles", False)
     jax.config.update("jax_debug_nans", False)
 
@@ -82,13 +82,14 @@ def print_summary(
     runtime: float,
     output_dir: Path | None = None,
 ) -> None:
-    """Print final energy and system metadata."""
+    """Print final energy, system metadata, and timing breakdown."""
     print("\n" + "=" * 60)
     print(f"System: N_o={system.n_orb}, N_e={system.n_elec}, MS2={system.ms2}")
     print(f"Mode: {mode.upper()}")
     print(f"E_nuc:       {system.e_nuc:>18.8f} Ha")
     print(f"E_total:     {e_total:>18.8f} Ha")
     print(f"Runtime:     {runtime:>18.2f} s")
+    
     if output_dir:
         print(f"Output:      {output_dir.resolve()}")
     print("=" * 60)
@@ -165,7 +166,7 @@ def main() -> None:
     )
 
     # Configure optimizer and determinant selector
-    schedule = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=400, alpha=0.1)
+    schedule = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=800, alpha=0.05)
     optimizer = optax.adamw(learning_rate=schedule)
     selector = TopKSelector(8192, stream=True)
 

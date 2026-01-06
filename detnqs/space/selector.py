@@ -65,15 +65,13 @@ class TopKSelector:
     """Select K determinants with highest importance scores."""
 
     def __init__(self, k: int, stream: bool = False) -> None:
-        """
-        Args:
-            k: Number of determinants to select.
-            stream: Enable streaming mode for large datasets.
-        """
         self.k = int(k)
         self.stream = bool(stream)
 
-    def select(self, scores: Any, dets: Any) -> np.ndarray:
+    def select(self, scores, dets) -> np.ndarray:
+        # -------------------------
+        # Non-streaming (unchanged)
+        # -------------------------
         if not self.stream:
             dets = np.asarray(dets, dtype=np.uint64)
             if dets.size == 0:
@@ -83,42 +81,84 @@ class TopKSelector:
             k = min(self.k, n)
             if k <= 0:
                 return dets[:0]
-          
-            # Partial sort: O(n + k log k) instead of O(n log n)
+
             idx = np.argpartition(scores, -k)[-k:]
             idx = idx[np.argsort(scores[idx])[::-1]]
             return dets[idx]
 
-        # Streaming: maintain a min-heap of top-k entries
+        # ---------------------------------------------------------
+        # Streaming Plan B:
+        #  - One pass: collect all score blocks in host RAM
+        #  - One global argpartition on the concatenated scores
+        #  - Gather determinants by global indices (no 2nd forward)
+        # ---------------------------------------------------------
         k = max(0, int(self.k))
         if k == 0:
             return np.zeros((0, 2), dtype=np.uint64)
 
         blocks = _blocks_factory(scores)
-        heap: list[tuple[float, int, np.ndarray]] = []
-        counter = itertools.count()  # Tie-breaker for stable sorting
 
+        score_blocks: list[np.ndarray] = []
+        dets_blocks: list[np.ndarray] = []
+        block_lens: list[int] = []
+
+        # Pass: store all scores (and keep det-block views for later indexing)
         for s_blk, d_blk in blocks():
-            if d_blk is None or len(d_blk) == 0:
+            if d_blk is None:
                 continue
-            s_blk = np.asarray(s_blk, dtype=np.float64)
             d_blk = np.asarray(d_blk, dtype=np.uint64)
+            if d_blk.size == 0:
+                continue
 
-            kk = min(k, int(s_blk.shape[0]))
-            idx = np.argpartition(s_blk, -kk)[-kk:]
+            # Store scores as float32 to reduce RAM pressure (scores are only used for ranking).
+            s_blk = np.asarray(s_blk, dtype=np.float32)
+            if s_blk.size == 0:
+                continue
 
-            for s, d in zip(s_blk[idx], d_blk[idx]):
-                item = (float(s), next(counter), d.copy())
-                if len(heap) < k:
-                    heapq.heappush(heap, item)
-                else:
-                    heapq.heappushpop(heap, item)
+            if s_blk.shape[0] != d_blk.shape[0]:
+                raise ValueError(f"scores and dets block size mismatch: {s_blk.shape[0]} vs {d_blk.shape[0]}")
 
-        if not heap:
+            score_blocks.append(s_blk)
+            dets_blocks.append(d_blk)          # views/slices are fine; no deep copy required
+            block_lens.append(int(s_blk.shape[0]))
+
+        if not score_blocks:
             return np.zeros((0, 2), dtype=np.uint64)
 
-        heap.sort(key=lambda x: x[0], reverse=True)
-        return np.stack([d for _, _, d in heap], axis=0)
+        # Concatenate into one 1D array for a single global selection.
+        scores_all = np.concatenate(score_blocks, axis=0)
+        n_total = int(scores_all.shape[0])
+
+        if n_total <= k:
+            # Rare case: return everything (materialize dets only if needed).
+            return np.concatenate(dets_blocks, axis=0)
+
+        # Global Top-K (exact): indices of the K largest elements.
+        # np.argpartition returns indices in "partitioned" order (not sorted).
+        idx = np.argpartition(scores_all, -k)[-k:]
+
+        # Deterministic final ordering:
+        #   primary: higher score first
+        #   tie-break: smaller global index first
+        top_scores = scores_all[idx]
+        order = np.lexsort((idx, -top_scores))  # last key is primary
+        top_idx = idx[order]                    # global indices, sorted by desired order
+
+        # Build cumulative ends to map global index -> (block_id, offset)
+        ends = np.cumsum(np.asarray(block_lens, dtype=np.int64))  # shape [n_blocks]
+        starts = np.concatenate([np.array([0], dtype=np.int64), ends[:-1]])
+
+        block_ids = np.searchsorted(ends, top_idx, side="right").astype(np.int64)
+        offsets = (top_idx - starts[block_ids]).astype(np.int64)
+
+        # Gather determinants (k is small, e.g. 8192, so this is cheap).
+        out = np.empty((k, 2), dtype=np.uint64)
+        for i in range(k):
+            b = int(block_ids[i])
+            o = int(offsets[i])
+            out[i] = dets_blocks[b][o]
+
+        return out
 
 
 class TopFractionSelector:

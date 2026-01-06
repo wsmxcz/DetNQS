@@ -22,7 +22,7 @@ Memory strategy:
 
 File: detnqs/driver.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: December, 2025
+Date: January, 2026
 """
 
 from __future__ import annotations
@@ -53,20 +53,19 @@ class BaseDriver:
     Outer loop workflow:
       1. Build Hamiltonian for current V/P spaces
       2. Execute JIT-compiled inner optimization loop
-      3. Compute norm decomposition ||ψ_V||² and ||ψ_P||² on T-space
-      4. Trigger callbacks with diagnostic statistics (total energies)
+      3. Compute norm decomposition ||ψ_V||^2 and ||ψ_P||^2 on T-space
+      4. Trigger callbacks with diagnostic statistics
       5. Update V-space via amplitude-based selection
-      6. Check convergence on energy delta
 
     Inner loop workflow:
       - Evaluate ψ(x; θ) and compute E[θ], ∇_θ E
       - Update parameters: θ ← optimizer(θ, ∇_θ E)
-      - Check convergence: δE < tol for patience consecutive steps
 
     Subclass requirements:
       - mode_tag(): Return mode identifier string
       - device_space(): Return "V" or "T" for GPU memory residency
       - build_hamiltonian(): Construct Hamiltonian and SpMV operator
+      - should_skip_inner(outer_step): Return True to skip inner loop
     """
 
     system: MolecularSystem
@@ -77,23 +76,20 @@ class BaseDriver:
     selector: Selector
 
     max_outer: int = 30
-    max_inner: int = 500
-
-    inner_tol: float = 1e-7
-    inner_patience: int = 30
-    outer_tol: float = 1e-6
-    outer_patience: int = 3
+    max_inner: int = 1000
 
     chunk_size: int | None = None
+    block_size: int = 4194304
+  
+    compute_norms: bool = False
 
     def device_space(self) -> str:
-        """
-        Which space is kept as State.batch on device: 'V' or 'T'.
-      
-        Variational/Effective: 'V' to minimize GPU memory
-        Proxy/Asymmetric: 'T' for full-space optimization
-        """
+        """Which space is kept as State.batch on device: 'V' or 'T'."""
         return "T"
+
+    def should_skip_inner(self, outer_step: int) -> bool:
+        """Return True to skip inner loop at given outer step."""
+        return False
 
     @classmethod
     def build(
@@ -153,7 +149,7 @@ class BaseDriver:
         Compute normalized sqrt(p_i) on V-space for Heat-Bath screening.
 
         Returns:
-            sqrt_prob: sqrt(|ψ_i|² / Σ|ψ_j|²) for each V-space determinant
+            sqrt_prob: sqrt(|ψ_i|^2 / Σ|ψ_j|^2) for each V-space determinant
         """
         if self.detspace.size_V == 0:
             return None
@@ -171,17 +167,26 @@ class BaseDriver:
 
     def _compute_norms(self) -> tuple[float, float]:
         """
-        Compute norm decomposition on T-space: ||ψ_V||² and ||ψ_P||².
-
-        Uses streaming H2D if State.batch != T (Variational/Effective modes)
-        to avoid VRAM overflow when |P| >> |V|.
-
+        Compute norm decomposition on T-space: ||ψ_V||^2 and ||ψ_P||^2.
+  
+        Returns (0.0, 0.0) if compute_norms=False to skip overhead.
+  
+        Fast path:
+        - If State.batch == T, single device forward and weight computation
+  
+        Streaming path (State.batch != T):
+        - Single-pass stable accumulator over T-space blocks
+        - Maintains running max and rescales sums for numerical stability
+  
         Returns:
-            (norm_v, norm_p): V-space and P-space norms
+            (norm_v, norm_p): Squared norms of V and P components
         """
-        n_v = self.detspace.size_V
-        n_p = self.detspace.size_P
-
+        if not self.compute_norms:
+            return 0.0, 0.0
+  
+        n_v = int(self.detspace.size_V)
+        n_p = int(self.detspace.size_P)
+  
         # Fast path: State.batch already equals T
         if self.state.n_det == self.detspace.size_T:
             _sign_t, logabs_t = self.state.forward(chunk_size=self.chunk_size)
@@ -191,50 +196,68 @@ class BaseDriver:
             w_v = w[:n_v]
             w_p = w[n_v : n_v + n_p] if n_p > 0 else jnp.array([])
             return float(jnp.sum(w_v)), float(jnp.sum(w_p)) if n_p > 0 else 0.0
-
-        # Streaming path: iterate over CPU det blocks
-        block_size = int(self.chunk_size or 8192)
-
-        def scores_factory():
-            for det_blk in self.detspace.iter_T(block_size):
-                _s, la = self.state.forward_dets(det_blk, block_size=block_size, chunk_size=self.chunk_size)
-                yield np.asarray(np.real(la), dtype=np.float64), det_blk
-
-        # Pass 1: global shift = max(log|psi|)
-        shift = -np.inf
-        for la_blk, _ in scores_factory():
-            if la_blk.size:
-                shift = max(shift, float(np.max(la_blk)))
-        if not np.isfinite(shift):
-            return 0.0, 0.0
-
-        # Pass 2: accumulate norms
-        norm_v = 0.0
-        norm_p = 0.0
-        seen = 0
-        for la_blk, _ in scores_factory():
-            w = np.exp(2.0 * (la_blk - shift))
+  
+        # Streaming path: online stable exp-sum accumulator
+        block_size = int(self.block_size)
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+  
+        alpha = -np.inf  # Running max of x = 2*log|ψ|
+        sum_v = 0.0
+        sum_p = 0.0
+        seen = 0  # Number of determinants processed in T order
+  
+        for det_blk in self.detspace.iter_T(block_size):
+            _s, la = self.state.forward_dets(
+                det_blk,
+                block_size=block_size,
+                chunk_size=self.chunk_size,
+            )
+            la = np.asarray(np.real(la), dtype=np.float64)
+            if la.size == 0:
+                continue
+      
+            x = 2.0 * la
+            x_max = float(np.max(x))
+      
+            # Update running max and rescale previous sums
+            if x_max > alpha:
+                if np.isfinite(alpha):
+                    scale = float(np.exp(alpha - x_max))
+                    sum_v *= scale
+                    sum_p *= scale
+                alpha = x_max
+      
+            # Compute safe weights: exp(x - alpha) with (x - alpha) <= 0
+            w = np.exp(x - alpha)
+      
             m = int(w.shape[0])
             if seen < n_v:
                 take_v = min(n_v - seen, m)
-                norm_v += float(np.sum(w[:take_v]))
+                sum_v += float(np.sum(w[:take_v]))
                 if m > take_v:
-                    norm_p += float(np.sum(w[take_v:]))
+                    sum_p += float(np.sum(w[take_v:]))
             else:
-                norm_p += float(np.sum(w))
+                sum_p += float(np.sum(w))
+      
             seen += m
-
-        return norm_v, norm_p
+  
+        if not np.isfinite(alpha):
+            return 0.0, 0.0
+  
+        return sum_v, sum_p
 
     def evolve_space(self) -> None:
         """
         Update V-space via importance sampling on log|ψ_T|.
-      
+    
         Uses streaming H2D if selector.stream=True or State.batch != T
         to avoid materializing full T in VRAM/RAM.
         """
-        block_size = int(self.chunk_size or 8192)
-        use_stream = bool(getattr(self.selector, "stream", False)) or (self.state.n_det != self.detspace.size_T)
+        block_size = int(self.block_size)
+        use_stream = bool(getattr(self.selector, "stream", False)) or (
+            self.state.n_det != self.detspace.size_T
+        )
 
         if not use_stream:
             # Fast path: State.batch already equals T
@@ -246,32 +269,19 @@ class BaseDriver:
             # Streaming path: provide factory for multi-pass selectors
             def scores_factory():
                 for det_blk in self.detspace.iter_T(block_size):
-                    _s, la = self.state.forward_dets(det_blk, block_size=block_size, chunk_size=self.chunk_size)
+                    _s, la = self.state.forward_dets(
+                        det_blk,
+                        block_size=block_size,
+                        chunk_size=self.chunk_size,
+                    )
                     yield np.asarray(np.real(la), dtype=np.float64), det_blk
 
             new_space = self.detspace.evolve(self.selector, scores_factory)
 
         self.detspace = new_space
-        self.state = self.state.update_space(new_space, device_space=self.device_space())
-
-    def _check_convergence(self, energy_history: list[float]) -> bool:
-        """
-        Check outer convergence via sliding window.
-
-        Args:
-            energy_history: Total energy sequence from consecutive outer steps
-
-        Returns:
-            True if max(|ΔE|) < tol over patience consecutive steps
-        """
-        if self.outer_patience <= 0 or len(energy_history) <= self.outer_patience:
-            return False
-
-        window = energy_history[-(self.outer_patience + 1) :]
-        deltas = [abs(window[i] - window[i - 1]) for i in range(1, len(window))]
-        max_delta = max(deltas)
-
-        return max_delta < self.outer_tol
+        self.state = self.state.update_space(
+            new_space, device_space=self.device_space()
+        )
 
     def _build_sweep(self, ham: Any, op: Callable) -> Callable:
         """Build JIT-compiled inner optimization loop."""
@@ -290,7 +300,7 @@ class BaseDriver:
         )
 
         def sweep(state, opt_state):
-            """Execute inner loop until convergence or max steps."""
+            """Execute inner loop for max_inner steps."""
 
             def single_step(state, opt_state):
                 energy_val, grad = energy_step(state)
@@ -304,25 +314,9 @@ class BaseDriver:
             single_step = jax.jit(single_step, donate_argnums=(0, 1))
 
             energy_trace = []
-            last_energy = float("inf")
-            streak = 0
-
-            for step in range(self.max_inner):
+            for _ in range(self.max_inner):
                 state, opt_state, energy_val = single_step(state, opt_state)
-                energy = float(energy_val)
-                energy_trace.append(energy)
-
-                delta = abs(energy - last_energy)
-                if delta < self.inner_tol:
-                    streak += 1
-                else:
-                    streak = 0
-
-                if self.inner_tol > 0 and self.inner_patience > 0:
-                    if streak >= self.inner_patience:
-                        break
-
-                last_energy = energy
+                energy_trace.append(float(energy_val))
 
             return state, opt_state, np.array(energy_trace)
 
@@ -336,79 +330,97 @@ class BaseDriver:
         """
         Execute outer loop over determinant-space evolution.
 
+        Timing breakdown per outer iteration:
+        - compile_time: Hamiltonian build + JIT compilation
+        - inner_time: Parameter optimization loop
+        - overhead_time: Post-processing + space evolution (includes evolve_space)
+        - total_time: Cumulative runtime from start
+
         Args:
             callbacks: Observer callbacks with interface:
                     - on_run_start(driver)
                     - on_outer_end(step, stats, driver)
                     - on_run_end(driver)
-    
+
         Note:
             All energies in stats are total energies (E_total = E_elec + E_nuc)
+            Space sizes (size_v, size_p) reflect the spaces used in current iteration
             Final detspace retains both V and P for post-analysis
         """
         callbacks = callbacks or []
-        start_time = time.perf_counter()
+        total_start = time.perf_counter()
 
         for cb in callbacks:
             if hasattr(cb, "on_run_start"):
                 cb.on_run_start(self)
 
-        energy_history = []
         self._last_outer_step = -1
         self._last_stats = {}
 
         for outer in range(self.max_outer):
-            self._last_outer_step = outer  # Track current step
-            
-            # L1: Rebuild Hamiltonian for current space
-            ham, op = self.build_hamiltonian()
-            inner_sweep = self._build_sweep(ham, op)
+            self._last_outer_step = outer
 
-            # L2: JIT-compiled inner loop (returns electronic energies)
-            inner_start = time.perf_counter()
-            self.state, self.opt_state, energy_trace_elec = inner_sweep(
-                self.state, self.opt_state
-            )
-            inner_elapsed = time.perf_counter() - inner_start
+            # Phase 1: Compile - Hamiltonian build + JIT compilation
+            compile_start = time.perf_counter()
+            ham, op = self.build_hamiltonian()
+          
+            skip_inner = self.should_skip_inner(outer)
+            if not skip_inner:
+                inner_sweep = self._build_sweep(ham, op)
+            compile_time = time.perf_counter() - compile_start
+
+            # Phase 2: Inner optimization loop (skip if requested)
+            if skip_inner:
+                energy_trace_elec = np.array([])
+                inner_time = 0.0
+            else:
+                inner_start = time.perf_counter()
+                self.state, self.opt_state, energy_trace_elec = inner_sweep(
+                    self.state, self.opt_state
+                )
+                jax.block_until_ready(self.state.params)
+                inner_time = time.perf_counter() - inner_start
+
+            # Phase 3: Overhead - post-processing + diagnostics + space evolution
+            overhead_start = time.perf_counter()
 
             self.post_inner_sweep(energy_trace_elec)
-
-            # Convert to total energies
             energy_trace_total = energy_trace_elec + self.system.e_nuc
-
-            # Compute diagnostics
             norm_v, norm_p = self._compute_norms()
 
-            if len(energy_trace_total) > 0:
-                last_e = float(energy_trace_total[-1])
-                total_elapsed = time.perf_counter() - start_time
+            # Save current iteration's space sizes before evolve_space modifies them
+            current_size_v = int(self.detspace.size_V)
+            current_size_p = int(self.detspace.size_P)
 
-                stats = {
-                    "outer_step": outer,
-                    "energy": last_e,  # Total energy
-                    "norm_v": norm_v,
-                    "norm_p": norm_p,
-                    "size_v": self.detspace.size_V,
-                    "size_p": self.detspace.size_P,
-                    "inner_steps": len(energy_trace_total),
-                    "inner_trace": energy_trace_total.tolist(),
-                    "inner_time": inner_elapsed,
-                    "total_time": total_elapsed,
-                }
-                
-                self._last_stats = stats  # Save for final checkpoint
-
-                for cb in callbacks:
-                    cb.on_outer_end(outer, stats, self)
-
-                energy_history.append(last_e)
-            
-                if self._check_convergence(energy_history):
-                    break
-
-            # Update V-space for next outer step (unless last iteration)
+            # Update V-space for next iteration (unless last step)
             if outer < self.max_outer - 1:
                 self.evolve_space()
+
+            overhead_time = time.perf_counter() - overhead_start
+            total_time = time.perf_counter() - total_start
+
+            # Assemble statistics using current iteration's space sizes
+            last_e = float(energy_trace_total[-1]) if len(energy_trace_total) > 0 else 0.0
+
+            stats = {
+                "outer_step": outer,
+                "energy": last_e,
+                "norm_v": norm_v,
+                "norm_p": norm_p,
+                "size_v": current_size_v,
+                "size_p": current_size_p,
+                "inner_steps": len(energy_trace_total),
+                "inner_trace": energy_trace_total.tolist(),
+                "compile_time": compile_time,
+                "inner_time": inner_time,
+                "overhead_time": overhead_time,
+                "total_time": total_time,
+            }
+
+            self._last_stats = stats
+
+            for cb in callbacks:
+                cb.on_outer_end(outer, stats, self)
 
         for cb in callbacks:
             cb.on_run_end(self)
@@ -420,11 +432,9 @@ class VariationalDriver(BaseDriver):
     Variational mode: E = <ψ_V|H_VV|ψ_V> / <ψ_V|ψ_V> on V-space.
 
     Workflow:
-      1. Construct H_VV on current V-space
-      2. Optimize parameters to minimize E[ψ_V]
-      3. Generate complement P via Heat-Bath screening
-      4. Update V ← select from T = V ∪ P
-    
+      1. [outer=0] Generate complement P via Heat-Bath screening, skip inner loop
+      2. [outer≥1] Construct H_VV, optimize parameters, update V
+  
     Memory: GPU holds only V-space batch, streams T for scoring/norms
     """
 
@@ -436,6 +446,10 @@ class VariationalDriver(BaseDriver):
 
     def device_space(self) -> str:
         return "V"
+
+    def should_skip_inner(self, outer_step: int) -> bool:
+        """Skip inner loop at first iteration (outer=0)."""
+        return outer_step == 0
 
     def build_hamiltonian(self) -> tuple[Any, Any]:
         """Build H_VV with screened complement P-space."""
@@ -457,7 +471,9 @@ class VariationalDriver(BaseDriver):
             )
 
         self.detspace = DetSpace(V_dets=self.detspace.V_dets, P_dets=P_dets)
-        self.state = self.state.update_space(self.detspace, device_space=self.device_space())
+        self.state = self.state.update_space(
+            self.detspace, device_space=self.device_space()
+        )
 
         ham = ham_mod.build_vv_hamiltonian(self.system, self.detspace)
         op = kern_mod.build_vv_operator(ham, jax_dtype=self.state.psi_dtype)
@@ -478,11 +494,9 @@ class EffectiveDriver(BaseDriver):
       - linear_shift: max(0, E_ref - diag(H_PP))
 
     Workflow:
-      1. Build proxy H and complement P
-      2. Compute H_eff via Löwdin partitioning
-      3. Optimize E_eff = <ψ_V|H_eff|ψ_V>
-      4. Update E_ref ← last electronic energy, V ← select from T
-    
+      1. [outer=0] Build proxy H and complement P, skip inner loop
+      2. [outer≥1] Compute H_eff, optimize E_eff, update E_ref and V
+  
     Memory: GPU holds only V-space batch, streams T for scoring/norms
     """
 
@@ -497,6 +511,10 @@ class EffectiveDriver(BaseDriver):
 
     def device_space(self) -> str:
         return "V"
+
+    def should_skip_inner(self, outer_step: int) -> bool:
+        """Skip inner loop at first iteration (outer=0)."""
+        return outer_step == 0
 
     def post_inner_sweep(self, energy_trace_elec: np.ndarray) -> None:
         """Update reference electronic energy for next Hamiltonian rebuild."""
@@ -518,7 +536,9 @@ class EffectiveDriver(BaseDriver):
         )
 
         self.detspace = DetSpace(V_dets=self.detspace.V_dets, P_dets=P_dets)
-        self.state = self.state.update_space(self.detspace, device_space=self.device_space())
+        self.state = self.state.update_space(
+            self.detspace, device_space=self.device_space()
+        )
 
         ham = ham_mod.build_effective_hamiltonian(
             system=self.system,
@@ -546,7 +566,7 @@ class ProxyDriver(BaseDriver):
       1. Build proxy H on T = V ∪ P with screening
       2. Optimize E = <ψ_T|H|ψ_T> / <ψ_T|ψ_T>
       3. Update V ← select from T
-    
+  
     Memory: GPU holds full T-space batch
     """
 
@@ -573,7 +593,9 @@ class ProxyDriver(BaseDriver):
         )
 
         self.detspace = DetSpace(V_dets=self.detspace.V_dets, P_dets=P_dets)
-        self.state = self.state.update_space(self.detspace, device_space=self.device_space())
+        self.state = self.state.update_space(
+            self.detspace, device_space=self.device_space()
+        )
 
         op = kern_mod.build_proxy_operator(ham, jax_dtype=self.state.psi_dtype)
 
@@ -594,7 +616,7 @@ class AsymmetricDriver(BaseDriver):
       - Uses proxy Hamiltonian H_T same as ProxyDriver
       - Inner loop minimizes asymmetric Rayleigh quotient
       - V-space evolution uses full-T amplitudes |ψ_T|
-    
+  
     Memory: GPU holds full T-space batch
     """
 
@@ -619,7 +641,9 @@ class AsymmetricDriver(BaseDriver):
         )
 
         self.detspace = DetSpace(V_dets=self.detspace.V_dets, P_dets=P_dets)
-        self.state = self.state.update_space(self.detspace, device_space=self.device_space())
+        self.state = self.state.update_space(
+            self.detspace, device_space=self.device_space()
+        )
 
         op = kern_mod.build_proxy_operator(ham, jax_dtype=self.state.psi_dtype)
 

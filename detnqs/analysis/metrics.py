@@ -89,12 +89,12 @@ def compute_pt2(
     e_ref: float,
     screening: str = "heatbath",
     eps1: float = 1e-6,
-) -> float | None:
+) -> dict[str, float] | None:
     """
-    Compute Epstein-Nesbet PT2 correction on P-space.
+    Compute decomposed Epstein-Nesbet PT2 correction.
 
-    The PT2 energy correction is computed as:
-        ΔE_PT2 = Σ_k |<D_k|(H - E_0)|Ψ_0>|² / (E_0 - H_kk)
+    Returns internal (V-space residual) and external (P-space) contributions.
+    For a true eigenstate in V, the internal term vanishes.
 
     Args:
         state: Optimized network state
@@ -105,11 +105,12 @@ def compute_pt2(
         eps1: Screening threshold for heat-bath
 
     Returns:
-        PT2 correction ΔE_PT2 (Ha), or None if C++ kernel unavailable
-    
-    Note:
-        The returned PT2 correction should be added to e_ref to get
-        the final total energy: E_total = e_ref + ΔE_PT2
+        Dict with:
+          - e_pt2_internal: V-space residual correction (Ha)
+          - e_pt2_external: P-space contribution (Ha)
+          - e_pt2_total: Total correction (Ha)
+          - n_ext: Number of external determinants
+        Returns None if C++ kernel unavailable
     """
     try:
         from .. import core
@@ -136,7 +137,7 @@ def compute_pt2(
 
     use_heatbath = screening == "heatbath"
 
-    e_pt2 = core.compute_pt2(
+    result = core.compute_pt2(
         V_dets,
         psi_v,
         system.int_ctx,
@@ -146,7 +147,12 @@ def compute_pt2(
         eps1=eps1,
     )
 
-    return float(e_pt2)
+    return {
+        "e_pt2_internal": float(result["e_pt2_internal"]),
+        "e_pt2_external": float(result["e_pt2_external"]),
+        "e_pt2_total": float(result["e_pt2_internal"] + result["e_pt2_external"]),
+        "n_ext": int(result["n_ext"]),
+    }
 
 
 def compute_variational(

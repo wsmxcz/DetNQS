@@ -7,13 +7,13 @@ Systematic scan of DetNQS modes and variational space sizes across molecules.
 Sweeps over:
   - Molecular systems (multiple FCIDUMP files)
   - Computational modes: Variational, Proxy, Asymmetric
-  - V-space sizes: |V| ∈ {64, 128, 256, ..., 8192}
+  - V-space sizes: |V| {64, 128, 256, ..., 8192}
 
 Outputs structured JSONL logs and post-analysis summaries.
 
 File: detnqs/examples/run_scan.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: December, 2025
+Date: January, 2026
 """
 
 from __future__ import annotations
@@ -60,6 +60,9 @@ class ScanConfig:
     learning_rate: float = 1e-3
     chunk_size: int = 8192
   
+    # Analysis
+    enable_pt2: bool = True  # Compute PT2 correction for Variational mode
+  
     # Reproducibility
     seed: int = 42
 
@@ -76,9 +79,9 @@ _DRIVER_MAP = {
 # ============================================================================
 
 def configure_jax() -> None:
-    """Configure JAX runtime: GPU priority, float64 precision."""
+    """Configure JAX runtime for GPU with float64 precision."""
     jax.config.update("jax_platforms", "cuda,cpu")
-    jax.config.update("jax_enable_x64", False)
+    jax.config.update("jax_enable_x64", True)
     jax.config.update("jax_log_compiles", False)
     jax.config.update("jax_debug_nans", False)
   
@@ -114,9 +117,9 @@ def _build_model(system: MolecularSystem, config: ScanConfig):
 def _run_optimization(driver, output_dir: Path) -> tuple[float, float, float]:
     """
     Execute optimization with callbacks.
-    
+  
     Returns:
-        (e_total, total_time, inner_time_avg): Final total energy, total runtime, avg inner time
+        (e_total, total_time, inner_time_avg)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
   
@@ -129,38 +132,44 @@ def _run_optimization(driver, output_dir: Path) -> tuple[float, float, float]:
     driver.run(callbacks=callbacks)
     total_runtime = time.perf_counter() - t_start
   
-    # Extract final energy and timing from trace
+    # Extract metrics from trace
     with open(output_dir / "trace.jsonl", 'r') as f:
         lines = f.readlines()
         last_record = json.loads(lines[-1])
-        e_total = last_record['energy']  # Already total energy
-        
-        # Compute average inner loop time
+        e_total = last_record['energy']
+      
         inner_times = [json.loads(line)['inner_time'] for line in lines if line.strip()]
         inner_time_avg = sum(inner_times) / len(inner_times) if inner_times else 0.0
   
     return e_total, total_runtime, inner_time_avg
 
 
-def _post_analysis(mode: str, driver, system: MolecularSystem, e_total: float) -> dict:
+def _post_analysis(
+    mode: str,
+    driver,
+    system: MolecularSystem,
+    e_total: float,
+    enable_pt2: bool,
+) -> dict:
     """
-    Compute mode-specific post-optimization analysis with timing.
-    
+    Compute mode-specific post-optimization analysis.
+  
     Args:
         mode: Computational mode
-        driver: Optimized driver
+        driver: Optimized driver instance
         system: Molecular system
         e_total: Reference total energy from optimization
-        
+        enable_pt2: Whether to compute PT2 correction (Variational mode only)
+      
     Returns:
         Dict with analysis results and timing
     """
     result = {}
   
-    if mode == "variational":
-        print("  Computing PT2 correction...")
+    if mode == "variational" and enable_pt2:
+        print("  Computing decomposed PT2 correction...")
         t_start = time.perf_counter()
-        e_pt2 = compute_pt2(
+        pt2_result = compute_pt2(
             state=driver.state,
             detspace=driver.detspace,
             system=system,
@@ -168,14 +177,22 @@ def _post_analysis(mode: str, driver, system: MolecularSystem, e_total: float) -
         )
         t_pt2 = time.perf_counter() - t_start
       
-        if e_pt2 is not None:
-            result["e_pt2"] = e_pt2
-            result["e_total_pt2"] = e_total + e_pt2
+        if pt2_result is not None:
+            result["e_pt2_internal"] = pt2_result["e_pt2_internal"]
+            result["e_pt2_external"] = pt2_result["e_pt2_external"]
+            result["e_pt2_total"] = pt2_result["e_pt2_total"]
+            result["n_ext"] = pt2_result["n_ext"]
+            result["e_total_pt2"] = e_total + pt2_result["e_pt2_total"]
             result["t_pt2"] = t_pt2
-            print(f"  PT2: ΔE = {e_pt2:.8f} Ha, E_total(PT2) = {e_total + e_pt2:.8f} Ha (in {t_pt2:.2f}s)")
+            
+            print(f"  E_PT2 (internal): {pt2_result['e_pt2_internal']:.8f} Ha")
+            print(f"  E_PT2 (external): {pt2_result['e_pt2_external']:.8f} Ha")
+            print(f"  E_PT2 (total):    {pt2_result['e_pt2_total']:.8f} Ha")
+            print(f"  E_total(PT2):      {e_total + pt2_result['e_pt2_total']:.8f} Ha")
+            print(f"  |P|: {pt2_result['n_ext']}, computed in {t_pt2:.2f}s")
   
     elif mode == "proxy":
-        print("  Computing variational energies...")
+        print("  Computing variational energies on V and T...")
         t_start = time.perf_counter()
         var_result = compute_variational(
             state=driver.state,
@@ -183,7 +200,7 @@ def _post_analysis(mode: str, driver, system: MolecularSystem, e_total: float) -
             system=system,
         )
         t_var = time.perf_counter() - t_start
-        
+      
         if var_result:
             result.update(var_result)
             result["t_var"] = t_var
@@ -224,7 +241,7 @@ def run_single_config(
     print(f"Output: {output_dir.relative_to(config.output_root)}")
     print(f"{'='*70}\n")
   
-    # Initialize detspace and model
+    # Initialize V-space from HF determinant
     hf_det = system.hf_determinant()
     detspace = DetSpace.initialize(hf_det)
     model = _build_model(system, config)
@@ -236,7 +253,7 @@ def run_single_config(
     optimizer = optax.adamw(learning_rate=schedule)
     selector = TopKSelector(topk, stream=True)
   
-    # Build driver
+    # Build driver for specified mode
     driver = _DRIVER_MAP[mode].build(
         system=system,
         detspace=detspace,
@@ -246,7 +263,7 @@ def run_single_config(
         chunk_size=config.chunk_size,
     )
   
-    # Run optimization
+    # Execute optimization
     e_total, total_time, inner_time_avg = _run_optimization(driver, output_dir)
   
     # Build summary
@@ -258,17 +275,17 @@ def run_single_config(
         "inner_time_avg": inner_time_avg,
     }
   
-    # Post-analysis
-    analysis = _post_analysis(mode, driver, system, e_total)
+    # Post-optimization analysis
+    analysis = _post_analysis(mode, driver, system, e_total, config.enable_pt2)
     summary.update(analysis)
   
     # Save summary
     with open(output_dir / "summary.json", 'w') as f:
         json.dump(summary, f, indent=2)
   
-    print(f"\n✓ Completed in {total_time:.1f}s")
+    print(f"\n Completed in {total_time:.1f}s")
     print(f"  E_total = {e_total:.8f} Ha")
-    
+  
     return summary
 
 
@@ -282,7 +299,7 @@ def run_scan(config: ScanConfig) -> None:
   
     config.output_root.mkdir(parents=True, exist_ok=True)
     all_results = []
-    
+  
     global_start = time.perf_counter()
   
     # Loop over molecules
@@ -293,12 +310,12 @@ def run_scan(config: ScanConfig) -> None:
         print(f"# Molecule: {molecule_name}")
         print(f"{'#'*70}")
       
-        # Load system (L0 layer, static per molecule)
+        # Load molecular system (L0 layer: static per molecule)
         system = MolecularSystem.from_fcidump(fcidump_path)
         print(f"System: N_o={system.n_orb}, N_e={system.n_elec}, MS2={system.ms2}")
         print(f"E_nuc:  {system.e_nuc:.8f} Ha\n")
       
-        # Loop over modes and topk sizes
+        # Loop over computational modes and V-space sizes
         for mode in config.modes:
             for topk in config.topk_sizes:
                 output_dir = config.output_root / molecule_name / mode / f"topk_{topk:04d}"
@@ -315,12 +332,12 @@ def run_scan(config: ScanConfig) -> None:
                     all_results.append(summary)
                   
                 except Exception as e:
-                    print(f"\n✗ Failed {molecule_name}/{mode}/topk={topk}: {e}")
+                    print(f"\n Failed {molecule_name}/{mode}/topk={topk}: {e}")
                     continue
-    
+  
     global_runtime = time.perf_counter() - global_start
   
-    # Save global summary
+    # Save aggregated results
     summary_path = config.output_root / "all_results.json"
     with open(summary_path, 'w') as f:
         json.dump(all_results, f, indent=2)
@@ -342,27 +359,34 @@ def main() -> None:
   
     config = ScanConfig(
         fcidump_paths=(
-            fcidump_dir / "H2O_631g.FCIDUMP",
-            # fcidump_dir / "N2_ccpvdz_2.118B.FCIDUMP",
-            # fcidump_dir / "N2_ccpvdz_2.400B.FCIDUMP",
-            # fcidump_dir / "N2_ccpvdz_2.700B.FCIDUMP",
-            # fcidump_dir / "N2_ccpvdz_3.000B.FCIDUMP",
-            # fcidump_dir / "N2_ccpvdz_3.600B.FCIDUMP",
-            # fcidump_dir / "N2_ccpvdz_4.200B.FCIDUMP",
-            # fcidump_dir / "H2O_ccpvdz_1.0re.FCIDUMP",
-            # fcidump_dir / "H2O_ccpvdz_1.5re.FCIDUMP",
-            # fcidump_dir / "H2O_ccpvdz_2.0re.FCIDUMP",
-            # fcidump_dir / "H2O_ccpvdz_2.5re.FCIDUMP",
-            # fcidump_dir / "H2O_ccpvdz_3.0re.FCIDUMP",
-            # fcidump_dir / "Cr2_24e30o.FCIDUMP",
-            # fcidump_dir / "Cr2_48e42o.FCIDUMP",
+#             fcidump_dir / "H2O_631g.FCIDUMP",
+#             fcidump_dir / "N2_ccpvdz_2.118B.FCIDUMP",
+#             fcidump_dir / "N2_ccpvdz_2.400B.FCIDUMP",
+#             fcidump_dir / "N2_ccpvdz_2.700B.FCIDUMP",
+#             fcidump_dir / "N2_ccpvdz_3.000B.FCIDUMP",
+#             fcidump_dir / "N2_ccpvdz_3.600B.FCIDUMP",
+#             fcidump_dir / "N2_ccpvdz_4.200B.FCIDUMP",
+#             fcidump_dir / "H2O_ccpvdz_1.0re.FCIDUMP",
+#             fcidump_dir / "H2O_ccpvdz_1.5re.FCIDUMP",
+#             fcidump_dir / "H2O_ccpvdz_2.0re.FCIDUMP",
+#             fcidump_dir / "H2O_ccpvdz_2.5re.FCIDUMP",
+#             fcidump_dir / "H2O_ccpvdz_3.0re.FCIDUMP",
+#             fcidump_dir / "Cr2_24e30o.FCIDUMP",
+#             fcidump_dir / "Cr2_48e42o.FCIDUMP",
+#             fcidump_dir / "Li2O_sto3g.FCIDUMP",
+             fcidump_dir / "C2H4O_sto3g.FCIDUMP",
+             fcidump_dir / "C3H8_sto3g.FCIDUMP",
         ),
-        output_root=Path("./scans/H2O_631g"),
-        modes=("variational", "proxy", "asymmetric"),
-        # modes=("variational",),
-        topk_sizes=(64, 128, 256, 512, 1024, 2048, 4096, 8192),
-        # topk_sizes=(1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144),
-        # topk_sizes=(131072, 262144),
+        output_root=Path("./scans/sm_2"),
+#        modes=("variational", "proxy", "asymmetric"),
+        modes=("variational",),
+#        topk_sizes=(64, 128, 256, 512, 1024, 2048, 4096, 8192),
+#        topk_sizes=(512, 2048, 8192, 32768, 131072),
+#        topk_sizes=(1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072),
+        topk_sizes=(524288, 1048576),
+#        topk_sizes=(1048576,),
+        
+        enable_pt2=True,  # Toggle PT2 computation
     )
   
     run_scan(config)

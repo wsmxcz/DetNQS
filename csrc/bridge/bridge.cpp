@@ -725,7 +725,7 @@ NB_MODULE(_detnqs_cpp, m) {
             int n_orb,
             double e_ref,
             bool use_heatbath,
-            double eps1) -> double {
+            double eps1) -> nb::dict {
 
             const auto V_vec = to_det_vector(dets);
             if (static_cast<std::size_t>(coeffs.shape(0)) != V_vec.size()) {
@@ -751,7 +751,12 @@ NB_MODULE(_detnqs_cpp, m) {
                 use_heatbath
             );
 
-            return res.e_pt2;
+            // Return decomposed PT2 results
+            nb::dict out;
+            out["e_pt2_internal"] = res.e_pt2_internal;
+            out["e_pt2_external"] = res.e_pt2_external;
+            out["n_ext"] = nb::int_(res.n_ext);
+            return out;
         },
         "dets_V"_a,
         "coeffs_V"_a,
@@ -760,8 +765,9 @@ NB_MODULE(_detnqs_cpp, m) {
         "e_ref"_a,
         "use_heatbath"_a = false,
         "eps1"_a = 1e-6,
-        "Compute EN-PT2 correction Delta E_PT2 from perturbative space P.\n"
-        "  E_total = E_ref + Delta E_PT2\n"
-        "  e_ref: electronic energy from variational optimization (normalized coeffs).");
+        "Compute decomposed EN-PT2: internal (V-space residual) and external (P-space) contributions.\n"
+        "  e_ref: electronic energy from variational optimization (normalized coeffs).\n"
+        "Returns dict with 'e_pt2_internal', 'e_pt2_external', 'n_ext'.");
+
 }
 

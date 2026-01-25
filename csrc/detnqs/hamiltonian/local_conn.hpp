@@ -75,10 +75,11 @@ struct LocalConnBatch {
     bool use_heatbath = false
 );
 
-/** EN-PT2 correction computed from variational-space wavefunction. */
+/** EN-PT2 decomposition: internal and external corrections. */
 struct Pt2Result {
-    double e_pt2;       // Second-order energy correction Delta E_PT2
-    std::size_t n_ext;  // Number of unique external configurations in P_k
+    double e_pt2_internal;  // Internal (V-space) residual contribution
+    double e_pt2_external;  // External (P-space) contribution
+    std::size_t n_ext;      // Number of external determinants in P
 };
 
 /**

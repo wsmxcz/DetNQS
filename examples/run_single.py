@@ -6,13 +6,13 @@ Command-line interface for DetNQS quantum chemistry calculations.
 
 Computational modes:
   - Variational: NQS-enhanced sCI on H_VV with optional PT2 analysis
-  - Effective:   Löwdin down-folded H_eff on V-space
-  - Proxy:       Diagonal approximation on T = V ∪ P
+  - Effective:   Lowdin down-folded H_eff on V-space
+  - Proxy:       Diagonal approximation on T = V U P
   - Asymmetric:  VMC-style truncated estimator on V-space
 
 File: detnqs/examples/run_single.py
 Author: Zheng (Alex) Che, email: wsmxcz@gmail.com
-Date: December, 2025
+Date: January, 2026
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 def configure_jax() -> None:
     """Set JAX runtime: GPU priority, float64, suppress compile warnings."""
     jax.config.update("jax_platforms", "cuda,cpu")
-    jax.config.update("jax_enable_x64", True)
+    jax.config.update("jax_enable_x64", False)
     jax.config.update("jax_log_compiles", False)
     jax.config.update("jax_debug_nans", False)
 
@@ -89,7 +89,7 @@ def print_summary(
     print(f"E_nuc:       {system.e_nuc:>18.8f} Ha")
     print(f"E_total:     {e_total:>18.8f} Ha")
     print(f"Runtime:     {runtime:>18.2f} s")
-    
+  
     if output_dir:
         print(f"Output:      {output_dir.resolve()}")
     print("=" * 60)
@@ -99,7 +99,7 @@ def run_post_analysis(driver, e_ref: float, mode: str) -> None:
     """
     Execute mode-specific post-processing with timing.
 
-    - Variational: Compute PT2 correction over P-space
+    - Variational: Compute decomposed PT2 correction over P-space
     - Proxy: Evaluate variational energies on V and T
 
     Args:
@@ -108,22 +108,30 @@ def run_post_analysis(driver, e_ref: float, mode: str) -> None:
         mode: Computational mode identifier
     """
     if mode == "variational":
-        print("\nComputing PT2 correction...")
+        print("\nComputing decomposed PT2 correction...")
         t_start = time.time()
-        e_pt2 = compute_pt2(
+        pt2_result = compute_pt2(
             state=driver.state,
             detspace=driver.detspace,
             system=driver.system,
             e_ref=e_ref,
         )
         t_pt2 = time.time() - t_start
-      
-        if e_pt2 is not None:
-            e_total_pt2 = e_ref + e_pt2
+    
+        if pt2_result is not None:
+            e_pt2_int = pt2_result["e_pt2_internal"]
+            e_pt2_ext = pt2_result["e_pt2_external"]
+            e_pt2_tot = pt2_result["e_pt2_total"]
+            n_ext = pt2_result["n_ext"]
+            e_total_pt2 = e_ref + e_pt2_tot
+          
             print(f"\nPT2 results (computed in {t_pt2:.2f}s):")
-            print(f"  E_var:       {e_ref:>18.8f} Ha")
-            print(f"  ΔE_PT2:      {e_pt2:>18.8f} Ha")
-            print(f"  E_total(PT2): {e_total_pt2:>18.8f} Ha")
+            print(f"  E_var:               {e_ref:>18.8f} Ha")
+            print(f"  Delta E_PT2 (internal): {e_pt2_int:>18.8f} Ha")
+            print(f"  Delta E_PT2 (external): {e_pt2_ext:>18.8f} Ha")
+            print(f"  Delta E_PT2 (total):    {e_pt2_tot:>18.8f} Ha")
+            print(f"  E_total(PT2):           {e_total_pt2:>18.8f} Ha")
+            print(f"  |P|:                    {n_ext}")
 
     elif mode == "proxy":
         print("\nComputing variational energies...")
@@ -168,7 +176,7 @@ def main() -> None:
     # Configure optimizer and determinant selector
     schedule = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=800, alpha=0.05)
     optimizer = optax.adamw(learning_rate=schedule)
-    selector = TopKSelector(8192, stream=True)
+    selector = TopKSelector(1024, stream=True)
 
     # L1: Instantiate driver for selected computational mode
     driver = _DRIVER_MAP[args.mode].build(
@@ -207,4 +215,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

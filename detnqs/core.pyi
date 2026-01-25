@@ -63,6 +63,12 @@ class LocalConnBatch(TypedDict):
     values: F64Array    # Matrix elements, shape (M,)
 
 
+class Pt2Result(TypedDict):
+    """Decomposed EN-PT2 correction components."""
+    e_pt2_internal: float  # V-space residual contribution (Ha)
+    e_pt2_external: float  # P-space contribution (Ha)
+    n_ext: int             # Number of external determinants
+
 # --- Integral Context ---
 
 class IntCtx:
@@ -325,14 +331,15 @@ def compute_pt2(
     e_ref: float,
     use_heatbath: bool = False,
     eps1: float = 1e-6,
-) -> float:
+) -> Pt2Result:
     """
-    Compute Epstein-Nesbet second-order perturbation correction.
+    Compute decomposed Epstein-Nesbet PT2 correction.
   
-    Evaluates: Delta_E_PT2 = sum_{j in P} |<j|H|V>|^2 / (E_ref - H_jj)
+    Returns internal (V-space residual) and external (P-space) contributions:
+      ΔE_internal = Σ_{i∈V} |r_i|² / (E_ref - H_ii)
+      ΔE_external = Σ_{a∈P} |<a|H|Ψ_V>|² / (E_ref - H_aa)
   
-    Note: coeffs_V must be domain-normalized before calling.
-          e_ref must be the electronic energy from optimizer.
+    where r_i = <i|H|Ψ_V> - E_ref * c_i is the residual on variational space.
   
     Args:
         dets_V: Variational space V determinants
@@ -344,7 +351,7 @@ def compute_pt2(
         eps1: Screening threshold
       
     Returns:
-        PT2 energy correction
+        Dict with 'e_pt2_internal', 'e_pt2_external', 'n_ext'
     """
     ...
 

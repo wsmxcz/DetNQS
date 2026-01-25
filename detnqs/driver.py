@@ -75,7 +75,7 @@ class BaseDriver:
     opt_state: optax.OptState
     selector: Selector
 
-    max_outer: int = 30
+    max_outer: int = 10
     max_inner: int = 1000
 
     chunk_size: int | None = None

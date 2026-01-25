@@ -51,7 +51,7 @@ def _gather_occupied_rows(C: jnp.ndarray, occ: jnp.ndarray) -> jnp.ndarray:
 # Reference State
 # ============================================================================
 
-class ReferenceCoefficients(nn.Module):
+class ReferenceCoeffs(nn.Module):
     """Trainable reference orbital coefficients C0.
     
     Initializes with HF-style one-hot + optional noise for symmetry breaking.
@@ -109,7 +109,7 @@ class ReferenceMapper(nn.Module):
         Returns:
             (B, N, N) reference determinant A0[occ, :]
         """
-        C0 = ReferenceCoefficients(
+        C0 = ReferenceCoeffs(
             self.system,
             init_sigma=self.init_sigma,
             param_dtype=self.param_dtype
@@ -139,7 +139,7 @@ class FullMapper(nn.Module):
         M, N = self.system.n_so, self.system.n_elec
         
         # Reference + backflow correction
-        C0 = ReferenceCoefficients(
+        C0 = ReferenceCoeffs(
             self.system,
             init_sigma=self.init_sigma,
             param_dtype=self.param_dtype
@@ -173,7 +173,7 @@ class SubmatrixMapper(nn.Module):
         N = self.system.n_elec
         
         # Reference submatrix
-        C0 = ReferenceCoefficients(
+        C0 = ReferenceCoeffs(
             self.system,
             init_sigma=self.init_sigma,
             param_dtype=self.param_dtype

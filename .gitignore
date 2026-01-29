@@ -93,8 +93,8 @@ ehthumbs.db
 *.backup
 *.pid
 *.seed
-.benchmarks
-*.FCIDUMP
+# .benchmarks
+# *.FCIDUMP
 *.pdf
 *.csv
 *.json

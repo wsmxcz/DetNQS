@@ -62,7 +62,7 @@ For a detailed theoretical background of the deterministic framework and the hyb
 If you find this work useful for your research, or if you use the DetNQS source code in your project, we would appreciate it if you could cite our work:
 
 ```bibtex
-@article{che2025detnqs,
+@article{che2026detnqs,
   title={A Deterministic Framework for Neural Network Quantum States in Quantum Chemistry},
   author={Che, Zheng},
   journal={arXiv preprint arXiv:2601.21310},

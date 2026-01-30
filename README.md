@@ -55,7 +55,7 @@ python DetNQS/examples/run_single.py ../benchmark/FCIDUMP/H2O_631g.FCIDUMP --out
 The main hyperparameters can be directly modified within the `run_single.py` script.
 
 ## Documentation
-For a detailed theoretical background of the deterministic framework and the hybrid CPU-GPU implementation, please refer to our [accompanying paper](link-to-arxiv).
+For a detailed theoretical background of the deterministic framework and the hybrid CPU-GPU implementation, please refer to our [accompanying paper](https://arxiv.org/abs/2601.21310).
 
 ## Citation
 
@@ -65,8 +65,8 @@ If you find this work useful for your research, or if you use the DetNQS source 
 @article{che2025detnqs,
   title={A Deterministic Framework for Neural Network Quantum States in Quantum Chemistry},
   author={Che, Zheng},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
-  year={2025}
+  journal={arXiv preprint arXiv:2601.21310},
+  year={2026}
 }
 ```
 
